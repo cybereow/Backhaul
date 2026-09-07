@@ -131,4 +131,30 @@ func TestWSMuxUDPForwardingE2E(t *testing.T) {
 	if got != nil {
 		assert.True(t, bytes.Equal(wantReply, got), "UDP echo payload mismatch: got %q want %q", got, wantReply)
 	}
+
+	// 5. Burst exchange on ONE socket: a stateful handshake (IKE) sends several
+	// datagrams back and forth in quick succession from the same source. This
+	// guards against the flow being torn down and re-created mid-exchange (the
+	// clock-skew "congestion" churn that broke IKE): every datagram in the burst
+	// must round-trip on the same flow.
+	burst, err := net.DialUDP("udp", nil, serverUDPAddr)
+	assert.NoError(t, err)
+	defer burst.Close()
+
+	const rounds = 10
+	rbuf := make([]byte, 64*1024)
+	for i := 0; i < rounds; i++ {
+		msg := []byte(fmt.Sprintf("pkt-%d", i))
+		_, werr := burst.Write(msg)
+		assert.NoError(t, werr)
+
+		_ = burst.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, rerr := burst.Read(rbuf)
+		assert.NoError(t, rerr, "no echo for burst packet %d (flow likely churned)", i)
+		if rerr == nil {
+			assert.True(t, bytes.Equal(append([]byte("echo:"), msg...), rbuf[:n]),
+				"burst packet %d echo mismatch: got %q", i, rbuf[:n])
+		}
+		time.Sleep(20 * time.Millisecond) // rapid, like handshake retransmits
+	}
 }

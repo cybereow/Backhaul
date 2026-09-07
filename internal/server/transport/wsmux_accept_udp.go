@@ -4,21 +4,43 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils"
 )
 
-// udpListener forwards UDP for one mapped port over the wssmux/wsmux tunnel.
-// It mirrors the TCP-transport accept_udp path (see accept_udp.go), but instead
-// of pulling a raw pooled TCP connection it opens a smux stream on a live pool
-// session for each distinct UDP source. Each datagram is length-framed and
-// carried over that stream using the exact same wire format the TCP transport
-// uses, so UDPConnectionHandler and the client's UDP dialer are reused verbatim.
-//
-// UDP over mux relies on the flow-kind byte, which only exists on mux_version >=
-// 2; startPortListeners guards this, so udpListener is never started on a v1
-// tunnel.
+// udpFlowIdleTimeout is how long a UDP flow (one source address) is kept open
+// with no traffic in either direction before its tunnel stream is torn down.
+// UDP is connectionless, so this is the only way to reclaim a stream for a
+// client that has gone away. It is deliberately generous: a stateful handshake
+// like IKE retransmits over tens of seconds, and an established VPN sends
+// keepalives (L2TP HELLO, IPsec DPD) on the order of 30-60s, so a short idle
+// would cut a live-but-quiet tunnel. The timer is reset on every datagram in
+// either direction, so it only fires on a genuinely dead flow.
+const udpFlowIdleTimeout = 120 * time.Second
+
+// udpFlow is one UDP pseudo-connection: all datagrams from a single source
+// address, carried over one smux stream. Unlike the TCP-transport accept_udp
+// path this carries no timestamp/congestion metadata - smux already gives the
+// stream reliability, ordering and flow control, and the cross-machine
+// timestamp comparison that path uses false-positives on any clock skew between
+// the two hosts, which would churn the stream mid-handshake and break IKE.
+type udpFlow struct {
+	payload    chan []byte
+	clientAddr *net.UDPAddr
+	lastActive atomic.Int64 // unix-nano of the last datagram in either direction
+}
+
+func (f *udpFlow) touch() {
+	f.lastActive.Store(time.Now().UnixNano())
+}
+
+// udpListener forwards UDP for one mapped port over the wssmux/wsmux tunnel. For
+// each distinct UDP source it opens one smux stream on a live pool session, tags
+// it as a UDP flow, and shuttles length-framed datagrams both ways. UDP over mux
+// relies on the flow-kind byte, which only exists on mux_version >= 2;
+// startPortListeners guards this, so udpListener is never started on a v1 tunnel.
 func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
@@ -34,17 +56,10 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 
 	s.logger.Infof("UDP listener started successfully, listening on address: %s", listener.LocalAddr().String())
 
-	// Track active connections keyed by source address
-	activeConnections := map[string]*LocalAcceptUDPConn{}
-
-	// 2 bytes reserved for the length header prepended to each datagram
-	buf := make([]byte, BufferSize-2)
-
-	udpChan := make(chan *LocalAcceptUDPConn, s.config.ChannelSize)
-
+	active := map[string]*udpFlow{}
 	mu := &sync.Mutex{}
 
-	go s.handleUDPLoop(udpChan, &activeConnections, mu)
+	buf := make([]byte, 64*1024)
 
 	go func() {
 		for {
@@ -54,59 +69,38 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 			default:
 				n, addr, err := listener.ReadFromUDP(buf)
 				if err != nil {
+					if s.ctx.Err() != nil {
+						return
+					}
 					s.logger.Errorf("failed to read from UDP listener: %v", err)
 					continue
 				}
 
 				key := addr.String()
+				datagram := append([]byte(nil), buf[:n]...) // copy before the next read overwrites buf
 
 				mu.Lock()
-				if existingConn, exists := activeConnections[key]; exists {
-					if existingConn.IsCongested.Load() {
-						s.logger.Debugf("connection with timestamp %d congested. Removing %s from active connections due to network congestion", existingConn.timeCreated, addr.String())
-						// Fall through and open a fresh stream for this source.
-					} else {
-						select {
-						case existingConn.payload <- append([]byte(nil), buf[:n]...): // copy to avoid overwrite
-							s.logger.Tracef("buffered %d bytes for existing connection %s", n, addr.String())
-						default:
-							s.logger.Warnf("payload channel for connection %s is full, dropping udp packet", addr.String())
-						}
-						mu.Unlock()
-						continue
-					}
-				}
-				mu.Unlock()
-
-				// Buffer up to 100,000 datagrams for this source
-				payloadChan := make(chan []byte, 100_000)
-
-				newUDPConn := LocalAcceptUDPConn{
-					timeCreated: time.Now().UnixNano(),
-					payload:     payloadChan,
-					remoteAddr:  remoteAddr,
-					listener:    listener,
-					clientAddr:  addr,
-				}
-
-				mu.Lock()
-				activeConnections[key] = &newUDPConn
-				mu.Unlock()
-
-				select {
-				case udpChan <- &newUDPConn:
-					s.logger.Debugf("accepted UDP connection from %s", addr.String())
-					payloadChan <- append([]byte(nil), buf[:n]...) // hand the first datagram to the new flow
-				default:
-					s.logger.Warn("UDP channel is full, dropping packet.")
-					mu.Lock()
-					// Roll back the just-added entry so a dropped flow doesn't
-					// pin the source's key forever.
-					if activeConnections[key] == &newUDPConn {
-						delete(activeConnections, key)
+				if f, ok := active[key]; ok {
+					select {
+					case f.payload <- datagram:
+						s.logger.Tracef("buffered %d bytes for existing udp flow %s", n, key)
+					default:
+						s.logger.Warnf("payload channel for udp flow %s is full, dropping packet", key)
 					}
 					mu.Unlock()
+					continue
 				}
+
+				f := &udpFlow{
+					payload:    make(chan []byte, 2048),
+					clientAddr: addr,
+				}
+				f.touch()
+				f.payload <- datagram // first datagram; channel is empty so this never blocks
+				active[key] = f
+				mu.Unlock()
+
+				go s.serveUDPFlow(listener, remoteAddr, key, f, active, mu)
 			}
 		}
 	}()
@@ -114,32 +108,82 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 	<-s.ctx.Done()
 }
 
-// handleUDPLoop assigns each new UDP source a smux stream and starts the shared
-// UDPConnectionHandler on it.
-func (s *WsMuxTransport) handleUDPLoop(udpChan chan *LocalAcceptUDPConn, activeConnections *map[string]*LocalAcceptUDPConn, mu *sync.Mutex) {
+// serveUDPFlow opens the tunnel stream for one source and pumps datagrams in
+// both directions until the flow goes idle, the stream drops, or the transport
+// shuts down.
+func (s *WsMuxTransport) serveUDPFlow(listener *net.UDPConn, remoteAddr, key string, f *udpFlow, active map[string]*udpFlow, mu *sync.Mutex) {
+	stream, err := s.openUDPStream(remoteAddr)
+	if err != nil {
+		s.logger.Errorf("failed to open udp tunnel stream for %s: %v", key, err)
+		mu.Lock()
+		if active[key] == f {
+			delete(active, key)
+		}
+		mu.Unlock()
+		return
+	}
+
+	s.logger.Debugf("initiated udp flow %s -> %s", key, remoteAddr)
+
+	defer func() {
+		stream.Close()
+		mu.Lock()
+		if active[key] == f {
+			delete(active, key)
+		}
+		mu.Unlock()
+		s.logger.Debugf("closed udp flow %s", key)
+	}()
+
+	port := listener.LocalAddr().(*net.UDPAddr).Port
+
+	// Stream -> UDP client (replies coming back from the local service).
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		rbuf := make([]byte, 64*1024)
+		for {
+			n, err := utils.ReadUDPFrame(stream, rbuf)
+			if err != nil {
+				s.logger.Debugf("udp flow %s stream closed: %v", key, err)
+				return
+			}
+			f.touch()
+			if _, err := listener.WriteToUDP(rbuf[:n], f.clientAddr); err != nil {
+				s.logger.Debugf("udp flow %s: failed to write reply to client: %v", key, err)
+				return
+			}
+			if s.config.Sniffer {
+				s.usageMonitor.AddOrUpdatePort(port, uint64(n))
+			}
+		}
+	}()
+
+	// UDP client -> stream (datagrams arriving on the public port), plus the
+	// idle watchdog.
+	idleCheck := time.NewTicker(5 * time.Second)
+	defer idleCheck.Stop()
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
-		case localConn := <-udpChan:
-			stream, err := s.openUDPStream(localConn.remoteAddr)
-			if err != nil {
-				s.logger.Errorf("failed to open udp tunnel stream for %s: %v", localConn.clientAddr.String(), err)
-				// Give up on this source; drop its buffered datagrams and free the key.
-				mu.Lock()
-				close(localConn.payload)
-				if (*activeConnections)[localConn.clientAddr.String()] == localConn {
-					delete(*activeConnections, localConn.clientAddr.String())
-				}
-				mu.Unlock()
-				continue
+		case <-readerDone:
+			return
+		case data := <-f.payload:
+			if err := utils.WriteUDPFrame(stream, data); err != nil {
+				s.logger.Debugf("udp flow %s: failed to write to stream: %v", key, err)
+				return
 			}
-
-			// wssmux does not measure RTT; UDPConnectionHandler treats 0 as
-			// "unknown" and applies a sane default for congestion detection.
-			go UDPConnectionHandler(localConn, stream, s.logger, s.usageMonitor, localConn.listener.LocalAddr().(*net.UDPAddr).Port, s.config.Sniffer, 0, activeConnections, mu)
-
-			s.logger.Debugf("initiate new udp handler for connection %s with timestamp %d", localConn.clientAddr.String(), localConn.timeCreated)
+			f.touch()
+			if s.config.Sniffer {
+				s.usageMonitor.AddOrUpdatePort(port, uint64(len(data)))
+			}
+		case <-idleCheck.C:
+			if time.Since(time.Unix(0, f.lastActive.Load())) > udpFlowIdleTimeout {
+				s.logger.Debugf("udp flow %s idle for %s, closing", key, udpFlowIdleTimeout)
+				return
+			}
 		}
 	}
 }

@@ -85,7 +85,7 @@ To start using the solution, you'll need to configure both server and client com
     [server]# Local, IRAN
     bind_addr = "0.0.0.0:3080"    # Address and port for the server to listen on (mandatory).
     transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
-    accept_udp = false             # Enable transferring UDP connections over TCP transport. (optional, default: false)
+    accept_udp = false             # Enable forwarding UDP alongside TCP on every mapped port. Works with the "tcp" transport (UDP over the raw TCP tunnel) and with "wsmux"/"wssmux" (UDP over the mux tunnel, which requires mux_version = 2 on both server and client). This is what lets a single wssmux tunnel also carry UDP services such as L2TP/IPsec (UDP 500/1701/4500) - list those UDP ports in `ports` and set accept_udp = true. (optional, default: false)
     token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
     keepalive_period = 75         # Interval in seconds to send keep-alive packets.(optional, default: 75s)
     nodelay = false               # Enable TCP_NODELAY (optional, default: false).
@@ -462,6 +462,7 @@ To start using the solution, you'll need to configure both server and client com
    nodelay = true 
    heartbeat = 40 
    channel_size = 2048
+   accept_udp = false            # Also forward UDP on each mapped port over the mux tunnel (requires mux_version = 2 on both ends). Enables carrying UDP services such as L2TP/IPsec over wssmux.
    mux_con = 8
    mux_version = 1
    mux_framesize = 32768 

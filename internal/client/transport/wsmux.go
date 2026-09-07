@@ -564,6 +564,15 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 				} else if kind == utils.FlowPromote {
 					go c.handlePromoteStream(stream)
 					continue
+				} else if kind == utils.FlowUDP {
+					remoteAddr, err := utils.ReceiveFlowUDP(stream)
+					if err != nil {
+						c.logger.Errorf("unable to read udp flow header: %v", err)
+						stream.Close()
+						continue
+					}
+					go c.localDialerUDP(stream, remoteAddr)
+					continue
 				}
 			} else {
 				if c.config.StripeFactor > 1 {
@@ -709,6 +718,50 @@ func (c *WsMuxTransport) localDialer(stream net.Conn, remoteAddr string) {
 	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
 
 	handlers.TCPConnectionHandler(c.ctx, false, stream, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+}
+
+// localDialerUDP handles a stream the server tagged as a UDP flow: it dials the
+// local UDP target and shuttles length-framed datagrams between the stream and
+// the socket using the shared accept_udp framing. Unlike UDPDialer it never
+// calls Fatalf (a bad target must not kill the whole tunnel) and tears both
+// directions down when either side ends, so nothing leaks.
+func (c *WsMuxTransport) localDialerUDP(stream net.Conn, remoteAddr string) {
+	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
+	if err != nil {
+		c.logger.Infof("failed to resolve remote udp port: %v", err)
+		stream.Close()
+		return
+	}
+
+	remoteUDPAddr, err := net.ResolveUDPAddr("udp", resolvedAddr)
+	if err != nil {
+		c.logger.Errorf("failed to resolve remote udp address %s: %v", resolvedAddr, err)
+		stream.Close()
+		return
+	}
+
+	remoteConn, err := net.DialUDP("udp", nil, remoteUDPAddr)
+	if err != nil {
+		c.logger.Errorf("failed to dial remote udp address %s: %v", resolvedAddr, err)
+		stream.Close()
+		return
+	}
+	defer remoteConn.Close()
+
+	c.logger.Debugf("connected to local udp address %s successfully", remoteAddr)
+
+	done := make(chan struct{})
+	go func() {
+		// stream -> udp; returns when the stream is closed/EOF
+		tcpToUDP(stream, remoteConn, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+		remoteConn.Close() // unblock the udp read below
+		close(done)
+	}()
+
+	// udp -> stream; returns when the udp socket is closed
+	udpToTCP(stream, remoteConn, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+	stream.Close() // unblock the stream read above
+	<-done
 }
 
 func (c *WsMuxTransport) localDialerPlain(stream *smux.Stream, flowID uint64, remoteAddr string) {

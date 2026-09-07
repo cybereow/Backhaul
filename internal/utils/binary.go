@@ -264,6 +264,7 @@ const (
 	FlowPlain   byte = 0x00
 	FlowStriped byte = 0x01
 	FlowPromote byte = 0x02
+	FlowUDP     byte = 0x03
 )
 
 func SendFlowPlain(conn net.Conn, flowID uint64, remoteAddr string) error {
@@ -294,6 +295,41 @@ func ReceiveFlowPlain(conn net.Conn) (flowID uint64, remoteAddr string, err erro
 		}
 	}
 	return flowID, string(addrBuf), nil
+}
+
+// SendFlowUDP marks a freshly opened stream as carrying a UDP flow and carries
+// the target address for the client to dial. Unlike a plain TCP flow, the
+// payload on the stream is length-framed UDP datagrams (see accept_udp), so the
+// receiver must route it to a UDP dialer rather than a TCP one. UDP over mux is
+// only available with mux_version >= 2, since flow kinds are read on that path.
+func SendFlowUDP(conn net.Conn, remoteAddr string) error {
+	const headerSize = 1 + 2 // kind + addr length
+	buf := make([]byte, headerSize+len(remoteAddr))
+	buf[0] = FlowUDP
+	binary.BigEndian.PutUint16(buf[1:3], uint16(len(remoteAddr)))
+	copy(buf[3:], remoteAddr)
+	if _, err := conn.Write(buf); err != nil {
+		return fmt.Errorf("failed to send udp flow header: %w", err)
+	}
+	return nil
+}
+
+// ReceiveFlowUDP reads the address written by SendFlowUDP. The one-byte flow
+// kind is consumed separately by ReadFlowKind before this is called.
+func ReceiveFlowUDP(conn net.Conn) (remoteAddr string, err error) {
+	const headerSize = 2 // addr length
+	head := make([]byte, headerSize)
+	if _, err = io.ReadFull(conn, head); err != nil {
+		return "", fmt.Errorf("failed to read udp flow header: %w", err)
+	}
+	addrLen := binary.BigEndian.Uint16(head[0:2])
+	addrBuf := make([]byte, addrLen)
+	if addrLen > 0 {
+		if _, err = io.ReadFull(conn, addrBuf); err != nil {
+			return "", fmt.Errorf("failed to read udp flow header address: %w", err)
+		}
+	}
+	return string(addrBuf), nil
 }
 
 func SendFlowStriped(conn net.Conn, groupID uint32, index, total, parity uint8, remoteAddr string) error {

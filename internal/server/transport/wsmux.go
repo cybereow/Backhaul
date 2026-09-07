@@ -83,6 +83,7 @@ type WsMuxConfig struct {
 	Heartbeat            time.Duration // in seconds
 	ChannelSize          int
 	MuxCon               int
+	AcceptUDP            bool // forward UDP alongside TCP on each mapped port (requires mux_version >= 2)
 	MuxVersion           int
 	MaxFrameSize         int
 	MaxReceiveBuffer     int
@@ -530,6 +531,13 @@ func (s *WsMuxTransport) tunnelListener() {
 }
 
 func (s *WsMuxTransport) parsePortMappings() {
+	// UDP forwarding rides the flow-kind protocol, which only exists on
+	// mux_version >= 2. Warn once here rather than silently ignoring accept_udp
+	// so a misconfigured setup is obvious in the logs.
+	if s.config.AcceptUDP && s.config.MuxVersion < 2 {
+		s.logger.Warn("accept_udp is enabled but requires mux_version = 2; UDP forwarding is disabled for this session")
+	}
+
 	for _, portMapping := range s.config.Ports {
 		parts := strings.Split(portMapping, "=")
 
@@ -561,8 +569,8 @@ func (s *WsMuxTransport) parsePortMappings() {
 				// Create listeners for all ports in the range
 				for port := startPort; port <= endPort; port++ {
 					localAddr = fmt.Sprintf(":%d", port)
-					go s.localListener(localAddr, strconv.Itoa(port)) // Use port as the remoteAddr
-					time.Sleep(1 * time.Millisecond)                  // for wide port ranges
+					s.startPortListeners(localAddr, strconv.Itoa(port)) // Use port as the remoteAddr
+					time.Sleep(1 * time.Millisecond)                    // for wide port ranges
 				}
 				continue
 			} else {
@@ -599,7 +607,7 @@ func (s *WsMuxTransport) parsePortMappings() {
 				// Create listeners for all ports in the range
 				for port := startPort; port <= endPort; port++ {
 					localAddr = fmt.Sprintf(":%d", port)
-					go s.localListener(localAddr, remoteAddr)
+					s.startPortListeners(localAddr, remoteAddr)
 					time.Sleep(1 * time.Millisecond) // for wide port ranges
 				}
 				continue
@@ -616,7 +624,18 @@ func (s *WsMuxTransport) parsePortMappings() {
 			s.logger.Fatalf("invalid port mapping format: %s", portMapping)
 		}
 		// Start listeners for single port
-		go s.localListener(localAddr, remoteAddr)
+		s.startPortListeners(localAddr, remoteAddr)
+	}
+}
+
+// startPortListeners brings up the TCP listener for a mapped port and, when
+// accept_udp is enabled on a mux_version >= 2 tunnel, a UDP listener on the same
+// port so both transports are forwarded (needed for e.g. L2TP/IPsec, which uses
+// UDP 500/1701/4500).
+func (s *WsMuxTransport) startPortListeners(localAddr, remoteAddr string) {
+	go s.localListener(localAddr, remoteAddr)
+	if s.config.AcceptUDP && s.config.MuxVersion >= 2 {
+		go s.udpListener(localAddr, remoteAddr)
 	}
 }
 

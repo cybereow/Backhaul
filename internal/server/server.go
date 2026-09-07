@@ -126,6 +126,7 @@ func (s *Server) Start() {
 			ChannelSize:          s.config.ChannelSize,
 			Ports:                s.config.Ports,
 			MuxCon:               s.config.MuxCon,
+			AcceptUDP:            s.config.AcceptUDP,
 			MuxVersion:           s.config.MuxVersion,
 			MaxFrameSize:         s.config.MaxFrameSize,
 			MaxReceiveBuffer:     s.config.MaxReceiveBuffer,

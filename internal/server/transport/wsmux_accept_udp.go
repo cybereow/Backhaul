@@ -20,6 +20,12 @@ import (
 // either direction, so it only fires on a genuinely dead flow.
 const udpFlowIdleTimeout = 120 * time.Second
 
+// defaultUDPPayloadBuffer is the fallback per-flow datagram queue depth used
+// when the transport is built without a configured UDPBuffer (cmd.applyDefaults
+// sets this from udp_buffer for the normal path). Kept in sync with
+// cmd.defaultUDPBuffer.
+const defaultUDPPayloadBuffer = 2048
+
 // udpFlow is one UDP pseudo-connection: all datagrams from a single source
 // address, carried over one smux stream. Unlike the TCP-transport accept_udp
 // path this carries no timestamp/congestion metadata - smux already gives the
@@ -59,6 +65,18 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 	active := map[string]*udpFlow{}
 	mu := &sync.Mutex{}
 
+	// How many datagrams a single flow may queue before we start dropping. A
+	// bigger buffer absorbs a short burst where the client briefly outruns the
+	// tunnel stream, at the cost of more memory per flow; it does not raise a
+	// flow's steady-state throughput, so a flow that is permanently faster than
+	// the tunnel will still drop once the buffer fills. 0/unset keeps the
+	// original 2048 (defaults are applied in cmd.applyDefaults, but guard here
+	// too so a directly-constructed transport - e.g. in tests - is still sane).
+	payloadBuf := s.config.UDPBuffer
+	if payloadBuf < 1 {
+		payloadBuf = defaultUDPPayloadBuffer
+	}
+
 	buf := make([]byte, 64*1024)
 
 	go func() {
@@ -92,7 +110,7 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 				}
 
 				f := &udpFlow{
-					payload:    make(chan []byte, 2048),
+					payload:    make(chan []byte, payloadBuf),
 					clientAddr: addr,
 				}
 				f.touch()

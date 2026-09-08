@@ -26,7 +26,8 @@ const ( // Default values
 	defaultMaxStreamBuffer  = 65536   // 64KB
 	defaultSnifferLog       = "backhaul.json"
 	defaultMuxCon           = 8
-	defaultMuxStripe        = 1 // 1 disables striping - one flow, one connection
+	defaultMuxStripe        = 1    // 1 disables striping - one flow, one connection
+	defaultUDPBuffer        = 2048 // datagrams queued per UDP flow before dropping (wsmux/wssmux)
 )
 
 func applyDefaults(cfg *config.Config) {
@@ -127,6 +128,12 @@ func applyDefaults(cfg *config.Config) {
 	// Mux concurrancy
 	if cfg.Server.MuxCon < 1 {
 		cfg.Server.MuxCon = defaultMuxCon
+	}
+
+	// UDP per-flow buffer - how many datagrams a single UDP flow may queue
+	// before packets are dropped. 0/unset keeps the original 2048.
+	if cfg.Server.UDPBuffer < 1 {
+		cfg.Server.UDPBuffer = defaultUDPBuffer
 	}
 
 	// Connection rotation age stays off unless set: it has to sit below the

@@ -67,6 +67,45 @@ type WsMuxTransport struct {
 	controlMu       sync.Mutex
 	handlersStarted bool
 	graceTimer      *time.Timer
+
+	// events is a small ring buffer of disruption events (control-channel
+	// losses, restarts, replacements) with timestamps, so an operator can see
+	// *why* a tunnel dropped after the fact via the /diag endpoint instead of
+	// having to catch it live in the logs.
+	eventsMu sync.Mutex
+	events   []transportEvent
+}
+
+// transportEvent is one recorded disruption: what happened, when, and any
+// detail. Kept deliberately small - this is a diagnostic breadcrumb trail, not
+// a metrics system.
+type transportEvent struct {
+	Time   time.Time `json:"time"`
+	Kind   string    `json:"kind"`
+	Detail string    `json:"detail,omitempty"`
+}
+
+// maxRecordedEvents caps the ring buffer; old events are dropped once full.
+const maxRecordedEvents = 128
+
+// recordEvent appends a disruption event, dropping the oldest once the ring is
+// full. Safe to call from any goroutine.
+func (s *WsMuxTransport) recordEvent(kind, detail string) {
+	s.eventsMu.Lock()
+	s.events = append(s.events, transportEvent{Time: time.Now(), Kind: kind, Detail: detail})
+	if len(s.events) > maxRecordedEvents {
+		s.events = s.events[len(s.events)-maxRecordedEvents:]
+	}
+	s.eventsMu.Unlock()
+}
+
+// snapshotEvents returns a copy of the recorded events, newest last.
+func (s *WsMuxTransport) snapshotEvents() []transportEvent {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	out := make([]transportEvent, len(s.events))
+	copy(out, s.events)
+	return out
 }
 
 type WsMuxConfig struct {
@@ -299,11 +338,13 @@ func (s *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 
 			case utils.SG_Closed:
 				s.logger.Warn("control channel has been closed by the client")
+				s.recordEvent("restart", "control channel closed by client; full restart (all flows dropped)")
 				s.Restart()
 				return
 
 			default:
 				s.logger.Errorf("unexpected response from channel: %v", msg)
+				s.recordEvent("restart", fmt.Sprintf("unexpected control signal %v; full restart (all flows dropped)", msg))
 				go s.Restart()
 				return
 			}
@@ -348,6 +389,7 @@ func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 			return
 		}
 		s.logger.Warn("control channel did not reattach within the grace window, restarting server")
+		s.recordEvent("restart", fmt.Sprintf("control channel did not reattach within %s; full restart (all flows dropped)", controlGraceWindow))
 		s.Restart()
 	})
 	s.controlMu.Unlock()
@@ -356,6 +398,7 @@ func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 	s.controlMu.Lock()
 	s.config.TunnelStatus = fmt.Sprintf("Reconnecting (%s)", s.config.Mode)
 	s.controlMu.Unlock()
+	s.recordEvent("control_lost", fmt.Sprintf("control channel dropped; holding pool up to %s for reattach (flows keep running)", controlGraceWindow))
 	s.logger.Warnf("control channel lost, holding the pool for up to %s for the client to reattach", controlGraceWindow)
 }
 
@@ -365,6 +408,7 @@ func (s *WsMuxTransport) tunnelListener() {
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
 	speedtestPath := basePath + "/speedtest"
+	diagPath := basePath + "/diag"
 
 	// Built once rather than per request: this ran through fmt.Sprintf on
 	// every probe that reached the listener.
@@ -393,6 +437,23 @@ func (s *WsMuxTransport) tunnelListener() {
 					return
 				}
 				s.handleSpeedtestRequest(w, r)
+				return
+			}
+
+			// Token-gated diagnostics: recent disruption events (control-channel
+			// losses, restarts) so an operator can see why the tunnel dropped
+			// after the fact, without catching it live in the logs.
+			if r.URL.Path == diagPath {
+				if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				events := s.snapshotEvents()
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"now":    time.Now(),
+					"count":  len(events),
+					"events": events,
+				})
 				return
 			}
 
@@ -436,6 +497,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				// for.
 				if old := s.controlChannel; old != nil {
 					s.logger.Warn("control channel replaced while the previous one was still registered")
+					s.recordEvent("control_replaced", fmt.Sprintf("new control channel from %s adopted, stale one dropped", conn.RemoteAddr()))
 					old.Close()
 				}
 				// The first control channel starts the pool machinery. One

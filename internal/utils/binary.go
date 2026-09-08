@@ -265,6 +265,7 @@ const (
 	FlowStriped byte = 0x01
 	FlowPromote byte = 0x02
 	FlowUDP     byte = 0x03
+	FlowPing    byte = 0x04
 )
 
 func SendFlowPlain(conn net.Conn, flowID uint64, remoteAddr string) error {
@@ -330,6 +331,42 @@ func ReceiveFlowUDP(conn net.Conn) (remoteAddr string, err error) {
 		}
 	}
 	return string(addrBuf), nil
+}
+
+// SendFlowPing opens an RTT probe on a pool session: the flow-kind byte plus an
+// 8-byte nonce the peer echoes back unchanged. The sender times the round-trip
+// to estimate the session's latency, used to steer striped-leg selection toward
+// the lowest-latency CDN. Only meaningful on mux_version >= 2, where the peer
+// reads the flow kind and can route the stream to the ping echoer.
+func SendFlowPing(conn net.Conn, nonce uint64) error {
+	var buf [1 + 8]byte
+	buf[0] = FlowPing
+	binary.BigEndian.PutUint64(buf[1:], nonce)
+	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to send ping probe: %w", err)
+	}
+	return nil
+}
+
+// ReceiveFlowPing reads the 8-byte nonce of a ping probe. The one-byte flow kind
+// is consumed separately by ReadFlowKind before this is called.
+func ReceiveFlowPing(conn net.Conn) (nonce uint64, err error) {
+	var buf [8]byte
+	if _, err = io.ReadFull(conn, buf[:]); err != nil {
+		return 0, fmt.Errorf("failed to read ping probe: %w", err)
+	}
+	return binary.BigEndian.Uint64(buf[:]), nil
+}
+
+// EchoFlowPing writes a ping nonce back unchanged, completing the round-trip the
+// prober is timing.
+func EchoFlowPing(conn net.Conn, nonce uint64) error {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], nonce)
+	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to echo ping probe: %w", err)
+	}
+	return nil
 }
 
 // WriteUDPFrame writes one UDP datagram to a stream as a 2-byte big-endian

@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,14 +49,14 @@ type WsMuxTransport struct {
 	stripedFlows     int32 // in-flight striped flows, bounded by the pool's stream budget
 	plainFlows       int32
 
-	// sessions is a live registry of pool sessions, used only when
-	// StripeFactor > 1 so the striped dispatcher can pick several sessions
-	// to open legs of the same logical connection on. The non-striped path
-	// (StripeFactor <= 1, the default) never touches this.
-	sessionsMu     sync.Mutex
-	sessions       []*smux.Session
-	stripeRotation uint32
-	stripeGroupID  uint32
+	// sessions is a live registry of pool sessions the striped dispatcher (and
+	// the single-leg UDP path) picks legs from. Each entry carries the CDN it
+	// arrived over and a live RTT estimate so leg selection can steer toward the
+	// lowest-latency, least-loaded connection and spread a flow across distinct
+	// CDNs. The non-striped TCP path never touches this.
+	sessionsMu    sync.Mutex
+	sessions      []*pooledSession
+	stripeGroupID uint32
 
 	fallbackProxy http.Handler
 
@@ -733,7 +734,14 @@ func (s *WsMuxTransport) handleLoop() {
 			atomic.AddInt32(&s.sessionCounter, 1)
 			atomic.AddInt32(&s.admittedSessions, 1)
 
-			s.registerSession(session)
+			ps := s.registerSession(session)
+			// Keep this session's RTT estimate fresh so leg selection can steer
+			// toward the lowest-latency CDN. Only on mux_version >= 2 (the peer
+			// must be able to route the probe to its echoer) and only when a path
+			// actually selects legs - striping, or the UDP flow path.
+			if s.config.MuxVersion >= 2 && (s.config.StripeFactor > 1 || s.config.AcceptUDP) {
+				go s.probeSessionRTT(ps)
+			}
 			go func(sess *smux.Session) {
 				<-sess.CloseChan()
 				s.unregisterSession(sess)
@@ -746,18 +754,45 @@ func (s *WsMuxTransport) handleLoop() {
 	}
 }
 
-// registerSession/unregisterSession maintain the live-session pool the
-// striped dispatcher picks legs from. Only used when StripeFactor > 1.
-func (s *WsMuxTransport) registerSession(session *smux.Session) {
+// pooledSession is one live pool connection plus the metadata leg selection
+// scores it on: the CDN it arrived over (so a flow can be spread across distinct
+// CDNs) and an EWMA round-trip estimate maintained by probeSessionRTT.
+type pooledSession struct {
+	session *smux.Session
+	cdn     string       // CDN identity: the remote IP the pool connection arrived from
+	rtt     atomic.Int64 // EWMA round-trip in nanoseconds; 0 until the first probe lands
+}
+
+// Leg-selection scoring weights. A leg's score is loadWeight per open stream
+// plus rttWeight per millisecond of measured RTT; the lowest score wins. The
+// defaults make load the primary signal (spreading a flow so no one connection
+// carries it all) while a slow CDN is still avoided: an extra ~2ms of latency
+// costs about as much as one extra in-flight stream. unprobedRTTms is the
+// neutral RTT charged to a session not yet probed (or on mux_version 1, where
+// probing isn't possible), so a fresh session is neither unfairly preferred nor
+// shunned before its first probe.
+const (
+	legLoadWeight   = 1.0
+	legRTTWeight    = 0.5
+	unprobedRTTms   = 40.0
+	rttProbeEvery   = 5 * time.Second
+	rttProbeTimeout = 10 * time.Second
+)
+
+// registerSession adds a pool session to the live registry and returns its
+// wrapper so the caller can start probing it. unregisterSession removes it.
+func (s *WsMuxTransport) registerSession(session *smux.Session) *pooledSession {
+	ps := &pooledSession{session: session, cdn: cdnKey(session.RemoteAddr())}
 	s.sessionsMu.Lock()
-	s.sessions = append(s.sessions, session)
+	s.sessions = append(s.sessions, ps)
 	s.sessionsMu.Unlock()
+	return ps
 }
 
 func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
 	s.sessionsMu.Lock()
-	for i, sess := range s.sessions {
-		if sess == session {
+	for i, ps := range s.sessions {
+		if ps.session == session {
 			s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
 			break
 		}
@@ -765,12 +800,86 @@ func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
 	s.sessionsMu.Unlock()
 }
 
-// openStripedLegs opens one stream on each of up to n distinct live
-// sessions, rotating the starting point on every call so legs aren't always
-// pulled from the same first few sessions.
+// cdnKey reduces a pool connection's remote address to a CDN identity - the host
+// (IP) without the ephemeral port - so two connections that arrived over the
+// same CDN edge count as the same path for spreading purposes.
+func cdnKey(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
+// legScore ranks a session for leg selection: lower is better. It combines live
+// load (open streams on the session) with the measured RTT so selection favours
+// the least-loaded, lowest-latency connection.
+func legScore(ps *pooledSession) float64 {
+	return legScoreValue(ps.session.NumStreams(), ps.rtt.Load())
+}
+
+// legScoreValue is the pure scoring math, split out from legScore so it can be
+// tested without a live smux session. An unprobed session (rttNanos <= 0) is
+// charged the neutral unprobedRTTms rather than 0, so a fresh session isn't
+// falsely ranked as the fastest path.
+func legScoreValue(load int, rttNanos int64) float64 {
+	rttMs := unprobedRTTms
+	if rttNanos > 0 {
+		rttMs = float64(rttNanos) / float64(time.Millisecond)
+	}
+	return float64(load)*legLoadWeight + rttMs*legRTTWeight
+}
+
+// selectLegs picks the n best sessions for a flow: lowest score first, but
+// spread across distinct CDNs before doubling up on any one. Pass 1 takes the
+// best session from each distinct CDN (so a striped flow rides several CDNs, and
+// a single-leg UDP flow lands on the best CDN); pass 2 fills any remaining slots
+// by best score regardless of CDN, for when a flow wants more legs than there
+// are CDNs. avail is sorted in place.
+func selectLegs(avail []*pooledSession, n int, score func(*pooledSession) float64) []*pooledSession {
+	sort.SliceStable(avail, func(i, j int) bool {
+		return score(avail[i]) < score(avail[j])
+	})
+
+	chosen := make([]*pooledSession, 0, n)
+	usedCDN := make(map[string]bool)
+	for _, ps := range avail {
+		if len(chosen) == n {
+			break
+		}
+		if usedCDN[ps.cdn] {
+			continue
+		}
+		usedCDN[ps.cdn] = true
+		chosen = append(chosen, ps)
+	}
+	if len(chosen) < n {
+		inChosen := make(map[*pooledSession]bool, len(chosen))
+		for _, ps := range chosen {
+			inChosen[ps] = true
+		}
+		for _, ps := range avail {
+			if len(chosen) == n {
+				break
+			}
+			if !inChosen[ps] {
+				chosen = append(chosen, ps)
+			}
+		}
+	}
+	return chosen
+}
+
+// openStripedLegs opens one stream on each of up to n live sessions, chosen by
+// selectLegs to be the least-loaded, lowest-latency, most CDN-diverse set
+// available. Used by both the striped TCP dispatcher (n = legsPerFlow) and the
+// UDP path (n = 1, which then just lands the flow on the single best session).
 func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 	s.sessionsMu.Lock()
-	avail := make([]*smux.Session, len(s.sessions))
+	avail := make([]*pooledSession, len(s.sessions))
 	copy(avail, s.sessions)
 	s.sessionsMu.Unlock()
 
@@ -781,11 +890,10 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 		n = len(avail)
 	}
 
-	start := int(atomic.AddUint32(&s.stripeRotation, 1))
+	chosen := selectLegs(avail, n, legScore)
 	streams := make([]*smux.Stream, 0, n)
-	for i := 0; i < n; i++ {
-		sess := avail[(start+i)%len(avail)]
-		stream, err := sess.OpenStream()
+	for _, ps := range chosen {
+		stream, err := ps.session.OpenStream()
 		if err != nil {
 			for _, st := range streams {
 				st.Close()
@@ -795,6 +903,61 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 		streams = append(streams, stream)
 	}
 	return streams, nil
+}
+
+// probeSessionRTT keeps a session's RTT estimate current by opening a tiny ping
+// stream every rttProbeEvery and timing the peer's echo, feeding the result into
+// an EWMA. It runs only on mux_version >= 2 (flow kinds, so the peer can route
+// the probe to its echoer) and only while striping is on, so a non-striped
+// deployment pays nothing. It exits when the session closes or the transport
+// shuts down.
+func (s *WsMuxTransport) probeSessionRTT(ps *pooledSession) {
+	ticker := time.NewTicker(rttProbeEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ps.session.CloseChan():
+			return
+		case <-ticker.C:
+			rtt, err := measureRTT(ps.session)
+			if err != nil {
+				// A transient probe failure (a busy session refusing a stream)
+				// shouldn't discard a good estimate; just try again next tick.
+				s.logger.Tracef("rtt probe on %s failed: %v", ps.cdn, err)
+				continue
+			}
+			// EWMA (7/8 old, 1/8 new) so a single jittery sample doesn't swing
+			// selection; the first sample seeds it directly.
+			if old := ps.rtt.Load(); old > 0 {
+				ps.rtt.Store((old*7 + rtt) / 8)
+			} else {
+				ps.rtt.Store(rtt)
+			}
+		}
+	}
+}
+
+// measureRTT opens one ping stream, sends a nonce and times the echo. The stream
+// carries no user data and is closed immediately after.
+func measureRTT(session *smux.Session) (int64, error) {
+	stream, err := session.OpenStream()
+	if err != nil {
+		return 0, err
+	}
+	defer stream.Close()
+	if err := stream.SetDeadline(time.Now().Add(rttProbeTimeout)); err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	if err := utils.SendFlowPing(stream, uint64(start.UnixNano())); err != nil {
+		return 0, err
+	}
+	if _, err := utils.ReceiveFlowPing(stream); err != nil {
+		return 0, err
+	}
+	return int64(time.Since(start)), nil
 }
 
 // stripedDispatchLoop replaces the per-session handleSession loop when

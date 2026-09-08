@@ -67,8 +67,27 @@ func ApplyTCPTuning() {
 			// entry here.
 			{"sysctl", "-w", "net.core.default_qdisc=fq"},
 			{"sysctl", "-w", "net.ipv4.tcp_congestion_control=bbr"},
-			// {"sysctl", "-w", "net.ipv4.tcp_rmem = 16384 1048576 33554432"}, // Maximum of 1MB of TCP read buffer memory
-			// {"sysctl", "-w", "net.ipv4.tcp_wmem = 16384 1048576 33554432"}, // Maximum of 1MB TCP write buffer memory
+			// Raise the TCP autotuning ceilings (the third value of each triple).
+			// This is the fix for asymmetric upload throughput on the server side.
+			//
+			// The wsmux/wssmux server accepts its tunnel sockets through net/http
+			// (and tls.Listen), which never calls setsockopt(SO_SNDBUF) on them, so
+			// their send window is left entirely to kernel autotuning - bounded by
+			// tcp_wmem[2]. The kernel default for that ceiling is only 4 MB, while
+			// tcp_rmem[2] defaults to 32 MB (8x larger). On a high-RTT tunnel that
+			// asymmetry caps the server->client direction (the user's *upload*) hard:
+			// at ~94 ms RTT a 4 MB send window tops out at 4 MB / 0.094 s ~= 357 Mbps
+			// no matter how fast the link is, while the download direction - governed
+			// by the 32 MB receive ceiling - runs unthrottled. Raising net.core.wmem_max
+			// above does NOT help here: that clamp only bounds an *explicit* SO_SNDBUF,
+			// and an autotuned socket never sets one, so tcp_wmem[2] is the only lever.
+			//
+			// Raising only the max (leaving min/default modest) lets autotuning grow a
+			// socket's buffer to fill the BDP when a bulk flow actually needs it, while
+			// idle sockets still start small - so this costs no memory on the many
+			// short-lived proxied connections, unlike a forced fixed buffer.
+			{"sysctl", "-w", "net.ipv4.tcp_rmem=4096 131072 67108864"}, // recv autotuning: max 64 MB
+			{"sysctl", "-w", "net.ipv4.tcp_wmem=4096 16384 67108864"},  // send autotuning: max 64 MB (was 4 MB default - the upload cap)
 			// tcp_notsent_lowat deliberately left at the OS default (unlimited).
 			// A low value trades throughput for latency by forcing small,
 			// frequent writes - the right tradeoff for many concurrent

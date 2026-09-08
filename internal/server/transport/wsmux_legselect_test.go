@@ -87,6 +87,33 @@ func TestSelectLegsCapsAtAvailable(t *testing.T) {
 	}
 }
 
+func TestBestPerCDN(t *testing.T) {
+	// Two CDNs with two sessions each; bestPerCDN keeps one per CDN, the
+	// best-scoring one, ordered best-first. (Scores are stashed in rtt; the real
+	// bestPerCDN scores via legScore, but selection order here is exercised
+	// through the same distinct-CDN logic selectLegs uses.)
+	avail := []*pooledSession{
+		mkSession("cdnA", 5),
+		mkSession("cdnA", 1), // best A
+		mkSession("cdnB", 8),
+		mkSession("cdnB", 3), // best B
+	}
+	got := bestPerCDN(avail, fakeScore)
+	if len(got) != 2 {
+		t.Fatalf("want one session per distinct CDN (2), got %d", len(got))
+	}
+	seen := map[string]bool{}
+	for _, ps := range got {
+		if seen[ps.cdn] {
+			t.Fatalf("bestPerCDN returned a duplicate CDN: %v", cdnsOf(got))
+		}
+		seen[ps.cdn] = true
+	}
+	if !seen["cdnA"] || !seen["cdnB"] {
+		t.Errorf("both CDNs should be represented, got %v", cdnsOf(got))
+	}
+}
+
 func TestLegScoreValue(t *testing.T) {
 	// Lower load and lower RTT must score lower (better).
 	rtt := int64(10 * time.Millisecond)

@@ -84,6 +84,7 @@ type WsMuxConfig struct {
 	ChannelSize          int
 	MuxCon               int
 	AcceptUDP            bool // forward UDP alongside TCP on each mapped port (requires mux_version >= 2)
+	UDPBuffer            int  // datagrams queued per UDP flow before dropping (0 = default 2048)
 	MuxVersion           int
 	MaxFrameSize         int
 	MaxReceiveBuffer     int

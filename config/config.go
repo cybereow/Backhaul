@@ -44,6 +44,7 @@ type ServerConfig struct {
 	Heartbeat            int           `toml:"heartbeat"`
 	MuxCon               int           `toml:"mux_con"`
 	AcceptUDP            bool          `toml:"accept_udp"`
+	UDPBuffer            int           `toml:"udp_buffer"` // wsmux/wssmux: how many datagrams to queue per UDP flow before dropping (default 2048). Raise it to absorb short bursts when a single flow briefly outruns the tunnel; it smooths bursts but does not raise a flow's steady-state throughput.
 	SkipOptz             bool          `toml:"skip_optz"`
 	MSS                  int           `toml:"mss"`
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`

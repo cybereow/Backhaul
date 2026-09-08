@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -86,6 +87,7 @@ type WsMuxConfig struct {
 	MuxCon               int
 	AcceptUDP            bool // forward UDP alongside TCP on each mapped port (requires mux_version >= 2)
 	UDPBuffer            int  // datagrams queued per UDP flow before dropping (0 = default 2048)
+	Speedtest            bool // expose the token-gated <path>/speedtest endpoint (requires mux_version >= 2)
 	MuxVersion           int
 	MaxFrameSize         int
 	MaxReceiveBuffer     int
@@ -362,6 +364,7 @@ func (s *WsMuxTransport) tunnelListener() {
 	basePath := network.NormalizeBasePath(s.config.Path)
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
+	speedtestPath := basePath + "/speedtest"
 
 	// Built once rather than per request: this ran through fmt.Sprintf on
 	// every probe that reached the listener.
@@ -379,6 +382,19 @@ func (s *WsMuxTransport) tunnelListener() {
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.logger.Tracef("received http request from %s", r.RemoteAddr)
+
+			// Token-gated speedtest endpoint: not a tunnel upgrade, so it is
+			// handled before the upgrade path. Enabled only when configured; when
+			// off it falls through to the normal not-a-tunnel-path handling
+			// (fallback/401) so the endpoint is invisible.
+			if s.config.Speedtest && r.URL.Path == speedtestPath {
+				if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				s.handleSpeedtestRequest(w, r)
+				return
+			}
 
 			// A request is legitimate tunnel traffic only if it carries the
 			// token AND targets the control or a tunnel path. Anything else -
@@ -739,7 +755,7 @@ func (s *WsMuxTransport) handleLoop() {
 			// toward the lowest-latency CDN. Only on mux_version >= 2 (the peer
 			// must be able to route the probe to its echoer) and only when a path
 			// actually selects legs - striping, or the UDP flow path.
-			if s.config.MuxVersion >= 2 && (s.config.StripeFactor > 1 || s.config.AcceptUDP) {
+			if s.config.MuxVersion >= 2 && (s.config.StripeFactor > 1 || s.config.AcceptUDP || s.config.Speedtest) {
 				go s.probeSessionRTT(ps)
 			}
 			go func(sess *smux.Session) {
@@ -958,6 +974,128 @@ func measureRTT(session *smux.Session) (int64, error) {
 		return 0, err
 	}
 	return int64(time.Since(start)), nil
+}
+
+// speedtestResult is the JSON returned by the speedtest endpoint.
+type speedtestResult struct {
+	Direction string  `json:"direction"`
+	Seconds   int     `json:"seconds"`
+	CDN       string  `json:"cdn,omitempty"`    // the pool connection the test ran over
+	RTTms     float64 `json:"rtt_ms,omitempty"` // last measured RTT of that connection
+	DownMbps  float64 `json:"down_mbps,omitempty"`
+	UpMbps    float64 `json:"up_mbps,omitempty"`
+	DownBytes int64   `json:"down_bytes,omitempty"`
+	UpBytes   int64   `json:"up_bytes,omitempty"`
+	Error     string  `json:"error,omitempty"`
+}
+
+// handleSpeedtestRequest runs a live throughput test over the pool and returns
+// the result as JSON. Query params: dir=down|up|both (default both),
+// seconds=1..30 (default 10). The test rides one stream on the best (CDN-aware)
+// pool session, so it measures what a single flow gets over the chosen CDN.
+func (s *WsMuxTransport) handleSpeedtestRequest(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	switch dir {
+	case "down", "up", "both":
+	case "":
+		dir = "both"
+	default:
+		writeJSON(w, http.StatusBadRequest, speedtestResult{Error: "dir must be down, up or both"})
+		return
+	}
+
+	seconds := 10
+	if v := r.URL.Query().Get("seconds"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 30 {
+			writeJSON(w, http.StatusBadRequest, speedtestResult{Error: "seconds must be an integer between 1 and 30"})
+			return
+		}
+		seconds = n
+	}
+
+	res := s.runSpeedtest(dir, seconds)
+	status := http.StatusOK
+	if res.Error != "" {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, res)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// runSpeedtest picks the best pool session (least load, least latency) and runs
+// the requested direction(s) over one stream on it.
+func (s *WsMuxTransport) runSpeedtest(dir string, seconds int) speedtestResult {
+	res := speedtestResult{Direction: dir, Seconds: seconds}
+
+	if s.config.MuxVersion < 2 {
+		res.Error = "speedtest requires mux_version >= 2 on both ends"
+		return res
+	}
+
+	s.sessionsMu.Lock()
+	avail := make([]*pooledSession, len(s.sessions))
+	copy(avail, s.sessions)
+	s.sessionsMu.Unlock()
+	if len(avail) == 0 {
+		res.Error = "no active pool sessions (is the client connected?)"
+		return res
+	}
+
+	ps := selectLegs(avail, 1, legScore)[0]
+	res.CDN = ps.cdn
+	if rtt := ps.rtt.Load(); rtt > 0 {
+		res.RTTms = float64(rtt) / float64(time.Millisecond)
+	}
+	dur := time.Duration(seconds) * time.Second
+
+	if dir == "down" || dir == "both" {
+		bytes, el, err := s.speedtestOnce(ps.session, utils.SpeedtestDownload, seconds, dur)
+		if err != nil {
+			res.Error = "download: " + err.Error()
+			return res
+		}
+		res.DownBytes = bytes
+		res.DownMbps = utils.SpeedtestMbps(bytes, el)
+	}
+	if dir == "up" || dir == "both" {
+		bytes, el, err := s.speedtestOnce(ps.session, utils.SpeedtestUpload, seconds, dur)
+		if err != nil {
+			res.Error = "upload: " + err.Error()
+			return res
+		}
+		res.UpBytes = bytes
+		res.UpMbps = utils.SpeedtestMbps(bytes, el)
+	}
+	return res
+}
+
+// speedtestOnce runs one direction of the test on a fresh stream and returns the
+// receiver-measured bytes and elapsed time. On download the server sources the
+// data and the client sinks and reports back; on upload the client sources and
+// the server sinks and measures directly.
+func (s *WsMuxTransport) speedtestOnce(session *smux.Session, mode byte, seconds int, dur time.Duration) (int64, time.Duration, error) {
+	stream, err := session.OpenStream()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer stream.Close()
+
+	if err := utils.SendFlowSpeedtest(stream, mode, uint32(seconds)); err != nil {
+		return 0, 0, err
+	}
+	if mode == utils.SpeedtestDownload {
+		if err := utils.SpeedtestSource(stream, dur); err != nil {
+			return 0, 0, err
+		}
+		return utils.ReadSpeedtestReport(stream)
+	}
+	return utils.SpeedtestSink(stream)
 }
 
 // stripedDispatchLoop replaces the per-session handleSession loop when

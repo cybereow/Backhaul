@@ -128,6 +128,7 @@ func (s *Server) Start() {
 			MuxCon:               s.config.MuxCon,
 			AcceptUDP:            s.config.AcceptUDP,
 			UDPBuffer:            s.config.UDPBuffer,
+			Speedtest:            s.config.Speedtest,
 			MuxVersion:           s.config.MuxVersion,
 			MaxFrameSize:         s.config.MaxFrameSize,
 			MaxReceiveBuffer:     s.config.MaxReceiveBuffer,

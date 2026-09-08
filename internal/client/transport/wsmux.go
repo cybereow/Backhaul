@@ -576,6 +576,9 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 				} else if kind == utils.FlowPing {
 					go c.handlePingStream(stream)
 					continue
+				} else if kind == utils.FlowSpeedtest {
+					go c.handleSpeedtestStream(stream)
+					continue
 				}
 			} else {
 				if c.config.StripeFactor > 1 {
@@ -738,6 +741,38 @@ func (c *WsMuxTransport) handlePingStream(stream net.Conn) {
 	}
 	if err := utils.EchoFlowPing(stream, nonce); err != nil {
 		c.logger.Tracef("ping probe echo failed: %v", err)
+	}
+}
+
+// handleSpeedtestStream answers a server-initiated tunnel speed test. The server
+// picks the direction: on a download it sources the data and the client sinks it
+// and reports back the receiver-measured bytes/elapsed; on an upload the client
+// sources for the requested duration and the server measures. It carries no user
+// data and is torn down when the test ends.
+func (c *WsMuxTransport) handleSpeedtestStream(stream net.Conn) {
+	defer stream.Close()
+	mode, seconds, err := utils.ReceiveFlowSpeedtest(stream)
+	if err != nil {
+		c.logger.Tracef("speedtest header read failed: %v", err)
+		return
+	}
+	dur := time.Duration(seconds) * time.Second
+	switch mode {
+	case utils.SpeedtestDownload:
+		bytes, el, err := utils.SpeedtestSink(stream)
+		if err != nil {
+			c.logger.Tracef("speedtest download sink ended: %v", err)
+			return
+		}
+		if err := utils.WriteSpeedtestReport(stream, bytes, el); err != nil {
+			c.logger.Tracef("speedtest report write failed: %v", err)
+		}
+	case utils.SpeedtestUpload:
+		if err := utils.SpeedtestSource(stream, dur); err != nil {
+			c.logger.Tracef("speedtest upload source ended: %v", err)
+		}
+	default:
+		c.logger.Tracef("speedtest: unknown mode %d", mode)
 	}
 }
 

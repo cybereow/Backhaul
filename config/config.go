@@ -45,6 +45,7 @@ type ServerConfig struct {
 	MuxCon               int           `toml:"mux_con"`
 	AcceptUDP            bool          `toml:"accept_udp"`
 	UDPBuffer            int           `toml:"udp_buffer"` // wsmux/wssmux: how many datagrams to queue per UDP flow before dropping (default 2048). Raise it to absorb short bursts when a single flow briefly outruns the tunnel; it smooths bursts but does not raise a flow's steady-state throughput.
+	Speedtest            bool          `toml:"speedtest"`  // wsmux/wssmux: expose a token-gated <path>/speedtest endpoint on the server that measures live tunnel throughput over the pool. Off by default; it generates load on demand, so enable it only when you want to test.
 	SkipOptz             bool          `toml:"skip_optz"`
 	MSS                  int           `toml:"mss"`
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`

@@ -261,11 +261,12 @@ func ReceiveBinaryByte(conn net.Conn) (byte, error) {
 }
 
 const (
-	FlowPlain   byte = 0x00
-	FlowStriped byte = 0x01
-	FlowPromote byte = 0x02
-	FlowUDP     byte = 0x03
-	FlowPing    byte = 0x04
+	FlowPlain     byte = 0x00
+	FlowStriped   byte = 0x01
+	FlowPromote   byte = 0x02
+	FlowUDP       byte = 0x03
+	FlowPing      byte = 0x04
+	FlowSpeedtest byte = 0x05
 )
 
 func SendFlowPlain(conn net.Conn, flowID uint64, remoteAddr string) error {

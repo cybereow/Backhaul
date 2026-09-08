@@ -7,9 +7,18 @@ import (
 	"syscall"
 )
 
+var (
+	execCommandRun = func(name string, arg ...string) error {
+		return exec.Command(name, arg...).Run()
+	}
+	sysGetrlimit = syscall.Getrlimit
+	sysSetrlimit = syscall.Setrlimit
+	osName       = runtime.GOOS
+)
+
 // applyTCPTuning applies temporary TCP optimizations for Linux to handle massive connections
 func ApplyTCPTuning() {
-	if runtime.GOOS == "linux" {
+	if osName == "linux" {
 		logger.Info("Applying TCP optimizations for Linux...")
 
 		// Define the buffer sizes to try
@@ -25,7 +34,7 @@ func ApplyTCPTuning() {
 		for _, size := range bufferSizes {
 			// Build the command with the current buffer size
 			cmd := []string{"sysctl", "-w", fmt.Sprintf("net.core.rmem_max=%d", size)}
-			if err := exec.Command(cmd[0], cmd[1:]...).Run(); err == nil {
+			if err := execCommandRun(cmd[0], cmd[1:]...); err == nil {
 				logger.Printf("Successfully set rmem_max to %d\n", size)
 				break // Exit the loop if successful
 			} else {
@@ -37,7 +46,7 @@ func ApplyTCPTuning() {
 		for _, size := range bufferSizes {
 			// Build the command with the current buffer size for wmem_max
 			cmd := []string{"sysctl", "-w", fmt.Sprintf("net.core.wmem_max=%d", size)}
-			if err := exec.Command(cmd[0], cmd[1:]...).Run(); err == nil {
+			if err := execCommandRun(cmd[0], cmd[1:]...); err == nil {
 				logger.Printf("Successfully set wmem_max to %d\n", size)
 				break // Exit the loop if successful
 			} else {
@@ -104,7 +113,7 @@ func ApplyTCPTuning() {
 
 		// Execute the sysctl commands
 		for _, cmd := range commands {
-			err := exec.Command(cmd[0], cmd[1:]...).Run()
+			err := execCommandRun(cmd[0], cmd[1:]...)
 			if err != nil {
 				logger.Errorf("Failed to apply TCP tuning: %s", cmd)
 			} else {
@@ -114,7 +123,7 @@ func ApplyTCPTuning() {
 
 		// Set file descriptor limit programmatically
 		var rLimit syscall.Rlimit
-		err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+		err := sysGetrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 		if err != nil {
 			logger.Errorf("Error getting Rlimit: %v", err)
 		} else {
@@ -123,7 +132,7 @@ func ApplyTCPTuning() {
 			// Set the maximum and current file descriptor limits to 1048576
 			rLimit.Max = 1048576
 			rLimit.Cur = 1048576
-			err = syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+			err = sysSetrlimit(syscall.RLIMIT_NOFILE, &rLimit)
 			if err != nil {
 				logger.Errorf("Error setting Rlimit: %v", err)
 			} else {

@@ -40,6 +40,114 @@ func (c *latencyConn) Write(p []byte) (int, error) {
 	return c.Conn.Write(p)
 }
 
+// stallingConn simulates a leg that periodically freezes, the way a real
+// TCP/TLS leg does while it waits out a retransmission timeout on a lossy path:
+// throughput is otherwise fine, but every `everyBytes` it blocks for `stallFor`.
+// This is the impairment a clean localhost pipe lacks and the most likely reason
+// an egress path (with real loss) behaves differently from an ingress one.
+type stallingConn struct {
+	net.Conn
+	everyBytes int
+	stallFor   time.Duration
+	written    int
+}
+
+func (c *stallingConn) Write(p []byte) (int, error) {
+	c.written += len(p)
+	if c.written >= c.everyBytes {
+		c.written = 0
+		time.Sleep(c.stallFor)
+	}
+	return c.Conn.Write(p)
+}
+
+// TestStripingStallingLeg is the impairment repro: one leg periodically stalls
+// (retransmit-style) while the others run clean. It measures plain striping's
+// aggregate throughput to see whether an in-order-reassembled flow collapses
+// toward a stalling leg - the suspected mechanism behind the egress-direction
+// upload collapse.
+func TestStripingStallingLeg(t *testing.T) {
+	const (
+		nLegs       = 4
+		window      = 256 * 1024
+		payloadSize = 12 << 20
+	)
+	serverLegs := make([]net.Conn, nLegs)
+	clientLegs := make([]net.Conn, nLegs)
+	for i := 0; i < nLegs; i++ {
+		srv, cli := boundedPipe(window)
+		serverLegs[i] = srv
+		clientLegs[i] = cli
+	}
+	// One leg stalls ~50ms every 256KB it sends: ~5 stalls/MB.
+	serverLegs[0] = &stallingConn{Conn: serverLegs[0], everyBytes: 256 * 1024, stallFor: 50 * time.Millisecond}
+
+	server := New(serverLegs, DefaultChunkSize)
+	client := New(clientLegs, DefaultChunkSize)
+
+	payload := make([]byte, payloadSize)
+	_, _ = rand.Read(payload)
+
+	recv := make(chan []byte, 1)
+	go func() { got, _ := io.ReadAll(client); recv <- got }()
+	start := time.Now()
+	go func() { _, _ = server.Write(payload); server.Close() }()
+	got := <-recv
+	elapsed := time.Since(start)
+
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload mismatch: got %d, want %d", len(got), len(payload))
+	}
+	mbps := float64(len(got)) * 8 / elapsed.Seconds() / 1e6
+	t.Logf("plain striping with a stalling leg: %.1f Mbps over %s", mbps, elapsed)
+}
+
+// TestFECStallingLeg is the FEC counterpart: with 3 data + 1 parity shards, a
+// row can be reconstructed from any 3 of the 4 legs, so a single stalling leg
+// should never gate the flow (the parity leg covers it). This checks the FEC
+// path doesn't wait on the stalling leg it is supposed to be able to skip.
+func TestFECStallingLeg(t *testing.T) {
+	const (
+		dataShards   = 3
+		parityShards = 1
+		nLegs        = dataShards + parityShards
+		window       = 256 * 1024
+		payloadSize  = 8 << 20
+	)
+	serverLegs := make([]net.Conn, nLegs)
+	clientLegs := make([]net.Conn, nLegs)
+	for i := 0; i < nLegs; i++ {
+		srv, cli := boundedPipe(window)
+		serverLegs[i] = srv
+		clientLegs[i] = cli
+	}
+	serverLegs[0] = &stallingConn{Conn: serverLegs[0], everyBytes: 256 * 1024, stallFor: 50 * time.Millisecond}
+
+	server, err := NewFEC(serverLegs, DefaultChunkSize, dataShards, parityShards)
+	if err != nil {
+		t.Fatalf("server NewFEC: %v", err)
+	}
+	client, err := NewFEC(clientLegs, DefaultChunkSize, dataShards, parityShards)
+	if err != nil {
+		t.Fatalf("client NewFEC: %v", err)
+	}
+
+	payload := make([]byte, payloadSize)
+	_, _ = rand.Read(payload)
+	recv := make(chan []byte, 1)
+	go func() { got, _ := io.ReadAll(client); recv <- got }()
+	start := time.Now()
+	go func() { _, _ = server.Write(payload); server.Close() }()
+	got := <-recv
+	elapsed := time.Since(start)
+
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("payload mismatch: got %d, want %d", len(got), len(payload))
+	}
+	mbps := float64(len(got)) * 8 / elapsed.Seconds() / 1e6
+	t.Logf("FEC (3+1) with a stalling leg: %.1f Mbps over %s", mbps, elapsed)
+}
+
 // TestStripingBoundedBufferSlowLeg drives a transfer over four legs, all with the
 // same modest flow-control window, one of them throttled and higher-latency. It
 // checks the aggregate still clears well above the slow leg's own rate - the

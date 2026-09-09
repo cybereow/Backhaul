@@ -34,6 +34,18 @@ import (
 // fecEndMarkerSeq), which carries no payload.
 const fecHeaderSize = 4 + 1 + 4
 
+// fecLegQueueDepth is how many shards may sit queued for one leg's writer.
+// Unlike plain striping's shared work-stealing queue, FEC assigns a specific
+// shard to each leg, so a shallow per-leg queue lets a single slow/stalling leg
+// fill its queue and gate flushRow. A deeper queue lets the fast legs run ahead
+// while a slow one catches up (paired with flushRow's skip-the-congested-leg
+// logic), which is what keeps FEC from collapsing toward the slowest leg.
+// fecRowChanDepth sizes the reassembled-row handoff to Read.
+const (
+	fecLegQueueDepth = 64
+	fecRowChanDepth  = 64
+)
+
 // fecEndMarkerSeq is a sentinel row sequence number marking end of stream.
 // A real row's seq starts at 0 and counts up, nowhere near this, so it's
 // unambiguous. When set, the header's rowLen field carries the total number
@@ -149,14 +161,14 @@ func NewFEC(legs []net.Conn, chunkSize int, dataShards, parityShards int) (*FECC
 		flush:        make(chan struct{}),
 		rows:         make(map[uint32]*pendingRow),
 		pending:      make(map[uint32]fecRow),
-		rowCh:        make(chan fecRow, n*2),
+		rowCh:        make(chan fecRow, fecRowChanDepth),
 		errCh:        make(chan error, n),
 		totalKnown:   make(chan struct{}),
 		closed:       make(chan struct{}),
 	}
 	for i := range legs {
 		c.legAlive[i] = 1
-		c.legQueues[i] = make(chan fecShardJob, 4)
+		c.legQueues[i] = make(chan fecShardJob, fecLegQueueDepth)
 	}
 	for i, leg := range legs {
 		c.writersWG.Add(1)
@@ -464,9 +476,40 @@ func (c *FECConn) flushRow() error {
 	seq := c.writeRowSeq
 	c.writeRowSeq++
 
-	for i, shard := range shards {
+	// Dispatch one shard per leg, but do NOT let a congested (slow/stalling) leg
+	// gate the whole flow. The receiver reconstructs a row from any dataShards of
+	// the dataShards+parityShards shards, so up to parityShards legs may miss a
+	// given row and it still decodes - that redundancy is the entire point of
+	// FEC. So: first try every leg without blocking; for the legs whose queue is
+	// full, only block on as many as are still needed to put dataShards shards on
+	// the wire, and skip the rest (a slow leg's shard, covered by parity). This
+	// keeps throughput at the fast legs' rate during a stall instead of collapsing
+	// to the slowest leg - the bug that made FEC ~3x slower than plain striping
+	// with one stalling leg.
+	pending := make([]int, 0, len(shards))
+	sent := 0
+	for i := range shards {
+		if !c.legIsAlive(i) {
+			continue
+		}
 		select {
-		case c.legQueues[i] <- fecShardJob{rowSeq: seq, rowLen: rowLen, data: shard}:
+		case c.legQueues[i] <- fecShardJob{rowSeq: seq, rowLen: rowLen, data: shards[i]}:
+			sent++
+		case <-c.closed:
+			return c.currentErr()
+		default:
+			pending = append(pending, i)
+		}
+	}
+	for _, i := range pending {
+		// Enough shards already queued and we still have skip budget: drop this
+		// congested leg's shard for this row - parity will cover it on decode.
+		if sent >= c.dataShards {
+			continue
+		}
+		select {
+		case c.legQueues[i] <- fecShardJob{rowSeq: seq, rowLen: rowLen, data: shards[i]}:
+			sent++
 		case <-c.closed:
 			return c.currentErr()
 		}

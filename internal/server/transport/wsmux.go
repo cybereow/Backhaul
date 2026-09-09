@@ -58,6 +58,7 @@ type WsMuxTransport struct {
 	sessionsMu    sync.Mutex
 	sessions      []*pooledSession
 	stripeGroupID uint32
+	legRotation   uint32 // round-robins leg selection so concurrent flows spread across CDNs
 
 	fallbackProxy http.Handler
 
@@ -1043,10 +1044,52 @@ func selectLegs(avail []*pooledSession, n int, score func(*pooledSession) float6
 	return chosen
 }
 
-// openStripedLegs opens one stream on each of n live sessions, chosen by
-// selectLegs to be the least-loaded, lowest-latency, most CDN-diverse set
-// available. Used by both the striped TCP dispatcher (n = legsPerFlow) and the
-// UDP path (n = 1, which then just lands the flow on the single best session).
+// spreadLegs picks n sessions round-robin from a rotating offset, preferring
+// distinct CDNs, so consecutive flows land on different CDNs and the whole pool
+// is used rather than a few low-RTT ones. This even spread across every CDN is
+// what lets a many-flow workload aggregate to the pool's full width.
+func (s *WsMuxTransport) spreadLegs(avail []*pooledSession, n int) []*pooledSession {
+	L := len(avail)
+	start := int(atomic.AddUint32(&s.legRotation, 1))
+
+	chosen := make([]*pooledSession, 0, n)
+	usedCDN := make(map[string]bool, n)
+	// Pass 1: one per distinct CDN, walking from the rotating start.
+	for i := 0; i < L && len(chosen) < n; i++ {
+		ps := avail[(start+i)%L]
+		if usedCDN[ps.cdn] {
+			continue
+		}
+		usedCDN[ps.cdn] = true
+		chosen = append(chosen, ps)
+	}
+	// Pass 2: fill any remaining slots (n > distinct CDNs) from the same walk.
+	if len(chosen) < n {
+		inChosen := make(map[*pooledSession]bool, len(chosen))
+		for _, ps := range chosen {
+			inChosen[ps] = true
+		}
+		for i := 0; i < L && len(chosen) < n; i++ {
+			ps := avail[(start+i)%L]
+			if !inChosen[ps] {
+				inChosen[ps] = true
+				chosen = append(chosen, ps)
+			}
+		}
+	}
+	return chosen
+}
+
+// openStripedLegs opens one stream on each of n live sessions, spread across
+// distinct CDNs by spreadLegs. Used by both the striped TCP dispatcher
+// (n = legsPerFlow) and the plain/UDP path (n = 1).
+//
+// Selection is round-robin, not "pick the lowest-latency session": with many
+// concurrent flows (a proxy workload's whole point), always steering to the
+// best-scoring session piles them onto a few low-RTT CDNs and leaves the rest
+// idle, capping aggregate throughput at those few CDNs instead of the pool's
+// full width. Round-robin spreads consecutive flows across every CDN, which is
+// what lets a many-flow upload actually aggregate.
 //
 // It requires n distinct sessions and errors if fewer are live, rather than
 // silently opening a narrower group: a reduced-width stripe means the two ends
@@ -1066,7 +1109,7 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 		return nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
 	}
 
-	chosen := selectLegs(avail, n, legScore)
+	chosen := s.spreadLegs(avail, n)
 	streams := make([]*smux.Stream, 0, n)
 	for _, ps := range chosen {
 		stream, err := ps.session.OpenStream()

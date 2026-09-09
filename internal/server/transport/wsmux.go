@@ -976,21 +976,27 @@ func selectLegs(avail []*pooledSession, n int, score func(*pooledSession) float6
 	return chosen
 }
 
-// openStripedLegs opens one stream on each of up to n live sessions, chosen by
+// openStripedLegs opens one stream on each of n live sessions, chosen by
 // selectLegs to be the least-loaded, lowest-latency, most CDN-diverse set
 // available. Used by both the striped TCP dispatcher (n = legsPerFlow) and the
 // UDP path (n = 1, which then just lands the flow on the single best session).
+//
+// It requires n distinct sessions and errors if fewer are live, rather than
+// silently opening a narrower group: a reduced-width stripe means the two ends
+// disagree on how many data shards a FEC flow has (the server sizes the encoder
+// from the configured StripeFactor, the client from the leg count it received),
+// so a partial group either fails to decode or truncates one direction. Callers
+// treat the error as "pool not wide enough yet" - the striped dispatcher
+// requeues and the promotion path stays plain - so the flow waits for the pool
+// to grow instead of running mis-striped.
 func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 	s.sessionsMu.Lock()
 	avail := make([]*pooledSession, len(s.sessions))
 	copy(avail, s.sessions)
 	s.sessionsMu.Unlock()
 
-	if len(avail) == 0 {
-		return nil, fmt.Errorf("no active pool sessions available for striping")
-	}
-	if n > len(avail) {
-		n = len(avail)
+	if len(avail) < n {
+		return nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
 	}
 
 	chosen := selectLegs(avail, n, legScore)

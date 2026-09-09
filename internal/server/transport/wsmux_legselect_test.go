@@ -87,6 +87,23 @@ func TestSelectLegsCapsAtAvailable(t *testing.T) {
 	}
 }
 
+// TestOpenStripedLegsRequiresFullWidth guards the fix for the silent stripe-width
+// reduction: asking for more legs than there are live sessions must error (so the
+// caller waits / stays plain), not quietly build a narrower group that leaves the
+// two ends disagreeing on the FEC data-shard count.
+func TestOpenStripedLegsRequiresFullWidth(t *testing.T) {
+	s := &WsMuxTransport{}
+	s.sessions = []*pooledSession{{cdn: "a"}} // one live session (nil smux is fine: the width check returns before touching it)
+
+	legs, err := s.openStripedLegs(2)
+	if err == nil {
+		t.Fatal("expected an error when fewer sessions are live than the requested stripe width")
+	}
+	if len(legs) != 0 {
+		t.Fatalf("expected 0 legs on error, got %d", len(legs))
+	}
+}
+
 func TestBestPerCDN(t *testing.T) {
 	// Two CDNs with two sessions each; bestPerCDN keeps one per CDN, the
 	// best-scoring one, ordered best-first. (Scores are stashed in rtt; the real

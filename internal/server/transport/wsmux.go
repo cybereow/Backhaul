@@ -814,7 +814,13 @@ func (s *WsMuxTransport) startPortListeners(localAddr, remoteAddr string) {
 }
 
 func (s *WsMuxTransport) localListener(localAddr string, remoteAddr string) {
-	listener, err := net.Listen("tcp", localAddr)
+	// Force the socket buffers on the local ingress port (e.g. 6034), the same
+	// way the tcp/tcpmux transports do. This port carries the user's traffic into
+	// the tunnel; with a plain net.Listen it fell back to the OS default receive
+	// buffer, which caps how fast the server can *read* an upload off a
+	// high-RTT client connection (throughput ~= rcvbuf / RTT) - so upload was
+	// throttled at ingress even though the tunnel legs themselves were tuned.
+	listener, err := network.ListenWithBuffers("tcp", localAddr, s.config.SO_RCVBUF, s.config.SO_SNDBUF, 0, s.config.KeepAlive, !s.config.Nodelay)
 	if err != nil {
 		s.logger.Fatalf("failed to start listener on %s: %v", localAddr, err)
 		return

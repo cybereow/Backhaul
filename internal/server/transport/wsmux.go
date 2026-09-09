@@ -381,17 +381,7 @@ func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 	if s.graceTimer != nil {
 		s.graceTimer.Stop()
 	}
-	s.graceTimer = time.AfterFunc(controlGraceWindow, func() {
-		s.controlMu.Lock()
-		reattached := s.controlChannel != nil
-		s.controlMu.Unlock()
-		if reattached {
-			return
-		}
-		s.logger.Warn("control channel did not reattach within the grace window, restarting server")
-		s.recordEvent("restart", fmt.Sprintf("control channel did not reattach within %s; full restart (all flows dropped)", controlGraceWindow))
-		s.Restart()
-	})
+	s.armControlGrace()
 	s.controlMu.Unlock()
 
 	conn.Close()
@@ -400,6 +390,41 @@ func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 	s.controlMu.Unlock()
 	s.recordEvent("control_lost", fmt.Sprintf("control channel dropped; holding pool up to %s for reattach (flows keep running)", controlGraceWindow))
 	s.logger.Warnf("control channel lost, holding the pool for up to %s for the client to reattach", controlGraceWindow)
+}
+
+// armControlGrace (re)starts the grace timer that decides what to do when the
+// control channel has not reattached. Caller holds controlMu. It is self-
+// re-arming: the control channel carries no user data, only heartbeats and
+// new-connection requests, so as long as the pool still has live sessions
+// carrying flows there is nothing to gain from a restart - it would just drop
+// every in-flight flow because a CDN was slow to reconnect a side channel.
+// Under prolonged CDN flakiness (502/521 storms) that turned every reconnect
+// delay into a full restart, which then cascaded to the client via SG_Closed.
+// So restart only once the pool has actually drained (nothing left to
+// preserve); until then keep holding and re-checking.
+func (s *WsMuxTransport) armControlGrace() {
+	s.graceTimer = time.AfterFunc(controlGraceWindow, s.onControlGraceExpired)
+}
+
+func (s *WsMuxTransport) onControlGraceExpired() {
+	s.controlMu.Lock()
+	if s.controlChannel != nil {
+		// Reattached in the meantime; nothing to do.
+		s.controlMu.Unlock()
+		return
+	}
+	if live := atomic.LoadInt32(&s.sessionCounter); live > 0 {
+		// Pool still carrying flows: hold, don't tear everything down.
+		s.armControlGrace()
+		s.controlMu.Unlock()
+		s.logger.Warnf("control channel still not reattached, but %d pool session(s) alive; holding instead of restarting", live)
+		s.recordEvent("control_hold", fmt.Sprintf("no control channel after %s but %d pool session(s) alive; holding (flows preserved)", controlGraceWindow, live))
+		return
+	}
+	s.controlMu.Unlock()
+	s.logger.Warn("control channel did not reattach and the pool is empty, restarting server")
+	s.recordEvent("restart", fmt.Sprintf("control channel did not reattach within %s and pool is empty; full restart", controlGraceWindow))
+	s.Restart()
 }
 
 func (s *WsMuxTransport) tunnelListener() {

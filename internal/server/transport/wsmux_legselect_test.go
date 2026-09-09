@@ -109,20 +109,31 @@ func TestSelectLegsCapsAtAvailable(t *testing.T) {
 	}
 }
 
-// TestLegScoreLoadDominatesRTT guards the regression fix: load must dominate RTT
-// in the score, so selection load-balances across every CDN (letting a many-flow
-// workload aggregate) instead of piling every flow onto a few low-RTT CDNs. An
-// idle high-RTT session must outrank a loaded low-RTT one; RTT only breaks ties
-// between equally-loaded sessions.
-func TestLegScoreLoadDominatesRTT(t *testing.T) {
-	// One extra stream must outweigh the whole realistic RTT spread.
-	idleSlow := legScoreValue(0, int64(200*time.Millisecond)) // idle, very high RTT
-	loadedFast := legScoreValue(1, int64(1*time.Millisecond)) // one stream, near-zero RTT
-	if !(idleSlow < loadedFast) {
-		t.Errorf("load must dominate RTT: idle/slow (%v) should outrank loaded/fast (%v)", idleSlow, loadedFast)
+// TestLegScoreCapacityWeighted guards the capacity-weighted selection: placement
+// cost is (load+1)*RTT, so a fast CDN keeps absorbing streams (~1/RTT of them)
+// before a slower CDN wins, biasing the spread toward the good paths instead of
+// balancing stream count evenly (which diluted aggregate throughput into slow
+// CDNs). It must still spread - never concentrate every stream on one leg - and
+// still prefer the lower-RTT leg at equal load.
+func TestLegScoreCapacityWeighted(t *testing.T) {
+	fast := int64(20 * time.Millisecond)
+	slow := int64(90 * time.Millisecond) // ~4.5x the RTT
+
+	// A fast CDN already carrying a few streams still outranks a slower idle CDN:
+	// we keep feeding the fast path rather than spilling onto the slow one early.
+	// (3+1)*20 = 80 < (0+1)*90 = 90.
+	if !(legScoreValue(3, fast) < legScoreValue(0, slow)) {
+		t.Errorf("a fast CDN with a few streams should still beat a slower idle CDN: fast=%v slow=%v",
+			legScoreValue(3, fast), legScoreValue(0, slow))
+	}
+	// But it must eventually spill to the slower CDN - the cost grows with load,
+	// so selection can never pile every stream onto one leg. (5+1)*20 = 120 > 90.
+	if !(legScoreValue(5, fast) > legScoreValue(0, slow)) {
+		t.Errorf("a fast CDN loaded enough must spill to a slower idle CDN (weighted spread, not concentration): fast=%v slow=%v",
+			legScoreValue(5, fast), legScoreValue(0, slow))
 	}
 	// Among equally-loaded sessions, lower RTT still wins (the least-latency pref).
-	if !(legScoreValue(2, int64(10*time.Millisecond)) < legScoreValue(2, int64(90*time.Millisecond))) {
+	if !(legScoreValue(2, fast) < legScoreValue(2, slow)) {
 		t.Error("with equal load, the lower-RTT session should win")
 	}
 }
@@ -189,8 +200,8 @@ func TestLegScoreValue(t *testing.T) {
 	// An unprobed session (rtt 0) is charged the neutral default, not treated as
 	// zero-latency (which would make it always win).
 	unprobed := legScoreValue(0, 0)
-	if unprobed != unprobedRTTms*legRTTWeight {
-		t.Errorf("unprobed score = %v, want %v", unprobed, unprobedRTTms*legRTTWeight)
+	if unprobed != unprobedRTTms {
+		t.Errorf("unprobed score = %v, want %v", unprobed, unprobedRTTms)
 	}
 	if unprobed <= legScoreValue(0, int64(1*time.Millisecond)) {
 		t.Errorf("unprobed session should not out-rank a measured 1ms session")

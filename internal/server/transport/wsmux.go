@@ -933,21 +933,28 @@ type pooledSession struct {
 	rtt     atomic.Int64 // EWMA round-trip in nanoseconds; 0 until the first probe lands
 }
 
-// Leg-selection scoring weights. A leg's score is loadWeight per open stream
-// plus rttWeight per millisecond of measured RTT; the lowest score wins. Load
-// is the STRONGLY dominant term: one extra in-flight stream (100) outweighs the
-// whole spread of real-world CDN RTTs (tens of ms x 0.5), so selection first
-// balances load across every CDN - which is what lets a many-flow workload
-// aggregate to the pool's full width - and only uses RTT to break ties between
-// equally-loaded sessions, still steering toward the lowest-latency CDN when
-// load is equal. An earlier build let RTT dominate, which piled every flow onto
-// a few low-RTT CDNs and capped aggregate throughput; hence the wide gap here.
+// Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;
+// the lowest score wins. This is capacity-weighted, not count-balanced: on a
+// TCP-over-TCP-over-TLS leg a single stream's throughput ceiling is ~window/RTT,
+// so RTT is a live proxy for how much a leg can carry. Weighting the placement
+// cost by RTT makes a fast (low-RTT) CDN absorb proportionally more streams
+// (~1/RTT) before its cost catches up to a slower CDN, while a slow CDN still
+// takes a few - a weighted spread biased toward the good paths.
+//
+// This sits between two failure modes seen earlier. Even-count balancing (load
+// the strongly dominant term, RTT a tiebreak) spread Ookla's parallel streams
+// equally over every CDN, pouring half of them onto slow/high-RTT paths that
+// each carried little, so the aggregate fell below the single best CDN. Pure
+// additive RTT dominance did the opposite - it piled every stream onto one
+// low-RTT session because load barely counted. The multiplicative form keeps
+// load always significant (each stream multiplies the leg's cost) so it can
+// never concentrate on one leg, yet still steers the bulk of the traffic toward
+// the fastest CDNs instead of diluting it into the slow ones.
+//
 // unprobedRTTms is the neutral RTT charged to a session not yet probed (or on
 // mux_version 1, where probing isn't possible), so a fresh session is neither
 // unfairly preferred nor shunned before its first probe.
 const (
-	legLoadWeight   = 100.0
-	legRTTWeight    = 0.5
 	unprobedRTTms   = 40.0
 	rttProbeEvery   = 5 * time.Second
 	rttProbeTimeout = 10 * time.Second
@@ -996,15 +1003,20 @@ func legScore(ps *pooledSession) float64 {
 }
 
 // legScoreValue is the pure scoring math, split out from legScore so it can be
-// tested without a live smux session. An unprobed session (rttNanos <= 0) is
-// charged the neutral unprobedRTTms rather than 0, so a fresh session isn't
+// tested without a live smux session. The cost of placing a stream on a leg is
+// (load + 1) x RTT: the +1 gives an idle leg a nonzero cost so idle legs are
+// still ranked by RTT (rather than all tying at zero and concentrating on the
+// first one), and multiplying by RTT makes each additional stream cost more on a
+// slower leg, so streams accrue on a leg in proportion to 1/RTT - the
+// capacity-weighted spread described above. An unprobed session (rttNanos <= 0)
+// is charged the neutral unprobedRTTms rather than 0, so a fresh session isn't
 // falsely ranked as the fastest path.
 func legScoreValue(load int, rttNanos int64) float64 {
 	rttMs := unprobedRTTms
 	if rttNanos > 0 {
 		rttMs = float64(rttNanos) / float64(time.Millisecond)
 	}
-	return float64(load)*legLoadWeight + rttMs*legRTTWeight
+	return float64(load+1) * rttMs
 }
 
 // selectLegs picks the n best sessions for a flow: lowest score first, but

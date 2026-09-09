@@ -2,10 +2,12 @@ package transport
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -48,14 +50,14 @@ type WsMuxTransport struct {
 	stripedFlows     int32 // in-flight striped flows, bounded by the pool's stream budget
 	plainFlows       int32
 
-	// sessions is a live registry of pool sessions, used only when
-	// StripeFactor > 1 so the striped dispatcher can pick several sessions
-	// to open legs of the same logical connection on. The non-striped path
-	// (StripeFactor <= 1, the default) never touches this.
-	sessionsMu     sync.Mutex
-	sessions       []*smux.Session
-	stripeRotation uint32
-	stripeGroupID  uint32
+	// sessions is a live registry of pool sessions the striped dispatcher (and
+	// the single-leg UDP path) picks legs from. Each entry carries the CDN it
+	// arrived over and a live RTT estimate so leg selection can steer toward the
+	// lowest-latency, least-loaded connection and spread a flow across distinct
+	// CDNs. The non-striped TCP path never touches this.
+	sessionsMu    sync.Mutex
+	sessions      []*pooledSession
+	stripeGroupID uint32
 
 	fallbackProxy http.Handler
 
@@ -65,6 +67,99 @@ type WsMuxTransport struct {
 	controlMu       sync.Mutex
 	handlersStarted bool
 	graceTimer      *time.Timer
+
+	// events is a small ring buffer of disruption events (control-channel
+	// losses, restarts, replacements) with timestamps, so an operator can see
+	// *why* a tunnel dropped after the fact via the /diag endpoint instead of
+	// having to catch it live in the logs.
+	eventsMu sync.Mutex
+	events   []transportEvent
+}
+
+// transportEvent is one recorded disruption: what happened, when, and any
+// detail. Kept deliberately small - this is a diagnostic breadcrumb trail, not
+// a metrics system.
+type transportEvent struct {
+	Time   time.Time `json:"time"`
+	Kind   string    `json:"kind"`
+	Detail string    `json:"detail,omitempty"`
+}
+
+// maxRecordedEvents caps the ring buffer; old events are dropped once full.
+const maxRecordedEvents = 128
+
+// recordEvent appends a disruption event, dropping the oldest once the ring is
+// full. Safe to call from any goroutine.
+func (s *WsMuxTransport) recordEvent(kind, detail string) {
+	s.eventsMu.Lock()
+	s.events = append(s.events, transportEvent{Time: time.Now(), Kind: kind, Detail: detail})
+	if len(s.events) > maxRecordedEvents {
+		s.events = s.events[len(s.events)-maxRecordedEvents:]
+	}
+	s.eventsMu.Unlock()
+}
+
+// snapshotEvents returns a copy of the recorded events, newest last.
+func (s *WsMuxTransport) snapshotEvents() []transportEvent {
+	s.eventsMu.Lock()
+	defer s.eventsMu.Unlock()
+	out := make([]transportEvent, len(s.events))
+	copy(out, s.events)
+	return out
+}
+
+// poolSnapshot reports the live pool grouped by CDN: how many sessions each CDN
+// has and how many streams (flows) are currently running on them. Run during a
+// transfer, it shows whether flows spread across the CDNs (good aggregation) or
+// concentrate on one (the reason a many-flow workload wouldn't aggregate).
+func (s *WsMuxTransport) poolSnapshot() map[string]interface{} {
+	type cdnStat struct {
+		CDN      string  `json:"cdn"`
+		Sessions int     `json:"sessions"`
+		Streams  int     `json:"streams"`
+		RTTms    float64 `json:"rtt_ms,omitempty"`
+	}
+
+	s.sessionsMu.Lock()
+	sessions := make([]*pooledSession, len(s.sessions))
+	copy(sessions, s.sessions)
+	s.sessionsMu.Unlock()
+
+	byCDN := map[string]*cdnStat{}
+	order := []string{}
+	totalStreams := 0
+	for _, ps := range sessions {
+		st, ok := byCDN[ps.cdn]
+		if !ok {
+			st = &cdnStat{CDN: ps.cdn}
+			byCDN[ps.cdn] = st
+			order = append(order, ps.cdn)
+		}
+		st.Sessions++
+		n := ps.session.NumStreams()
+		st.Streams += n
+		totalStreams += n
+		if rtt := ps.rtt.Load(); rtt > 0 {
+			st.RTTms = float64(rtt) / float64(time.Millisecond)
+		}
+	}
+
+	// Sort CDNs by stream count, busiest first, so concentration is obvious.
+	sort.SliceStable(order, func(i, j int) bool {
+		return byCDN[order[i]].Streams > byCDN[order[j]].Streams
+	})
+	cdns := make([]*cdnStat, 0, len(order))
+	for _, c := range order {
+		cdns = append(cdns, byCDN[c])
+	}
+
+	return map[string]interface{}{
+		"now":            time.Now(),
+		"total_sessions": len(sessions),
+		"distinct_cdns":  len(byCDN),
+		"total_streams":  totalStreams,
+		"per_cdn":        cdns,
+	}
 }
 
 type WsMuxConfig struct {
@@ -85,6 +180,7 @@ type WsMuxConfig struct {
 	MuxCon               int
 	AcceptUDP            bool // forward UDP alongside TCP on each mapped port (requires mux_version >= 2)
 	UDPBuffer            int  // datagrams queued per UDP flow before dropping (0 = default 2048)
+	Speedtest            bool // expose the token-gated <path>/speedtest endpoint (requires mux_version >= 2)
 	MuxVersion           int
 	MaxFrameSize         int
 	MaxReceiveBuffer     int
@@ -101,6 +197,8 @@ type WsMuxConfig struct {
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
 	PromoteBytes         uint64        // bytes transferred before upgrading to a striped connection
+	SO_RCVBUF            int           // socket receive buffer forced on the server's accepted tunnel legs (0 = OS default)
+	SO_SNDBUF            int           // socket send buffer forced on the server's accepted tunnel legs (0 = OS default)
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -296,11 +394,13 @@ func (s *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 
 			case utils.SG_Closed:
 				s.logger.Warn("control channel has been closed by the client")
+				s.recordEvent("restart", "control channel closed by client; full restart (all flows dropped)")
 				s.Restart()
 				return
 
 			default:
 				s.logger.Errorf("unexpected response from channel: %v", msg)
+				s.recordEvent("restart", fmt.Sprintf("unexpected control signal %v; full restart (all flows dropped)", msg))
 				go s.Restart()
 				return
 			}
@@ -337,23 +437,50 @@ func (s *WsMuxTransport) onControlLost(conn *network.WebSocketConn) {
 	if s.graceTimer != nil {
 		s.graceTimer.Stop()
 	}
-	s.graceTimer = time.AfterFunc(controlGraceWindow, func() {
-		s.controlMu.Lock()
-		reattached := s.controlChannel != nil
-		s.controlMu.Unlock()
-		if reattached {
-			return
-		}
-		s.logger.Warn("control channel did not reattach within the grace window, restarting server")
-		s.Restart()
-	})
+	s.armControlGrace()
 	s.controlMu.Unlock()
 
 	conn.Close()
 	s.controlMu.Lock()
 	s.config.TunnelStatus = fmt.Sprintf("Reconnecting (%s)", s.config.Mode)
 	s.controlMu.Unlock()
+	s.recordEvent("control_lost", fmt.Sprintf("control channel dropped; holding pool up to %s for reattach (flows keep running)", controlGraceWindow))
 	s.logger.Warnf("control channel lost, holding the pool for up to %s for the client to reattach", controlGraceWindow)
+}
+
+// armControlGrace (re)starts the grace timer that decides what to do when the
+// control channel has not reattached. Caller holds controlMu. It is self-
+// re-arming: the control channel carries no user data, only heartbeats and
+// new-connection requests, so as long as the pool still has live sessions
+// carrying flows there is nothing to gain from a restart - it would just drop
+// every in-flight flow because a CDN was slow to reconnect a side channel.
+// Under prolonged CDN flakiness (502/521 storms) that turned every reconnect
+// delay into a full restart, which then cascaded to the client via SG_Closed.
+// So restart only once the pool has actually drained (nothing left to
+// preserve); until then keep holding and re-checking.
+func (s *WsMuxTransport) armControlGrace() {
+	s.graceTimer = time.AfterFunc(controlGraceWindow, s.onControlGraceExpired)
+}
+
+func (s *WsMuxTransport) onControlGraceExpired() {
+	s.controlMu.Lock()
+	if s.controlChannel != nil {
+		// Reattached in the meantime; nothing to do.
+		s.controlMu.Unlock()
+		return
+	}
+	if live := atomic.LoadInt32(&s.sessionCounter); live > 0 {
+		// Pool still carrying flows: hold, don't tear everything down.
+		s.armControlGrace()
+		s.controlMu.Unlock()
+		s.logger.Warnf("control channel still not reattached, but %d pool session(s) alive; holding instead of restarting", live)
+		s.recordEvent("control_hold", fmt.Sprintf("no control channel after %s but %d pool session(s) alive; holding (flows preserved)", controlGraceWindow, live))
+		return
+	}
+	s.controlMu.Unlock()
+	s.logger.Warn("control channel did not reattach and the pool is empty, restarting server")
+	s.recordEvent("restart", fmt.Sprintf("control channel did not reattach within %s and pool is empty; full restart", controlGraceWindow))
+	s.Restart()
 }
 
 func (s *WsMuxTransport) tunnelListener() {
@@ -361,6 +488,9 @@ func (s *WsMuxTransport) tunnelListener() {
 	basePath := network.NormalizeBasePath(s.config.Path)
 	channelPath := basePath + "/channel"
 	tunnelPathPrefix := basePath + "/tunnel"
+	speedtestPath := basePath + "/speedtest"
+	diagPath := basePath + "/diag"
+	poolPath := basePath + "/pool"
 
 	// Built once rather than per request: this ran through fmt.Sprintf on
 	// every probe that reached the listener.
@@ -378,6 +508,48 @@ func (s *WsMuxTransport) tunnelListener() {
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			s.logger.Tracef("received http request from %s", r.RemoteAddr)
+
+			// Token-gated speedtest endpoint: not a tunnel upgrade, so it is
+			// handled before the upgrade path. Enabled only when configured; when
+			// off it falls through to the normal not-a-tunnel-path handling
+			// (fallback/401) so the endpoint is invisible.
+			if s.config.Speedtest && r.URL.Path == speedtestPath {
+				if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				s.handleSpeedtestRequest(w, r)
+				return
+			}
+
+			// Token-gated diagnostics: recent disruption events (control-channel
+			// losses, restarts) so an operator can see why the tunnel dropped
+			// after the fact, without catching it live in the logs.
+			if r.URL.Path == diagPath {
+				if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				events := s.snapshotEvents()
+				writeJSON(w, http.StatusOK, map[string]interface{}{
+					"now":    time.Now(),
+					"count":  len(events),
+					"events": events,
+				})
+				return
+			}
+
+			// Token-gated live pool view: per-CDN active-stream counts, so you can
+			// see during a transfer whether flows are actually spreading across the
+			// CDNs or piling onto one. Run it *during* a speed test.
+			if r.URL.Path == poolPath {
+				if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				writeJSON(w, http.StatusOK, s.poolSnapshot())
+				return
+			}
 
 			// A request is legitimate tunnel traffic only if it carries the
 			// token AND targets the control or a tunnel path. Anything else -
@@ -419,6 +591,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				// for.
 				if old := s.controlChannel; old != nil {
 					s.logger.Warn("control channel replaced while the previous one was still registered")
+					s.recordEvent("control_replaced", fmt.Sprintf("new control channel from %s adopted, stale one dropped", conn.RemoteAddr()))
 					old.Close()
 				}
 				// The first control channel starts the pool machinery. One
@@ -505,7 +678,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys)
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, s.config.SO_SNDBUF)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}
@@ -641,7 +814,13 @@ func (s *WsMuxTransport) startPortListeners(localAddr, remoteAddr string) {
 }
 
 func (s *WsMuxTransport) localListener(localAddr string, remoteAddr string) {
-	listener, err := net.Listen("tcp", localAddr)
+	// Force the socket buffers on the local ingress port (e.g. 6034), the same
+	// way the tcp/tcpmux transports do. This port carries the user's traffic into
+	// the tunnel; with a plain net.Listen it fell back to the OS default receive
+	// buffer, which caps how fast the server can *read* an upload off a
+	// high-RTT client connection (throughput ~= rcvbuf / RTT) - so upload was
+	// throttled at ingress even though the tunnel legs themselves were tuned.
+	listener, err := network.ListenWithBuffers("tcp", localAddr, s.config.SO_RCVBUF, s.config.SO_SNDBUF, 0, s.config.KeepAlive, !s.config.Nodelay)
 	if err != nil {
 		s.logger.Fatalf("failed to start listener on %s: %v", localAddr, err)
 		return
@@ -733,7 +912,14 @@ func (s *WsMuxTransport) handleLoop() {
 			atomic.AddInt32(&s.sessionCounter, 1)
 			atomic.AddInt32(&s.admittedSessions, 1)
 
-			s.registerSession(session)
+			ps := s.registerSession(session)
+			// Keep this session's RTT estimate fresh so leg selection can steer
+			// toward the lowest-latency CDN. Only on mux_version >= 2 (the peer
+			// must be able to route the probe to its echoer) and only when a path
+			// actually selects legs - striping, or the UDP flow path.
+			if s.config.MuxVersion >= 2 && (s.config.StripeFactor > 1 || s.config.AcceptUDP || s.config.Speedtest) {
+				go s.probeSessionRTT(ps)
+			}
 			go func(sess *smux.Session) {
 				<-sess.CloseChan()
 				s.unregisterSession(sess)
@@ -746,18 +932,56 @@ func (s *WsMuxTransport) handleLoop() {
 	}
 }
 
-// registerSession/unregisterSession maintain the live-session pool the
-// striped dispatcher picks legs from. Only used when StripeFactor > 1.
-func (s *WsMuxTransport) registerSession(session *smux.Session) {
+// pooledSession is one live pool connection plus the metadata leg selection
+// scores it on: the CDN it arrived over (so a flow can be spread across distinct
+// CDNs) and an EWMA round-trip estimate maintained by probeSessionRTT.
+type pooledSession struct {
+	session *smux.Session
+	cdn     string       // CDN identity: the remote IP the pool connection arrived from
+	rtt     atomic.Int64 // EWMA round-trip in nanoseconds; 0 until the first probe lands
+}
+
+// Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;
+// the lowest score wins. This is capacity-weighted, not count-balanced: on a
+// TCP-over-TCP-over-TLS leg a single stream's throughput ceiling is ~window/RTT,
+// so RTT is a live proxy for how much a leg can carry. Weighting the placement
+// cost by RTT makes a fast (low-RTT) CDN absorb proportionally more streams
+// (~1/RTT) before its cost catches up to a slower CDN, while a slow CDN still
+// takes a few - a weighted spread biased toward the good paths.
+//
+// This sits between two failure modes seen earlier. Even-count balancing (load
+// the strongly dominant term, RTT a tiebreak) spread Ookla's parallel streams
+// equally over every CDN, pouring half of them onto slow/high-RTT paths that
+// each carried little, so the aggregate fell below the single best CDN. Pure
+// additive RTT dominance did the opposite - it piled every stream onto one
+// low-RTT session because load barely counted. The multiplicative form keeps
+// load always significant (each stream multiplies the leg's cost) so it can
+// never concentrate on one leg, yet still steers the bulk of the traffic toward
+// the fastest CDNs instead of diluting it into the slow ones.
+//
+// unprobedRTTms is the neutral RTT charged to a session not yet probed (or on
+// mux_version 1, where probing isn't possible), so a fresh session is neither
+// unfairly preferred nor shunned before its first probe.
+const (
+	unprobedRTTms   = 40.0
+	rttProbeEvery   = 5 * time.Second
+	rttProbeTimeout = 10 * time.Second
+)
+
+// registerSession adds a pool session to the live registry and returns its
+// wrapper so the caller can start probing it. unregisterSession removes it.
+func (s *WsMuxTransport) registerSession(session *smux.Session) *pooledSession {
+	ps := &pooledSession{session: session, cdn: cdnKey(session.RemoteAddr())}
 	s.sessionsMu.Lock()
-	s.sessions = append(s.sessions, session)
+	s.sessions = append(s.sessions, ps)
 	s.sessionsMu.Unlock()
+	return ps
 }
 
 func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
 	s.sessionsMu.Lock()
-	for i, sess := range s.sessions {
-		if sess == session {
+	for i, ps := range s.sessions {
+		if ps.session == session {
 			s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
 			break
 		}
@@ -765,27 +989,112 @@ func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
 	s.sessionsMu.Unlock()
 }
 
-// openStripedLegs opens one stream on each of up to n distinct live
-// sessions, rotating the starting point on every call so legs aren't always
-// pulled from the same first few sessions.
+// cdnKey reduces a pool connection's remote address to a CDN identity - the host
+// (IP) without the ephemeral port - so two connections that arrived over the
+// same CDN edge count as the same path for spreading purposes.
+func cdnKey(addr net.Addr) string {
+	if addr == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return addr.String()
+	}
+	return host
+}
+
+// legScore ranks a session for leg selection: lower is better. It combines live
+// load (open streams on the session) with the measured RTT so selection favours
+// the least-loaded, lowest-latency connection.
+func legScore(ps *pooledSession) float64 {
+	return legScoreValue(ps.session.NumStreams(), ps.rtt.Load())
+}
+
+// legScoreValue is the pure scoring math, split out from legScore so it can be
+// tested without a live smux session. The cost of placing a stream on a leg is
+// (load + 1) x RTT: the +1 gives an idle leg a nonzero cost so idle legs are
+// still ranked by RTT (rather than all tying at zero and concentrating on the
+// first one), and multiplying by RTT makes each additional stream cost more on a
+// slower leg, so streams accrue on a leg in proportion to 1/RTT - the
+// capacity-weighted spread described above. An unprobed session (rttNanos <= 0)
+// is charged the neutral unprobedRTTms rather than 0, so a fresh session isn't
+// falsely ranked as the fastest path.
+func legScoreValue(load int, rttNanos int64) float64 {
+	rttMs := unprobedRTTms
+	if rttNanos > 0 {
+		rttMs = float64(rttNanos) / float64(time.Millisecond)
+	}
+	return float64(load+1) * rttMs
+}
+
+// selectLegs picks the n best sessions for a flow: lowest score first, but
+// spread across distinct CDNs before doubling up on any one. Pass 1 takes the
+// best session from each distinct CDN (so a striped flow rides several CDNs, and
+// a single-leg UDP flow lands on the best CDN); pass 2 fills any remaining slots
+// by best score regardless of CDN, for when a flow wants more legs than there
+// are CDNs. avail is sorted in place.
+func selectLegs(avail []*pooledSession, n int, score func(*pooledSession) float64) []*pooledSession {
+	sort.SliceStable(avail, func(i, j int) bool {
+		return score(avail[i]) < score(avail[j])
+	})
+
+	chosen := make([]*pooledSession, 0, n)
+	usedCDN := make(map[string]bool)
+	for _, ps := range avail {
+		if len(chosen) == n {
+			break
+		}
+		if usedCDN[ps.cdn] {
+			continue
+		}
+		usedCDN[ps.cdn] = true
+		chosen = append(chosen, ps)
+	}
+	if len(chosen) < n {
+		inChosen := make(map[*pooledSession]bool, len(chosen))
+		for _, ps := range chosen {
+			inChosen[ps] = true
+		}
+		for _, ps := range avail {
+			if len(chosen) == n {
+				break
+			}
+			if !inChosen[ps] {
+				chosen = append(chosen, ps)
+			}
+		}
+	}
+	return chosen
+}
+
+// openStripedLegs opens one stream on each of n live sessions, chosen by
+// selectLegs: load-balanced across the pool (so a many-flow workload spreads
+// over every CDN and aggregates to the pool's full width) with RTT breaking
+// ties toward the lowest-latency CDN. Used by both the striped TCP dispatcher
+// (n = legsPerFlow) and the plain/UDP path (n = 1).
+//
+// It requires n distinct sessions and errors if fewer are live, rather than
+// silently opening a narrower group: a reduced-width stripe means the two ends
+// disagree on how many data shards a FEC flow has (the server sizes the encoder
+// from the configured StripeFactor, the client from the leg count it received),
+// so a partial group either fails to decode or truncates one direction. Callers
+// treat the error as "pool not wide enough yet" - the striped dispatcher
+// requeues and the promotion path stays plain - so the flow waits for the pool
+// to grow instead of running mis-striped.
 func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 	s.sessionsMu.Lock()
-	avail := make([]*smux.Session, len(s.sessions))
+	avail := make([]*pooledSession, len(s.sessions))
 	copy(avail, s.sessions)
 	s.sessionsMu.Unlock()
 
-	if len(avail) == 0 {
-		return nil, fmt.Errorf("no active pool sessions available for striping")
-	}
-	if n > len(avail) {
-		n = len(avail)
+	if len(avail) < n {
+		return nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
 	}
 
-	start := int(atomic.AddUint32(&s.stripeRotation, 1))
+	chosen := selectLegs(avail, n, legScore)
 	streams := make([]*smux.Stream, 0, n)
-	for i := 0; i < n; i++ {
-		sess := avail[(start+i)%len(avail)]
-		stream, err := sess.OpenStream()
+	for _, ps := range chosen {
+		stream, err := ps.session.OpenStream()
 		if err != nil {
 			for _, st := range streams {
 				st.Close()
@@ -795,6 +1104,314 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 		streams = append(streams, stream)
 	}
 	return streams, nil
+}
+
+// probeSessionRTT keeps a session's RTT estimate current by opening a tiny ping
+// stream every rttProbeEvery and timing the peer's echo, feeding the result into
+// an EWMA. It runs only on mux_version >= 2 (flow kinds, so the peer can route
+// the probe to its echoer) and only while striping is on, so a non-striped
+// deployment pays nothing. It exits when the session closes or the transport
+// shuts down.
+func (s *WsMuxTransport) probeSessionRTT(ps *pooledSession) {
+	ticker := time.NewTicker(rttProbeEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ps.session.CloseChan():
+			return
+		case <-ticker.C:
+			rtt, err := measureRTT(ps.session)
+			if err != nil {
+				// A transient probe failure (a busy session refusing a stream)
+				// shouldn't discard a good estimate; just try again next tick.
+				s.logger.Tracef("rtt probe on %s failed: %v", ps.cdn, err)
+				continue
+			}
+			// EWMA (7/8 old, 1/8 new) so a single jittery sample doesn't swing
+			// selection; the first sample seeds it directly.
+			if old := ps.rtt.Load(); old > 0 {
+				ps.rtt.Store((old*7 + rtt) / 8)
+			} else {
+				ps.rtt.Store(rtt)
+			}
+		}
+	}
+}
+
+// measureRTT opens one ping stream, sends a nonce and times the echo. The stream
+// carries no user data and is closed immediately after.
+func measureRTT(session *smux.Session) (int64, error) {
+	stream, err := session.OpenStream()
+	if err != nil {
+		return 0, err
+	}
+	defer stream.Close()
+	if err := stream.SetDeadline(time.Now().Add(rttProbeTimeout)); err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	if err := utils.SendFlowPing(stream, uint64(start.UnixNano())); err != nil {
+		return 0, err
+	}
+	if _, err := utils.ReceiveFlowPing(stream); err != nil {
+		return 0, err
+	}
+	return int64(time.Since(start)), nil
+}
+
+// speedtestResult is the JSON returned by the speedtest endpoint. In "best"
+// scope the top-level CDN/*Mbps/*Bytes fields carry the single-session result;
+// in "all" scope Total*Mbps carry the aggregate across every CDN run in
+// parallel and PerCDN carries the per-connection breakdown.
+type speedtestResult struct {
+	Direction string  `json:"direction"`
+	Seconds   int     `json:"seconds"`
+	Scope     string  `json:"scope"`
+	CDN       string  `json:"cdn,omitempty"`    // best scope: the pool connection the test ran over
+	RTTms     float64 `json:"rtt_ms,omitempty"` // best scope: last measured RTT of that connection
+	DownMbps  float64 `json:"down_mbps,omitempty"`
+	UpMbps    float64 `json:"up_mbps,omitempty"`
+	DownBytes int64   `json:"down_bytes,omitempty"`
+	UpBytes   int64   `json:"up_bytes,omitempty"`
+
+	TotalDownMbps float64       `json:"total_down_mbps,omitempty"` // all scope: aggregate across CDNs
+	TotalUpMbps   float64       `json:"total_up_mbps,omitempty"`
+	PerCDN        []perCDNSpeed `json:"per_cdn,omitempty"`
+
+	Error string `json:"error,omitempty"`
+}
+
+// perCDNSpeed is one connection's contribution in an "all"-scope aggregate run.
+type perCDNSpeed struct {
+	CDN      string  `json:"cdn"`
+	RTTms    float64 `json:"rtt_ms,omitempty"`
+	DownMbps float64 `json:"down_mbps,omitempty"`
+	UpMbps   float64 `json:"up_mbps,omitempty"`
+}
+
+// handleSpeedtestRequest runs a live throughput test over the pool and returns
+// the result as JSON. Query params:
+//   - dir=down|up|both (default both)
+//   - seconds=1..30 (default 10)
+//   - scope=best|all (default best): "best" rides one stream on the best
+//     (CDN-aware) session - single-flow throughput over the chosen CDN; "all"
+//     runs every distinct CDN in parallel and reports the aggregate - the whole
+//     connection's combined throughput.
+func (s *WsMuxTransport) handleSpeedtestRequest(w http.ResponseWriter, r *http.Request) {
+	dir := r.URL.Query().Get("dir")
+	switch dir {
+	case "down", "up", "both":
+	case "":
+		dir = "both"
+	default:
+		writeJSON(w, http.StatusBadRequest, speedtestResult{Error: "dir must be down, up or both"})
+		return
+	}
+
+	scope := r.URL.Query().Get("scope")
+	switch scope {
+	case "best", "all":
+	case "":
+		scope = "best"
+	default:
+		writeJSON(w, http.StatusBadRequest, speedtestResult{Error: "scope must be best or all"})
+		return
+	}
+
+	seconds := 10
+	if v := r.URL.Query().Get("seconds"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 30 {
+			writeJSON(w, http.StatusBadRequest, speedtestResult{Error: "seconds must be an integer between 1 and 30"})
+			return
+		}
+		seconds = n
+	}
+
+	res := s.runSpeedtest(dir, scope, seconds)
+	status := http.StatusOK
+	if res.Error != "" {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, res)
+}
+
+func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// runSpeedtest measures tunnel throughput. In "best" scope it runs one stream
+// on the best (least load, least latency) session; in "all" scope it runs every
+// distinct CDN in parallel and aggregates.
+func (s *WsMuxTransport) runSpeedtest(dir, scope string, seconds int) speedtestResult {
+	res := speedtestResult{Direction: dir, Seconds: seconds, Scope: scope}
+
+	if s.config.MuxVersion < 2 {
+		res.Error = "speedtest requires mux_version >= 2 on both ends"
+		return res
+	}
+
+	s.sessionsMu.Lock()
+	avail := make([]*pooledSession, len(s.sessions))
+	copy(avail, s.sessions)
+	s.sessionsMu.Unlock()
+	if len(avail) == 0 {
+		res.Error = "no active pool sessions (is the client connected?)"
+		return res
+	}
+
+	dur := time.Duration(seconds) * time.Second
+	if scope == "all" {
+		return s.runSpeedtestAll(avail, dir, seconds, dur)
+	}
+
+	ps := selectLegs(avail, 1, legScore)[0]
+	res.CDN = ps.cdn
+	if rtt := ps.rtt.Load(); rtt > 0 {
+		res.RTTms = float64(rtt) / float64(time.Millisecond)
+	}
+
+	if dir == "down" || dir == "both" {
+		bytes, el, err := s.speedtestOnce(ps.session, utils.SpeedtestDownload, seconds, dur)
+		if err != nil {
+			res.Error = "download: " + err.Error()
+			return res
+		}
+		res.DownBytes = bytes
+		res.DownMbps = utils.SpeedtestMbps(bytes, el)
+	}
+	if dir == "up" || dir == "both" {
+		bytes, el, err := s.speedtestOnce(ps.session, utils.SpeedtestUpload, seconds, dur)
+		if err != nil {
+			res.Error = "upload: " + err.Error()
+			return res
+		}
+		res.UpBytes = bytes
+		res.UpMbps = utils.SpeedtestMbps(bytes, el)
+	}
+	return res
+}
+
+// speedtestOnce runs one direction of the test on a fresh stream and returns the
+// receiver-measured bytes and elapsed time. On download the server sources the
+// data and the client sinks and reports back; on upload the client sources and
+// the server sinks and measures directly.
+func (s *WsMuxTransport) speedtestOnce(session *smux.Session, mode byte, seconds int, dur time.Duration) (int64, time.Duration, error) {
+	stream, err := session.OpenStream()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer stream.Close()
+
+	if err := utils.SendFlowSpeedtest(stream, mode, uint32(seconds)); err != nil {
+		return 0, 0, err
+	}
+	if mode == utils.SpeedtestDownload {
+		if err := utils.SpeedtestSource(stream, dur); err != nil {
+			return 0, 0, err
+		}
+		return utils.ReadSpeedtestReport(stream)
+	}
+	return utils.SpeedtestSink(stream)
+}
+
+// runSpeedtestAll measures the whole connection's throughput: it runs the test
+// on the best session of every distinct CDN in parallel and sums the
+// receiver-measured bytes over the test window. Because the runs are concurrent
+// they contend for any shared bottleneck (e.g. one origin uplink behind several
+// CDNs), so the aggregate honestly reflects what the pool can move at once
+// rather than an inflated sum of isolated runs.
+func (s *WsMuxTransport) runSpeedtestAll(avail []*pooledSession, dir string, seconds int, dur time.Duration) speedtestResult {
+	res := speedtestResult{Direction: dir, Seconds: seconds, Scope: "all"}
+	targets := bestPerCDN(avail, legScore)
+
+	per := make([]perCDNSpeed, len(targets))
+	for i, ps := range targets {
+		per[i].CDN = ps.cdn
+		if rtt := ps.rtt.Load(); rtt > 0 {
+			per[i].RTTms = float64(rtt) / float64(time.Millisecond)
+		}
+	}
+
+	// runPhase runs one direction on every target concurrently and returns each
+	// target's receiver-measured byte count (index-aligned with targets).
+	runPhase := func(mode byte) ([]int64, error) {
+		bytes := make([]int64, len(targets))
+		errs := make([]error, len(targets))
+		var wg sync.WaitGroup
+		for i, ps := range targets {
+			wg.Add(1)
+			go func(i int, ps *pooledSession) {
+				defer wg.Done()
+				b, _, err := s.speedtestOnce(ps.session, mode, seconds, dur)
+				bytes[i] = b
+				errs[i] = err
+			}(i, ps)
+		}
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				return bytes, fmt.Errorf("cdn %s: %w", targets[i].cdn, err)
+			}
+		}
+		return bytes, nil
+	}
+
+	// Aggregate throughput is the summed bytes over the common test window, so
+	// concurrent runs that share a bottleneck don't add up beyond it.
+	if dir == "down" || dir == "both" {
+		b, err := runPhase(utils.SpeedtestDownload)
+		if err != nil {
+			res.Error = "download: " + err.Error()
+			return res
+		}
+		var sum int64
+		for i, x := range b {
+			per[i].DownMbps = utils.SpeedtestMbps(x, dur)
+			sum += x
+		}
+		res.TotalDownMbps = utils.SpeedtestMbps(sum, dur)
+	}
+	if dir == "up" || dir == "both" {
+		b, err := runPhase(utils.SpeedtestUpload)
+		if err != nil {
+			res.Error = "upload: " + err.Error()
+			return res
+		}
+		var sum int64
+		for i, x := range b {
+			per[i].UpMbps = utils.SpeedtestMbps(x, dur)
+			sum += x
+		}
+		res.TotalUpMbps = utils.SpeedtestMbps(sum, dur)
+	}
+
+	res.PerCDN = per
+	return res
+}
+
+// bestPerCDN returns the best-scoring session for each distinct CDN, so an
+// aggregate run uses one connection per path rather than several on the same one.
+func bestPerCDN(avail []*pooledSession, score func(*pooledSession) float64) []*pooledSession {
+	ordered := make([]*pooledSession, len(avail))
+	copy(ordered, avail)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return score(ordered[i]) < score(ordered[j])
+	})
+	seen := make(map[string]bool)
+	out := make([]*pooledSession, 0, len(ordered))
+	for _, ps := range ordered {
+		if seen[ps.cdn] {
+			continue
+		}
+		seen[ps.cdn] = true
+		out = append(out, ps)
+	}
+	return out
 }
 
 // stripedDispatchLoop replaces the per-session handleSession loop when
@@ -1350,7 +1967,12 @@ func (s *WsMuxTransport) dispatchPromotable(appConn net.Conn, plainStream net.Co
 				return
 			case <-time.After(100 * time.Millisecond):
 				if swapper.UpBytes() >= s.config.PromoteBytes {
-					s.promoteFlow(flowID, remoteAddr, swapper, plainStream)
+					if s.shouldPromote() {
+						s.promoteFlow(flowID, remoteAddr, swapper, plainStream)
+					}
+					// Whether or not it promoted, stop checking: a flow that
+					// stayed plain because the pool was busy keeps running plain
+					// (already spread across CDNs by load-balancing) for its life.
 					return
 				}
 			}
@@ -1360,6 +1982,36 @@ func (s *WsMuxTransport) dispatchPromotable(appConn net.Conn, plainStream net.Co
 	// Block until the flow (and any promotion) is fully done, so the caller's
 	// pool-slot accounting is released only when the flow actually finishes.
 	<-swapper.DoneWait()
+}
+
+// shouldPromote decides whether a flow that has crossed promote_bytes should
+// migrate to a striped group or stay plain. Striping one flow across legsPerFlow
+// legs helps a single heavy flow reach several CDNs it otherwise couldn't. But
+// when many flows are already active, plain load-balancing is already spreading
+// them across every CDN, and promoting each one (each grabbing legsPerFlow legs)
+// over-subscribes the pool and couples the legs under in-order reassembly -
+// which collapses aggregate throughput instead of raising it (the "climbs then
+// crashes mid-test" upload symptom). So only promote while few enough flows are
+// active that their striped groups still fit the pool on distinct CDNs; beyond
+// that, staying plain aggregates better.
+func (s *WsMuxTransport) shouldPromote() bool {
+	s.sessionsMu.Lock()
+	cdns := make(map[string]struct{}, len(s.sessions))
+	for _, ps := range s.sessions {
+		cdns[ps.cdn] = struct{}{}
+	}
+	distinct := len(cdns)
+	s.sessionsMu.Unlock()
+
+	legs := s.legsPerFlow()
+	if legs < 1 {
+		legs = 1
+	}
+	budget := int32(distinct / legs)
+	if budget < 1 {
+		budget = 1 // always let a single heavy flow promote, even with one CDN
+	}
+	return atomic.LoadInt32(&s.plainFlows) <= budget
 }
 
 func (s *WsMuxTransport) promoteFlow(flowID uint64, remoteAddr string, swapper *handlers.PumpSwapper, plainStream net.Conn) {

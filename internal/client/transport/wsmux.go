@@ -573,6 +573,12 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 					}
 					go c.localDialerUDP(stream, remoteAddr)
 					continue
+				} else if kind == utils.FlowPing {
+					go c.handlePingStream(stream)
+					continue
+				} else if kind == utils.FlowSpeedtest {
+					go c.handleSpeedtestStream(stream)
+					continue
 				}
 			} else {
 				if c.config.StripeFactor > 1 {
@@ -718,6 +724,56 @@ func (c *WsMuxTransport) localDialer(stream net.Conn, remoteAddr string) {
 	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
 
 	handlers.TCPConnectionHandler(c.ctx, false, stream, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+}
+
+// handlePingStream answers a server RTT probe: it reads the 8-byte nonce and
+// writes it straight back, so the server can time the session round-trip and
+// steer striped-leg selection toward the lowest-latency CDN. The stream carries
+// no user data and is torn down as soon as the echo is sent; a deadline keeps a
+// dead probe from leaking a goroutine.
+func (c *WsMuxTransport) handlePingStream(stream net.Conn) {
+	defer stream.Close()
+	_ = stream.SetDeadline(time.Now().Add(10 * time.Second))
+	nonce, err := utils.ReceiveFlowPing(stream)
+	if err != nil {
+		c.logger.Tracef("ping probe read failed: %v", err)
+		return
+	}
+	if err := utils.EchoFlowPing(stream, nonce); err != nil {
+		c.logger.Tracef("ping probe echo failed: %v", err)
+	}
+}
+
+// handleSpeedtestStream answers a server-initiated tunnel speed test. The server
+// picks the direction: on a download it sources the data and the client sinks it
+// and reports back the receiver-measured bytes/elapsed; on an upload the client
+// sources for the requested duration and the server measures. It carries no user
+// data and is torn down when the test ends.
+func (c *WsMuxTransport) handleSpeedtestStream(stream net.Conn) {
+	defer stream.Close()
+	mode, seconds, err := utils.ReceiveFlowSpeedtest(stream)
+	if err != nil {
+		c.logger.Tracef("speedtest header read failed: %v", err)
+		return
+	}
+	dur := time.Duration(seconds) * time.Second
+	switch mode {
+	case utils.SpeedtestDownload:
+		bytes, el, err := utils.SpeedtestSink(stream)
+		if err != nil {
+			c.logger.Tracef("speedtest download sink ended: %v", err)
+			return
+		}
+		if err := utils.WriteSpeedtestReport(stream, bytes, el); err != nil {
+			c.logger.Tracef("speedtest report write failed: %v", err)
+		}
+	case utils.SpeedtestUpload:
+		if err := utils.SpeedtestSource(stream, dur); err != nil {
+			c.logger.Tracef("speedtest upload source ended: %v", err)
+		}
+	default:
+		c.logger.Tracef("speedtest: unknown mode %d", mode)
+	}
 }
 
 // localDialerUDP handles a stream the server tagged as a UDP flow: it dials the

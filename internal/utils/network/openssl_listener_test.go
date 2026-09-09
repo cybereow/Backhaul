@@ -57,7 +57,7 @@ func writeSelfSignedCert(t *testing.T) (certPath, keyPath string) {
 // with Go's TLS client, and reports the TLS 1.3 cipher the server chose.
 func negotiatedTLS13Cipher(t *testing.T, engine, certPath, keyPath string) uint16 {
 	t.Helper()
-	ln, err := NewTLSListener(engine, "127.0.0.1:0", []string{certPath}, []string{keyPath})
+	ln, err := NewTLSListener(engine, "127.0.0.1:0", []string{certPath}, []string{keyPath}, 0, 0)
 	if err != nil {
 		t.Fatalf("NewTLSListener(%q): %v", engine, err)
 	}
@@ -117,7 +117,7 @@ func TestOpenSSLMatchesNginxTLS13Cipher(t *testing.T) {
 // accepts a real TLS connection and yields a usable net.Conn.
 func TestOpenSSLListenerServesTLS(t *testing.T) {
 	certPath, keyPath := writeSelfSignedCert(t)
-	ln, err := NewTLSListener(TLSEngineOpenSSL, "127.0.0.1:0", []string{certPath}, []string{keyPath})
+	ln, err := NewTLSListener(TLSEngineOpenSSL, "127.0.0.1:0", []string{certPath}, []string{keyPath}, 0, 0)
 	if err != nil {
 		t.Fatalf("NewTLSListener: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestOpenSSLListenerSNISelectsByServerName(t *testing.T) {
 	certB, keyB := writeNamedCert(t, "beta.test")
 
 	ln, err := NewTLSListener(TLSEngineOpenSSL, "127.0.0.1:0",
-		[]string{certA, certB}, []string{keyA, keyB})
+		[]string{certA, certB}, []string{keyA, keyB}, 0, 0)
 	if err != nil {
 		t.Fatalf("NewTLSListener: %v", err)
 	}

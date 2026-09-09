@@ -84,7 +84,7 @@ func leafFromPEM(certFile string) (*x509.Certificate, error) {
 // for the requested host wins; certFiles[0] is the fallback when nothing
 // matches. Every cert gets an identically-tuned ctx, so the nginx-matching
 // fingerprint is preserved whichever one is chosen.
-func newOpenSSLListener(addr string, certFiles, keyFiles []string) (net.Listener, error) {
+func newOpenSSLListener(addr string, certFiles, keyFiles []string, rcvBuf, sndBuf int) (net.Listener, error) {
 	base, err := newConfiguredCtx(certFiles[0], keyFiles[0])
 	if err != nil {
 		return nil, err
@@ -126,5 +126,11 @@ func newOpenSSLListener(addr string, certFiles, keyFiles []string) (net.Listener
 		})
 	}
 
-	return openssl.Listen("tcp", addr, base)
+	// Build the raw TCP listener ourselves so its socket buffers are forced
+	// (accepted conns inherit them), then let OpenSSL wrap each accepted conn.
+	inner, err := listenTCPForced(addr, rcvBuf, sndBuf)
+	if err != nil {
+		return nil, err
+	}
+	return openssl.NewListener(inner, base), nil
 }

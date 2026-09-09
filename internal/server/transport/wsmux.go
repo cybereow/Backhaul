@@ -197,6 +197,8 @@ type WsMuxConfig struct {
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
 	PromoteBytes         uint64        // bytes transferred before upgrading to a striped connection
+	SO_RCVBUF            int           // socket receive buffer forced on the server's accepted tunnel legs (0 = OS default)
+	SO_SNDBUF            int           // socket send buffer forced on the server's accepted tunnel legs (0 = OS default)
 }
 
 func NewWSMuxServer(parentCtx context.Context, config *WsMuxConfig, logger *logrus.Logger) *WsMuxTransport {
@@ -676,7 +678,7 @@ func (s *WsMuxTransport) tunnelListener() {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys)
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, s.config.SO_SNDBUF)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}

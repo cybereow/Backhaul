@@ -1,9 +1,11 @@
 package network
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
+	"syscall"
 )
 
 // TLS engine names for the server's wss/wssmux `tls_engine` option.
@@ -41,7 +43,7 @@ func ResolveCertPairs(certFile, keyFile string, certFiles, keyFiles []string) ([
 // is directly reachable and a censor can fingerprint it. The OpenSSL path only
 // exists in binaries built with the "openssl" build tag; otherwise it returns
 // an explanatory error instead of silently falling back.
-func NewTLSListener(engine, addr string, certFiles, keyFiles []string) (net.Listener, error) {
+func NewTLSListener(engine, addr string, certFiles, keyFiles []string, rcvBuf, sndBuf int) (net.Listener, error) {
 	if len(certFiles) == 0 || len(certFiles) != len(keyFiles) {
 		return nil, fmt.Errorf("tls: need matching cert/key file lists (got %d certs, %d keys)", len(certFiles), len(keyFiles))
 	}
@@ -61,10 +63,49 @@ func NewTLSListener(engine, addr string, certFiles, keyFiles []string) (net.List
 			Certificates: certs,
 			MinVersion:   tls.VersionTLS12,
 		}
-		return tls.Listen("tcp", addr, cfg)
+		inner, err := listenTCPForced(addr, rcvBuf, sndBuf)
+		if err != nil {
+			return nil, err
+		}
+		return tls.NewListener(inner, cfg), nil
 	case TLSEngineOpenSSL:
-		return newOpenSSLListener(addr, certFiles, keyFiles)
+		return newOpenSSLListener(addr, certFiles, keyFiles, rcvBuf, sndBuf)
 	default:
 		return nil, fmt.Errorf("unknown tls_engine %q (want %q or %q)", engine, TLSEngineGo, TLSEngineOpenSSL)
 	}
+}
+
+// listenTCPForced builds the raw TCP listener that a TLS engine wraps, forcing
+// its socket receive/send buffers to rcvBuf/sndBuf (0 = leave the OS default).
+// On Linux an accepted connection inherits the listening socket's buffer sizes,
+// so this lifts every wssmux leg the server accepts out of send-buffer
+// autotuning. That mattered for a real asymmetry: the client's dialed legs
+// already force their buffers (TcpDialer), so download (client -> server) ran at
+// full window, but the server's accepted legs relied on tcp_wmem autotuning,
+// which capped the reverse direction - upload (server -> client) - well below
+// line rate. Forcing the listener's buffers makes the server side symmetric.
+func listenTCPForced(addr string, rcvBuf, sndBuf int) (net.Listener, error) {
+	lc := &net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var setErr error
+			if err := c.Control(func(fd uintptr) {
+				if rcvBuf > 0 {
+					if e := setRecvBuf(int(fd), rcvBuf); e != nil {
+						setErr = fmt.Errorf("set SO_RCVBUF: %w", e)
+						return
+					}
+				}
+				if sndBuf > 0 {
+					if e := setSendBuf(int(fd), sndBuf); e != nil {
+						setErr = fmt.Errorf("set SO_SNDBUF: %w", e)
+						return
+					}
+				}
+			}); err != nil {
+				return err
+			}
+			return setErr
+		},
+	}
+	return lc.Listen(context.Background(), "tcp", addr)
 }

@@ -138,6 +138,8 @@ func (s *Server) Start() {
 			StripeParity:         s.config.StripeParity,
 			StripePorts:          s.config.StripePorts,
 			PromoteBytes:         s.config.PromoteBytes,
+			SO_RCVBUF:            s.config.SO_RCVBUF,
+			SO_SNDBUF:            s.config.SO_SNDBUF,
 			Sniffer:              s.config.Sniffer,
 			WebPort:              s.config.WebPort,
 			SnifferLog:           s.config.SnifferLog,

@@ -350,7 +350,7 @@ func (s *WsTransport) tunnelListener() {
 			s.logger.Infof("wss server starting, listening on %s (tls engine: %s)", addr, engine)
 			s.logger.Info("waiting for wss control channel connection")
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys)
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, 0, 0)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}

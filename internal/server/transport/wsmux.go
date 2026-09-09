@@ -1947,7 +1947,12 @@ func (s *WsMuxTransport) dispatchPromotable(appConn net.Conn, plainStream net.Co
 				return
 			case <-time.After(100 * time.Millisecond):
 				if swapper.UpBytes() >= s.config.PromoteBytes {
-					s.promoteFlow(flowID, remoteAddr, swapper, plainStream)
+					if s.shouldPromote() {
+						s.promoteFlow(flowID, remoteAddr, swapper, plainStream)
+					}
+					// Whether or not it promoted, stop checking: a flow that
+					// stayed plain because the pool was busy keeps running plain
+					// (already spread across CDNs by load-balancing) for its life.
 					return
 				}
 			}
@@ -1957,6 +1962,36 @@ func (s *WsMuxTransport) dispatchPromotable(appConn net.Conn, plainStream net.Co
 	// Block until the flow (and any promotion) is fully done, so the caller's
 	// pool-slot accounting is released only when the flow actually finishes.
 	<-swapper.DoneWait()
+}
+
+// shouldPromote decides whether a flow that has crossed promote_bytes should
+// migrate to a striped group or stay plain. Striping one flow across legsPerFlow
+// legs helps a single heavy flow reach several CDNs it otherwise couldn't. But
+// when many flows are already active, plain load-balancing is already spreading
+// them across every CDN, and promoting each one (each grabbing legsPerFlow legs)
+// over-subscribes the pool and couples the legs under in-order reassembly -
+// which collapses aggregate throughput instead of raising it (the "climbs then
+// crashes mid-test" upload symptom). So only promote while few enough flows are
+// active that their striped groups still fit the pool on distinct CDNs; beyond
+// that, staying plain aggregates better.
+func (s *WsMuxTransport) shouldPromote() bool {
+	s.sessionsMu.Lock()
+	cdns := make(map[string]struct{}, len(s.sessions))
+	for _, ps := range s.sessions {
+		cdns[ps.cdn] = struct{}{}
+	}
+	distinct := len(cdns)
+	s.sessionsMu.Unlock()
+
+	legs := s.legsPerFlow()
+	if legs < 1 {
+		legs = 1
+	}
+	budget := int32(distinct / legs)
+	if budget < 1 {
+		budget = 1 // always let a single heavy flow promote, even with one CDN
+	}
+	return atomic.LoadInt32(&s.plainFlows) <= budget
 }
 
 func (s *WsMuxTransport) promoteFlow(flowID uint64, remoteAddr string, swapper *handlers.PumpSwapper, plainStream net.Conn) {

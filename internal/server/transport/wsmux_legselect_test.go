@@ -1,9 +1,31 @@
 package transport
 
 import (
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// TestShouldPromoteGatesOnFlowCount guards the fix that keeps promotion from
+// collapsing a many-flow upload: promote a single/few heavy flows, but stay
+// plain (already spread across CDNs by load-balancing) once many flows are
+// active, so promotion can't over-subscribe the pool.
+func TestShouldPromoteGatesOnFlowCount(t *testing.T) {
+	s := &WsMuxTransport{config: &WsMuxConfig{StripeFactor: 3, StripeParity: 1}} // legsPerFlow = 4
+	for i := 0; i < 12; i++ {
+		s.sessions = append(s.sessions, &pooledSession{cdn: fmt.Sprintf("cdn%d", i)})
+	}
+	// budget = distinctCDNs(12) / legsPerFlow(4) = 3.
+	atomic.StoreInt32(&s.plainFlows, 2)
+	if !s.shouldPromote() {
+		t.Error("few flows (2 <= budget 3) should be allowed to promote")
+	}
+	atomic.StoreInt32(&s.plainFlows, 10)
+	if s.shouldPromote() {
+		t.Error("many flows (10 > budget 3) should stay plain instead of promoting")
+	}
+}
 
 // fakeScore lets the selection tests rank sessions without a live smux session
 // (legScore reads NumStreams off a real session). Each pooledSession is scored

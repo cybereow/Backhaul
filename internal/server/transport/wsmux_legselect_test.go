@@ -87,34 +87,21 @@ func TestSelectLegsCapsAtAvailable(t *testing.T) {
 	}
 }
 
-// TestSpreadLegsRoundRobinsAcrossCDNs guards the regression fix: leg selection
-// must round-robin across CDNs, not steer every flow to one "best" session -
-// otherwise a many-flow workload piles onto a few CDNs and can't aggregate.
-func TestSpreadLegsRoundRobinsAcrossCDNs(t *testing.T) {
-	s := &WsMuxTransport{}
-	avail := []*pooledSession{{cdn: "a"}, {cdn: "b"}, {cdn: "c"}, {cdn: "d"}}
-
-	// Repeated single-leg picks must spread across CDNs, not stick to one.
-	seen := map[string]int{}
-	for i := 0; i < 20; i++ {
-		got := s.spreadLegs(avail, 1)
-		if len(got) != 1 {
-			t.Fatalf("want 1 leg, got %d", len(got))
-		}
-		seen[got[0].cdn]++
+// TestLegScoreLoadDominatesRTT guards the regression fix: load must dominate RTT
+// in the score, so selection load-balances across every CDN (letting a many-flow
+// workload aggregate) instead of piling every flow onto a few low-RTT CDNs. An
+// idle high-RTT session must outrank a loaded low-RTT one; RTT only breaks ties
+// between equally-loaded sessions.
+func TestLegScoreLoadDominatesRTT(t *testing.T) {
+	// One extra stream must outweigh the whole realistic RTT spread.
+	idleSlow := legScoreValue(0, int64(200*time.Millisecond)) // idle, very high RTT
+	loadedFast := legScoreValue(1, int64(1*time.Millisecond)) // one stream, near-zero RTT
+	if !(idleSlow < loadedFast) {
+		t.Errorf("load must dominate RTT: idle/slow (%v) should outrank loaded/fast (%v)", idleSlow, loadedFast)
 	}
-	if len(seen) < 3 {
-		t.Errorf("single-leg selection should spread across CDNs; only hit %d of 4: %v", len(seen), seen)
-	}
-
-	// A multi-leg pick must still land on distinct CDNs.
-	got := s.spreadLegs(avail, 3)
-	cdns := map[string]bool{}
-	for _, ps := range got {
-		cdns[ps.cdn] = true
-	}
-	if len(got) != 3 || len(cdns) != 3 {
-		t.Errorf("3-leg pick should be 3 distinct CDNs, got %v", cdnsOf(got))
+	// Among equally-loaded sessions, lower RTT still wins (the least-latency pref).
+	if !(legScoreValue(2, int64(10*time.Millisecond)) < legScoreValue(2, int64(90*time.Millisecond))) {
+		t.Error("with equal load, the lower-RTT session should win")
 	}
 }
 

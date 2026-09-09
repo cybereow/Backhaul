@@ -23,11 +23,14 @@ func ListenWithBuffers(network, address string, rcvBufSize, sndBufSize, mss int,
 				return err
 			}
 
-			// Set SO_RCVBUF
+			// Set SO_RCVBUF (via SO_RCVBUFFORCE when privileged; see setRecvBuf).
+			// Accepted connections inherit the listener's buffer sizes, so forcing
+			// them here lifts the rmem_max clamp for every wssmux leg the server
+			// accepts.
 			if rcvBufSize > 0 {
 				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, rcvBufSize); err != nil {
-						err = fmt.Errorf("failed to set SO_RCVBUF: %v", err)
+					if e := setRecvBuf(int(fd), rcvBufSize); e != nil {
+						err = fmt.Errorf("failed to set SO_RCVBUF: %v", e)
 					}
 				})
 			}
@@ -35,11 +38,11 @@ func ListenWithBuffers(network, address string, rcvBufSize, sndBufSize, mss int,
 				return err
 			}
 
-			// Set SO_SNDBUF
+			// Set SO_SNDBUF (via SO_SNDBUFFORCE when privileged; see setSendBuf).
 			if sndBufSize > 0 {
 				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, sndBufSize); err != nil {
-						err = fmt.Errorf("failed to set SO_SNDBUF: %v", err)
+					if e := setSendBuf(int(fd), sndBufSize); e != nil {
+						err = fmt.Errorf("failed to set SO_SNDBUF: %v", e)
 					}
 				})
 			}

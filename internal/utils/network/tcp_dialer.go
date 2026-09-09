@@ -71,10 +71,13 @@ func attemptTcpDialer(
 				return err
 			}
 
+			// SO_RCVBUF / SO_SNDBUF via the FORCE variants when privileged, so the
+			// configured buffer isn't silently clamped to net.core.rmem_max /
+			// wmem_max on the client's dialed legs (see setRecvBuf / setSendBuf).
 			if SO_RCVBUF > 0 {
 				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, SO_RCVBUF); err != nil {
-						err = fmt.Errorf("failed to set SO_RCVBUF: %v", err)
+					if e := setRecvBuf(int(fd), SO_RCVBUF); e != nil {
+						err = fmt.Errorf("failed to set SO_RCVBUF: %v", e)
 					}
 				})
 			}
@@ -84,8 +87,8 @@ func attemptTcpDialer(
 
 			if SO_SNDBUF > 0 {
 				err = s.Control(func(fd uintptr) {
-					if err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, SO_SNDBUF); err != nil {
-						err = fmt.Errorf("failed to set SO_SNDBUF: %v", err)
+					if e := setSendBuf(int(fd), SO_SNDBUF); e != nil {
+						err = fmt.Errorf("failed to set SO_SNDBUF: %v", e)
 					}
 				})
 			}

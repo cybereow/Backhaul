@@ -202,6 +202,48 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 	return streams, nil
 }
 
+// openPlainLeg opens one stream for a single-leg (plain, non-striped) flow,
+// picking the session round-robin across the whole pool rather than always the
+// single lowest-score one. selectLegs(_, 1, legScore) returns the one
+// best-scoring session, which concentrates a burst of concurrent plain flows
+// onto the same connection: when the pool is unprobed (RTT probing only runs
+// for the striped/UDP paths) every session ties on score, and many flows opened
+// at once all read the same near-zero load and pile onto the first session
+// before NumStreams catches up. Every stream then shares one TCP connection to
+// one CDN edge, and that single connection's origin->edge (upload) ceiling -
+// well below its edge->origin (download) ceiling behind the CDN - caps the
+// aggregate. The old per-session work-stealing loop never had this: each of N
+// pool sessions pulled independently from the shared local channel, so N flows
+// spread across N connections and their throughput summed past any single
+// connection's asymmetry. Round-robin restores that spread with an atomic cursor
+// so concurrent callers each get a distinct starting session; a closed session
+// or a failed OpenStream just advances to the next.
+func (s *WsMuxTransport) openPlainLeg() (*smux.Stream, error) {
+	s.sessionsMu.Lock()
+	avail := make([]*pooledSession, len(s.sessions))
+	copy(avail, s.sessions)
+	s.sessionsMu.Unlock()
+
+	if len(avail) == 0 {
+		return nil, fmt.Errorf("no live pool session available for a plain leg")
+	}
+
+	start := int(atomic.AddUint32(&s.plainRotation, 1))
+	for i := 0; i < len(avail); i++ {
+		ps := avail[(start+i)%len(avail)]
+		if ps.session == nil || ps.session.IsClosed() {
+			continue
+		}
+		stream, err := ps.session.OpenStream()
+		if err != nil {
+			s.logger.Tracef("plain leg: OpenStream on a pool session failed, trying the next: %v", err)
+			continue
+		}
+		return stream, nil
+	}
+	return nil, fmt.Errorf("all %d pool session(s) failed to open a plain leg", len(avail))
+}
+
 // bestPerCDN returns the best-scoring session for each distinct CDN, so an
 // aggregate run uses one connection per path rather than several on the same one.
 func bestPerCDN(avail []*pooledSession, score func(*pooledSession) float64) []*pooledSession {

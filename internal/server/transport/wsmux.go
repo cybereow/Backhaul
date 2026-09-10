@@ -53,6 +53,12 @@ type WsMuxTransport struct {
 	sessionsMu    sync.Mutex
 	sessions      []*pooledSession
 	stripeGroupID uint32
+	// plainRotation is the round-robin cursor for single-leg (plain) flow
+	// placement. A burst of concurrent plain flows each advances it atomically,
+	// so they land on different sessions instead of all racing to the same
+	// least-loaded one - restoring the even spread across every CDN that the old
+	// per-session work-stealing loop had.
+	plainRotation uint32
 
 	fallbackProxy http.Handler
 

@@ -32,6 +32,45 @@ func livePoolSession(t *testing.T, s *WsMuxTransport) func() {
 	}
 }
 
+// TestOpenPlainLegRoundRobin guards the upload-aggregation fix: plain (single-
+// leg) flows must spread evenly across every pool session, not pile onto one.
+// The old central selection took the single lowest-score session, so a burst of
+// concurrent plain flows - all reading the same near-zero load on an unprobed
+// pool - concentrated on one connection, whose single-connection upload ceiling
+// then capped the aggregate. Round-robin placement restores the even spread the
+// old per-session work-stealing loop had.
+func TestOpenPlainLegRoundRobin(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	s := &WsMuxTransport{logger: logger}
+
+	const nSessions = 4
+	for i := 0; i < nSessions; i++ {
+		defer livePoolSession(t, s)()
+	}
+
+	const nFlows = 12 // an exact multiple of nSessions: perfect round-robin => 3 each
+	streams := make([]*smux.Stream, 0, nFlows)
+	for i := 0; i < nFlows; i++ {
+		st, err := s.openPlainLeg()
+		if err != nil {
+			t.Fatalf("openPlainLeg %d: %v", i, err)
+		}
+		streams = append(streams, st)
+	}
+	defer func() {
+		for _, st := range streams {
+			st.Close()
+		}
+	}()
+
+	for i, ps := range s.sessions {
+		if got := ps.session.NumStreams(); got != nFlows/nSessions {
+			t.Errorf("session %d carries %d streams, want an even %d (flows must spread, not concentrate)", i, got, nFlows/nSessions)
+		}
+	}
+}
+
 // TestControlGraceHoldsWhilePoolAlive verifies the core fix: when the control
 // channel has not reattached but the pool still carries a live session (and the
 // hold is within the cap), the grace handler holds (re-arms) instead of

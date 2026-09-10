@@ -157,7 +157,7 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 		return
 	}
 
-	legs, err := s.openStripedLegs(1)
+	stream, err := s.openPlainLeg()
 	if err != nil {
 		atomic.AddInt32(&s.plainFlows, -1)
 		s.logger.Tracef("plain dispatch: %v, retrying shortly", err)
@@ -167,10 +167,14 @@ func (s *WsMuxTransport) dispatchPlain(incomingConn LocalTCPConn) {
 		return
 	}
 
-	stream := legs[0]
-
 	var flowID uint64
-	promotable := s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0
+	// Promotion migrates a heavy plain flow onto a striped group, so it only
+	// makes sense when a group is actually wider than one leg. In pure-plain mode
+	// (StripeFactor 1, no parity) legsPerFlow is 1, so "promotion" would just wrap
+	// the flow in single-leg striping framing and stall it through the promote
+	// handshake for no aggregation gain - keep it plain. Per-port striping (a
+	// plain port in a striped deployment) still has legsPerFlow > 1 and promotes.
+	promotable := s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0 && s.legsPerFlow() > 1
 
 	if s.config.MuxVersion >= 2 {
 		// A non-zero flowID signals the client this flow is promotable and must

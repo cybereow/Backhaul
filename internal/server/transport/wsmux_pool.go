@@ -203,37 +203,52 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 }
 
 // openPlainLeg opens one stream for a single-leg (plain, non-striped) flow,
-// picking the session round-robin across the whole pool rather than always the
-// single lowest-score one. selectLegs(_, 1, legScore) returns the one
-// best-scoring session, which concentrates a burst of concurrent plain flows
-// onto the same connection: when the pool is unprobed (RTT probing only runs
-// for the striped/UDP paths) every session ties on score, and many flows opened
-// at once all read the same near-zero load and pile onto the first session
-// before NumStreams catches up. Every stream then shares one TCP connection to
-// one CDN edge, and that single connection's origin->edge (upload) ceiling -
-// well below its edge->origin (download) ceiling behind the CDN - caps the
-// aggregate. The old per-session work-stealing loop never had this: each of N
-// pool sessions pulled independently from the shared local channel, so N flows
-// spread across N connections and their throughput summed past any single
-// connection's asymmetry. Round-robin restores that spread with an atomic cursor
-// so concurrent callers each get a distinct starting session; a closed session
-// or a failed OpenStream just advances to the next.
+// placed by legScore so it lands on a fast, lightly-loaded CDN - the same
+// capacity-weighted, latency-aware ranking the striped path uses - but with the
+// selection serialized so a burst of concurrent flows actually spreads.
+//
+// The bug this fixes: dispatching each plain flow with the single lowest-score
+// session concentrated a burst of them onto one connection. Selection reads a
+// session's stream count, and OpenStream only bumps that count after the pick;
+// N flows dispatched at once (an Ookla run opens ~16 in a burst) all read the
+// same pre-OpenStream load and pick the same session before any of their
+// OpenStreams register. Every stream then shares one TCP connection to one CDN
+// edge, and that single connection's origin->edge (upload) ceiling - well below
+// its edge->origin (download) ceiling behind the CDN - caps the aggregate,
+// which is the fast-download / throttled-upload asymmetry seen in production.
+// The old per-session work-stealing loop never hit this: each pool session
+// pulled independently from the shared local channel, so flows spread across
+// connections and their throughput summed.
+//
+// plainSelectMu serializes the score-pick-open sequence, so each flow's
+// OpenStream raises its session's score before the next flow scores: legScore
+// then steers successive flows onto different (still fast) CDNs. RTT is probed
+// on this path too (see handleLoop), so the spread favours the low-latency CDNs
+// and leaves the slow tail unused rather than round-robining blindly onto it.
 func (s *WsMuxTransport) openPlainLeg() (*smux.Stream, error) {
+	s.plainSelectMu.Lock()
+	defer s.plainSelectMu.Unlock()
+
 	s.sessionsMu.Lock()
-	avail := make([]*pooledSession, len(s.sessions))
-	copy(avail, s.sessions)
+	avail := make([]*pooledSession, 0, len(s.sessions))
+	for _, ps := range s.sessions {
+		if ps.session != nil && !ps.session.IsClosed() {
+			avail = append(avail, ps)
+		}
+	}
 	s.sessionsMu.Unlock()
 
 	if len(avail) == 0 {
 		return nil, fmt.Errorf("no live pool session available for a plain leg")
 	}
 
-	start := int(atomic.AddUint32(&s.plainRotation, 1))
-	for i := 0; i < len(avail); i++ {
-		ps := avail[(start+i)%len(avail)]
-		if ps.session == nil || ps.session.IsClosed() {
-			continue
-		}
+	// Best score first; try the next on an OpenStream failure. Holding
+	// plainSelectMu across OpenStream is what makes the placement spread: the
+	// chosen session's NumStreams is up by one before the next flow scores.
+	sort.SliceStable(avail, func(i, j int) bool {
+		return legScore(avail[i]) < legScore(avail[j])
+	})
+	for _, ps := range avail {
 		stream, err := ps.session.OpenStream()
 		if err != nil {
 			s.logger.Tracef("plain leg: OpenStream on a pool session failed, trying the next: %v", err)

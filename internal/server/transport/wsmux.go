@@ -53,12 +53,13 @@ type WsMuxTransport struct {
 	sessionsMu    sync.Mutex
 	sessions      []*pooledSession
 	stripeGroupID uint32
-	// plainRotation is the round-robin cursor for single-leg (plain) flow
-	// placement. A burst of concurrent plain flows each advances it atomically,
-	// so they land on different sessions instead of all racing to the same
-	// least-loaded one - restoring the even spread across every CDN that the old
-	// per-session work-stealing loop had.
-	plainRotation uint32
+	// plainSelectMu serializes single-leg (plain) flow placement so a burst of
+	// concurrent flows can't all read the same pre-OpenStream load and pile onto
+	// one session: each pick's OpenStream bumps that session's stream count
+	// before the next pick scores, so score-based selection actually spreads them
+	// across CDNs instead of concentrating on one connection (whose single-
+	// connection upload ceiling then caps the aggregate).
+	plainSelectMu sync.Mutex
 
 	fallbackProxy http.Handler
 
@@ -672,10 +673,13 @@ func (s *WsMuxTransport) handleLoop() {
 
 			ps := s.registerSession(session)
 			// Keep this session's RTT estimate fresh so leg selection can steer
-			// toward the lowest-latency CDN. Only on mux_version >= 2 (the peer
-			// must be able to route the probe to its echoer) and only when a path
-			// actually selects legs - striping, or the UDP flow path.
-			if s.config.MuxVersion >= 2 && (s.config.StripeFactor > 1 || s.config.AcceptUDP || s.config.Speedtest) {
+			// toward the lowest-latency CDN. Requires mux_version >= 2 (the peer
+			// must be able to route the probe to its echoer, which it does on the
+			// FlowPing kind regardless of mode). Every leg-selecting path benefits:
+			// striping, the UDP flow path, and the plain single-leg path, which now
+			// ranks by legScore too so it spreads across the fast CDNs rather than
+			// blindly round-robining onto the slow tail.
+			if s.config.MuxVersion >= 2 {
 				go s.probeSessionRTT(ps)
 			}
 			go func(sess *smux.Session) {

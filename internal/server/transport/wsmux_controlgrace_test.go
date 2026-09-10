@@ -32,14 +32,15 @@ func livePoolSession(t *testing.T, s *WsMuxTransport) func() {
 	}
 }
 
-// TestOpenPlainLegRoundRobin guards the upload-aggregation fix: plain (single-
-// leg) flows must spread evenly across every pool session, not pile onto one.
-// The old central selection took the single lowest-score session, so a burst of
-// concurrent plain flows - all reading the same near-zero load on an unprobed
-// pool - concentrated on one connection, whose single-connection upload ceiling
-// then capped the aggregate. Round-robin placement restores the even spread the
-// old per-session work-stealing loop had.
-func TestOpenPlainLegRoundRobin(t *testing.T) {
+// TestOpenPlainLegSpreads guards the upload-aggregation fix: a burst of plain
+// (single-leg) flows must spread across every pool session, not pile onto one.
+// Dispatching each flow to the single lowest-score session concentrated a burst
+// of them on one connection (they all read the same pre-OpenStream load and
+// picked the same session), whose single-connection upload ceiling then capped
+// the aggregate. openPlainLeg serializes the score-pick-open sequence so each
+// flow's OpenStream raises its session's score before the next flow scores;
+// with the sessions here equally scored (unprobed) that yields an even spread.
+func TestOpenPlainLegSpreads(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	s := &WsMuxTransport{logger: logger}
@@ -49,7 +50,7 @@ func TestOpenPlainLegRoundRobin(t *testing.T) {
 		defer livePoolSession(t, s)()
 	}
 
-	const nFlows = 12 // an exact multiple of nSessions: perfect round-robin => 3 each
+	const nFlows = 12 // an exact multiple of nSessions: even spread => 3 each
 	streams := make([]*smux.Stream, 0, nFlows)
 	for i := 0; i < nFlows; i++ {
 		st, err := s.openPlainLeg()
@@ -68,6 +69,33 @@ func TestOpenPlainLegRoundRobin(t *testing.T) {
 		if got := ps.session.NumStreams(); got != nFlows/nSessions {
 			t.Errorf("session %d carries %d streams, want an even %d (flows must spread, not concentrate)", i, got, nFlows/nSessions)
 		}
+	}
+}
+
+// TestOpenPlainLegPrefersFastCDN confirms the spread stays latency-aware: given
+// sessions of differing RTT at equal load, the next plain flow lands on the
+// lower-RTT one, so the placement favours the fast CDNs (and leaves the slow
+// tail unused) instead of round-robining blindly. rtt is set directly here;
+// in production probeSessionRTT keeps it current on the plain path too.
+func TestOpenPlainLegPrefersFastCDN(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	s := &WsMuxTransport{logger: logger}
+
+	defer livePoolSession(t, s)() // s.sessions[0]
+	defer livePoolSession(t, s)() // s.sessions[1]
+	s.sessions[0].rtt.Store(int64(90 * time.Millisecond))
+	s.sessions[1].rtt.Store(int64(15 * time.Millisecond)) // the fast CDN
+
+	st, err := s.openPlainLeg()
+	if err != nil {
+		t.Fatalf("openPlainLeg: %v", err)
+	}
+	defer st.Close()
+
+	if s.sessions[1].session.NumStreams() != 1 || s.sessions[0].session.NumStreams() != 0 {
+		t.Errorf("the first plain flow should land on the lower-RTT session, got fast=%d slow=%d",
+			s.sessions[1].session.NumStreams(), s.sessions[0].session.NumStreams())
 	}
 }
 

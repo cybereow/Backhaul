@@ -2,23 +2,49 @@ package transport
 
 import (
 	"io"
-	"sync/atomic"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/xtaci/smux"
 )
 
+// livePoolSession returns a real, open smux session registered on s, plus a
+// cleanup. Mirrors the pool: the server opens streams, the peer accepts them.
+func livePoolSession(t *testing.T, s *WsMuxTransport) func() {
+	t.Helper()
+	srvConn, cliConn := net.Pipe()
+	session, err := smux.Client(srvConn, smux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	peer, err := smux.Server(cliConn, smux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("smux.Server: %v", err)
+	}
+	s.sessions = append(s.sessions, &pooledSession{session: session, cdn: "test"})
+	return func() {
+		session.Close()
+		peer.Close()
+		srvConn.Close()
+		cliConn.Close()
+	}
+}
+
 // TestControlGraceHoldsWhilePoolAlive verifies the core fix: when the control
-// channel has not reattached but the pool still carries live sessions, the grace
-// handler holds (re-arms) instead of restarting the whole transport - which
-// would drop every in-flight flow just because a CDN was slow to reconnect the
-// side channel.
+// channel has not reattached but the pool still carries a live session (and the
+// hold is within the cap), the grace handler holds (re-arms) instead of
+// restarting the whole transport - which would drop every in-flight flow just
+// because a CDN was slow to reconnect the side channel.
 func TestControlGraceHoldsWhilePoolAlive(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	s := &WsMuxTransport{logger: logger}
 
-	atomic.StoreInt32(&s.sessionCounter, 2) // pool still carrying flows
+	cleanup := livePoolSession(t, s) // one genuinely-open pool session
+	defer cleanup()
+	s.graceStart = time.Now() // just lost the control channel; well within the cap
 	// controlChannel is nil (lost) and not reattached.
 
 	s.onControlGraceExpired()
@@ -46,5 +72,40 @@ func TestControlGraceHoldsWhilePoolAlive(t *testing.T) {
 	s.controlMu.Unlock()
 	if !armed {
 		t.Error("grace timer should be re-armed while holding")
+	}
+}
+
+// TestGraceShouldHold guards the hold/restart decision, including the cap that
+// keeps a silently-dropped client (sessions never report closed, e.g. mux
+// keepalive disabled) from being held "up" forever.
+func TestGraceShouldHold(t *testing.T) {
+	if !graceShouldHold(1, time.Second) {
+		t.Error("a live session within the cap should hold")
+	}
+	if graceShouldHold(0, time.Second) {
+		t.Error("no live sessions should not hold (restart to rebuild)")
+	}
+	if graceShouldHold(3, maxControlGraceHold+time.Second) {
+		t.Error("past the cap it must stop holding even with live sessions, so a stale pool is rebuilt")
+	}
+}
+
+// TestLiveSessionCount confirms the grace decision counts real open sessions,
+// not the lagging sessionCounter: an open session counts, a closed one does not.
+func TestLiveSessionCount(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	s := &WsMuxTransport{logger: logger}
+
+	cleanup := livePoolSession(t, s)
+	defer cleanup()
+	if got := s.liveSessionCount(); got != 1 {
+		t.Fatalf("expected 1 live session, got %d", got)
+	}
+
+	// Close it: it must no longer count as live.
+	s.sessions[0].session.Close()
+	if got := s.liveSessionCount(); got != 0 {
+		t.Fatalf("a closed session must not count as live, got %d", got)
 	}
 }

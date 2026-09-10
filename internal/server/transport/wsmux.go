@@ -62,6 +62,11 @@ type WsMuxTransport struct {
 	controlMu       sync.Mutex
 	handlersStarted bool
 	graceTimer      *time.Timer
+	// graceStart marks when the current control-loss grace period began, so the
+	// hold can be capped: without a cap, a client that drops silently (no smux
+	// keepalive, so sessions never report closed) would be held "up" forever
+	// with no working data path. Set on the initial loss, not on each re-arm.
+	graceStart time.Time
 
 	// events is a small ring buffer of disruption events (control-channel
 	// losses, restarts, replacements) with timestamps, so an operator can see

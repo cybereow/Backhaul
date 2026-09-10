@@ -67,6 +67,24 @@ func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
 	s.sessionsMu.Unlock()
 }
 
+// liveSessionCount reports how many registered pool sessions are still open.
+// It reads the smux sessions' real state rather than the sessionCounter, which
+// only drops when each handleSession loop individually notices its session die
+// - a lag that a mass disconnect (or a config with mux keepalive disabled) can
+// stretch indefinitely. The control-grace decision uses this so a dead pool is
+// recognised as dead.
+func (s *WsMuxTransport) liveSessionCount() int {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	live := 0
+	for _, ps := range s.sessions {
+		if ps.session != nil && !ps.session.IsClosed() {
+			live++
+		}
+	}
+	return live
+}
+
 // cdnKey reduces a pool connection's remote address to a CDN identity - the host
 // (IP) without the ephemeral port - so two connections that arrived over the
 // same CDN edge count as the same path for spreading purposes.

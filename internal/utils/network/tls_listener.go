@@ -75,18 +75,30 @@ func NewTLSListener(engine, addr string, certFiles, keyFiles []string, rcvBuf, s
 	}
 }
 
-// listenTCPForced builds the raw TCP listener that a TLS engine wraps, forcing
-// its socket receive/send buffers to rcvBuf/sndBuf (0 = leave the OS default).
+// listenTCPForced builds the raw TCP listener that a TLS engine wraps. It sets
+// SO_REUSEADDR/SO_REUSEPORT (so a restart can re-bind the address while the old
+// listener is still closing, instead of failing with "address already in use")
+// and forces the socket receive/send buffers to rcvBuf/sndBuf (0 = leave the OS
+// default).
+//
 // On Linux an accepted connection inherits the listening socket's buffer sizes,
-// so this lifts every wssmux leg the server accepts out of send-buffer
-// autotuning. That mattered for a real asymmetry: the client's dialed legs
-// already force their buffers (TcpDialer), so download (client -> server) ran at
-// full window, but the server's accepted legs relied on tcp_wmem autotuning,
-// which capped the reverse direction - upload (server -> client) - well below
-// line rate. Forcing the listener's buffers makes the server side symmetric.
+// so forcing them here lifts every wssmux leg the server accepts out of
+// send-buffer autotuning. That mattered for a real asymmetry: the client's
+// dialed legs already force their buffers (TcpDialer), so download
+// (client -> server) ran at full window, but the server's accepted legs relied
+// on tcp_wmem autotuning, which capped the reverse direction - upload
+// (server -> client). Forcing the listener's buffers makes the server side
+// symmetric. The local port listeners already go through ListenWithBuffers,
+// which sets the reuse options too; the TLS listener previously did not, which
+// is why a config-change or control-loss restart could hit EADDRINUSE on :443.
 func listenTCPForced(addr string, rcvBuf, sndBuf int) (net.Listener, error) {
 	lc := &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
+			// Reuse the address/port first, so a restart's fresh listener can
+			// bind before the previous generation's socket has fully closed.
+			if err := ReusePortControl(network, address, c); err != nil {
+				return err
+			}
 			var setErr error
 			if err := c.Control(func(fd uintptr) {
 				if rcvBuf > 0 {

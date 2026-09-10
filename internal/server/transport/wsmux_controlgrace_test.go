@@ -2,23 +2,116 @@ package transport
 
 import (
 	"io"
-	"sync/atomic"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/sirupsen/logrus"
+	"github.com/xtaci/smux"
 )
 
+// livePoolSession returns a real, open smux session registered on s, plus a
+// cleanup. Mirrors the pool: the server opens streams, the peer accepts them.
+func livePoolSession(t *testing.T, s *WsMuxTransport) func() {
+	t.Helper()
+	srvConn, cliConn := net.Pipe()
+	session, err := smux.Client(srvConn, smux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("smux.Client: %v", err)
+	}
+	peer, err := smux.Server(cliConn, smux.DefaultConfig())
+	if err != nil {
+		t.Fatalf("smux.Server: %v", err)
+	}
+	s.sessions = append(s.sessions, &pooledSession{session: session, cdn: "test"})
+	return func() {
+		session.Close()
+		peer.Close()
+		srvConn.Close()
+		cliConn.Close()
+	}
+}
+
+// TestOpenPlainLegSpreads guards the upload-aggregation fix: a burst of plain
+// (single-leg) flows must spread across every pool session, not pile onto one.
+// Dispatching each flow to the single lowest-score session concentrated a burst
+// of them on one connection (they all read the same pre-OpenStream load and
+// picked the same session), whose single-connection upload ceiling then capped
+// the aggregate. openPlainLeg serializes the score-pick-open sequence so each
+// flow's OpenStream raises its session's score before the next flow scores;
+// with the sessions here equally scored (unprobed) that yields an even spread.
+func TestOpenPlainLegSpreads(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	s := &WsMuxTransport{logger: logger}
+
+	const nSessions = 4
+	for i := 0; i < nSessions; i++ {
+		defer livePoolSession(t, s)()
+	}
+
+	const nFlows = 12 // an exact multiple of nSessions: even spread => 3 each
+	streams := make([]*smux.Stream, 0, nFlows)
+	for i := 0; i < nFlows; i++ {
+		st, err := s.openPlainLeg()
+		if err != nil {
+			t.Fatalf("openPlainLeg %d: %v", i, err)
+		}
+		streams = append(streams, st)
+	}
+	defer func() {
+		for _, st := range streams {
+			st.Close()
+		}
+	}()
+
+	for i, ps := range s.sessions {
+		if got := ps.session.NumStreams(); got != nFlows/nSessions {
+			t.Errorf("session %d carries %d streams, want an even %d (flows must spread, not concentrate)", i, got, nFlows/nSessions)
+		}
+	}
+}
+
+// TestOpenPlainLegPrefersFastCDN confirms the spread stays latency-aware: given
+// sessions of differing RTT at equal load, the next plain flow lands on the
+// lower-RTT one, so the placement favours the fast CDNs (and leaves the slow
+// tail unused) instead of round-robining blindly. rtt is set directly here;
+// in production probeSessionRTT keeps it current on the plain path too.
+func TestOpenPlainLegPrefersFastCDN(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	s := &WsMuxTransport{logger: logger}
+
+	defer livePoolSession(t, s)() // s.sessions[0]
+	defer livePoolSession(t, s)() // s.sessions[1]
+	s.sessions[0].rtt.Store(int64(90 * time.Millisecond))
+	s.sessions[1].rtt.Store(int64(15 * time.Millisecond)) // the fast CDN
+
+	st, err := s.openPlainLeg()
+	if err != nil {
+		t.Fatalf("openPlainLeg: %v", err)
+	}
+	defer st.Close()
+
+	if s.sessions[1].session.NumStreams() != 1 || s.sessions[0].session.NumStreams() != 0 {
+		t.Errorf("the first plain flow should land on the lower-RTT session, got fast=%d slow=%d",
+			s.sessions[1].session.NumStreams(), s.sessions[0].session.NumStreams())
+	}
+}
+
 // TestControlGraceHoldsWhilePoolAlive verifies the core fix: when the control
-// channel has not reattached but the pool still carries live sessions, the grace
-// handler holds (re-arms) instead of restarting the whole transport - which
-// would drop every in-flight flow just because a CDN was slow to reconnect the
-// side channel.
+// channel has not reattached but the pool still carries a live session (and the
+// hold is within the cap), the grace handler holds (re-arms) instead of
+// restarting the whole transport - which would drop every in-flight flow just
+// because a CDN was slow to reconnect the side channel.
 func TestControlGraceHoldsWhilePoolAlive(t *testing.T) {
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	s := &WsMuxTransport{logger: logger}
 
-	atomic.StoreInt32(&s.sessionCounter, 2) // pool still carrying flows
+	cleanup := livePoolSession(t, s) // one genuinely-open pool session
+	defer cleanup()
+	s.graceStart = time.Now() // just lost the control channel; well within the cap
 	// controlChannel is nil (lost) and not reattached.
 
 	s.onControlGraceExpired()
@@ -46,5 +139,40 @@ func TestControlGraceHoldsWhilePoolAlive(t *testing.T) {
 	s.controlMu.Unlock()
 	if !armed {
 		t.Error("grace timer should be re-armed while holding")
+	}
+}
+
+// TestGraceShouldHold guards the hold/restart decision, including the cap that
+// keeps a silently-dropped client (sessions never report closed, e.g. mux
+// keepalive disabled) from being held "up" forever.
+func TestGraceShouldHold(t *testing.T) {
+	if !graceShouldHold(1, time.Second) {
+		t.Error("a live session within the cap should hold")
+	}
+	if graceShouldHold(0, time.Second) {
+		t.Error("no live sessions should not hold (restart to rebuild)")
+	}
+	if graceShouldHold(3, maxControlGraceHold+time.Second) {
+		t.Error("past the cap it must stop holding even with live sessions, so a stale pool is rebuilt")
+	}
+}
+
+// TestLiveSessionCount confirms the grace decision counts real open sessions,
+// not the lagging sessionCounter: an open session counts, a closed one does not.
+func TestLiveSessionCount(t *testing.T) {
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	s := &WsMuxTransport{logger: logger}
+
+	cleanup := livePoolSession(t, s)
+	defer cleanup()
+	if got := s.liveSessionCount(); got != 1 {
+		t.Fatalf("expected 1 live session, got %d", got)
+	}
+
+	// Close it: it must no longer count as live.
+	s.sessions[0].session.Close()
+	if got := s.liveSessionCount(); got != 0 {
+		t.Fatalf("a closed session must not count as live, got %d", got)
 	}
 }

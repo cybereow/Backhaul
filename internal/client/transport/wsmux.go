@@ -358,7 +358,15 @@ func (c *WsMuxTransport) poolMaintainer() {
 			// idle it doesn't, until I reconnect" symptom. Refill the deficit
 			// gently, counting in-flight dials so a slow handshake isn't dialed
 			// repeatedly.
-			refill := poolRefillCount(newPoolSize, int(atomic.LoadInt32(&c.poolConnections)), int(atomic.LoadInt32(&c.pendingDials)), poolRefillPerTick)
+			//
+			// Target the configured floor (ConnPoolSize), NOT newPoolSize: during
+			// a dial outage poolConnectionsAvg sits at 0, so the load check below
+			// increments newPoolSize every 10s even with no traffic. Chasing that
+			// inflated target here would, on recovery, open hundreds of surplus
+			// sessions at poolRefillPerTick/sec and overload the CDN that just
+			// came back. Growth above the floor stays the load path's job (it
+			// dials its own connection when it grows).
+			refill := poolRefillCount(c.config.ConnPoolSize, int(atomic.LoadInt32(&c.poolConnections)), int(atomic.LoadInt32(&c.pendingDials)), poolRefillPerTick)
 			for i := 0; i < refill; i++ {
 				go c.tunnelDialer()
 			}

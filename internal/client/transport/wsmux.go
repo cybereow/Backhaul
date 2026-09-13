@@ -36,6 +36,11 @@ type WsMuxTransport struct {
 	usageMonitor    *web.Usage
 	restartMutex    sync.Mutex
 	poolConnections int32
+	// pendingDials counts pool dials that are in flight (dialing, not yet
+	// established). The proactive refill in poolMaintainer subtracts it from the
+	// deficit so a slow CDN handshake isn't dialed over and over each tick while
+	// the first attempt is still connecting.
+	pendingDials    int32
 	loadConnections int32
 	controlFlow     chan struct{}
 	// userAgent is picked once per process instead of per dial, so a single
@@ -216,6 +221,7 @@ func (c *WsMuxTransport) Restart() {
 	c.usageMonitor = web.NewDataStore(fmt.Sprintf(":%v", c.config.WebPort), ctx, c.config.SnifferLog, c.config.Sniffer, &c.config.TunnelStatus, c.logger)
 	c.config.TunnelStatus = ""
 	c.poolConnections = 0
+	atomic.StoreInt32(&c.pendingDials, 0)
 	c.loadConnections = 0
 	c.controlFlow = make(chan struct{}, 100)
 
@@ -268,6 +274,31 @@ func (c *WsMuxTransport) channelDialer() {
 	}
 }
 
+// poolRefillPerTick caps how many pool connections the proactive refill dials
+// in a single tick. The refill runs once a second, so this bounds the reconnect
+// rate to at most this many dials/sec - enough to rebuild a drained pool in a
+// few seconds, gentle enough not to storm a flaky CDN that is already returning
+// 502/521 (which is often *why* the pool drained in the first place).
+const poolRefillPerTick = 4
+
+// poolRefillCount decides how many new pool dials to launch this tick to keep
+// the pool at its configured floor. target is connection_pool; live is the
+// established pool connections; pending is dials still in flight. Split out as a
+// pure function so the deficit logic is unit-testable without driving real
+// dials. It never returns more than perTick, and never counts a connection
+// twice (in-flight dials are subtracted from the deficit), so a slow CDN
+// handshake is waited on rather than piled onto.
+func poolRefillCount(target, live, pending, perTick int) int {
+	deficit := target - live - pending
+	if deficit <= 0 {
+		return 0
+	}
+	if deficit > perTick {
+		return perTick
+	}
+	return deficit
+}
+
 func (c *WsMuxTransport) poolMaintainer() {
 	// Stagger the initial pool fill instead of firing every dial at once -
 	// a burst of ConnPoolSize near-simultaneous TLS handshakes to the same
@@ -315,6 +346,30 @@ func (c *WsMuxTransport) poolMaintainer() {
 		case <-tickerPool.C:
 			// Accumulate pool connections over time (every second)
 			atomic.AddInt32(&poolConnectionsSum, atomic.LoadInt32(&c.poolConnections))
+
+			// Proactively keep the pool topped up to its configured floor.
+			// Pool connections die on their own - a CDN max-age reset, an idle
+			// phone whose tunnelled flows went quiet long enough for the edge to
+			// drop them - and nothing else rebuilt them: the initial fill runs
+			// once and the dynamic sizing below only *grows* on load. So after an
+			// idle spell the pool could sit well below connection_pool, and a
+			// resumed flow would land on a thin (or empty) pool and stall until
+			// load happened to trigger growth - the "works, then after another
+			// idle it doesn't, until I reconnect" symptom. Refill the deficit
+			// gently, counting in-flight dials so a slow handshake isn't dialed
+			// repeatedly.
+			//
+			// Target the configured floor (ConnPoolSize), NOT newPoolSize: during
+			// a dial outage poolConnectionsAvg sits at 0, so the load check below
+			// increments newPoolSize every 10s even with no traffic. Chasing that
+			// inflated target here would, on recovery, open hundreds of surplus
+			// sessions at poolRefillPerTick/sec and overload the CDN that just
+			// came back. Growth above the floor stays the load path's job (it
+			// dials its own connection when it grows).
+			refill := poolRefillCount(c.config.ConnPoolSize, int(atomic.LoadInt32(&c.poolConnections)), int(atomic.LoadInt32(&c.pendingDials)), poolRefillPerTick)
+			for i := 0; i < refill; i++ {
+				go c.tunnelDialer()
+			}
 
 		case <-tickerLoad.C:
 			// Calculate the loadConnections over the last 10 seconds
@@ -494,19 +549,27 @@ func (c *WsMuxTransport) reconnectControl(old *network.WebSocketConn) {
 }
 
 func (c *WsMuxTransport) tunnelDialer() {
+	// Count this attempt as in flight only for the dialing phase, so the
+	// proactive refill (poolMaintainer) doesn't re-dial a connection that is
+	// still handshaking. It is handed off to poolConnections once established.
+	atomic.AddInt32(&c.pendingDials, 1)
+
 	ep := c.nextEndpoint()
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
 
 	// Dial to the tunnel server
 	tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
 	if err != nil {
+		atomic.AddInt32(&c.pendingDials, -1)
 		c.logger.Errorf("tunnel server dialer: %v", err)
 
 		return
 	}
 
-	// Increment active connections counter
+	// Increment active connections counter, then drop the in-flight mark: the
+	// connection is now a live pool member tracked by poolConnections.
 	atomic.AddInt32(&c.poolConnections, 1)
+	atomic.AddInt32(&c.pendingDials, -1)
 
 	c.handleSession(tunnelWSConn)
 }

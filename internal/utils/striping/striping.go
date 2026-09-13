@@ -73,6 +73,11 @@ type chunk struct {
 type writeJob struct {
 	seq  uint32
 	data []byte
+	// buf is the full-size backing buffer that data slices into, borrowed from
+	// the Conn's chunkPool. The write worker returns it to the pool once the
+	// chunk has been framed and sent, so a sustained transfer reuses a small
+	// set of buffers instead of allocating one per chunk.
+	buf *[]byte
 }
 
 // Conn stripes Read/Write over multiple legs. It implements net.Conn so it
@@ -85,9 +90,13 @@ type Conn struct {
 	wmu        sync.Mutex // guards writeSeq only; queueing itself is lock-free via the channel
 	writeSeq   uint32
 	writeQueue chan writeJob
-	writersWG  sync.WaitGroup // write workers, waited on by a graceful Close
-	flush      chan struct{}  // closed by a graceful Close: drain writeQueue, then stop
-	flushOnce  sync.Once
+	// chunkPool recycles chunkSize payload buffers across the write path so a
+	// high-throughput flow doesn't allocate a fresh buffer for every chunk.
+	// Buffers are handed out in Write and returned by the write workers.
+	chunkPool sync.Pool
+	writersWG sync.WaitGroup // write workers, waited on by a graceful Close
+	flush     chan struct{}  // closed by a graceful Close: drain writeQueue, then stop
+	flushOnce sync.Once
 
 	// rmu guards only the reassembly state below (nextSeq/pending/readBuf)
 	// and is held for as long as Read blocks waiting on the network. permErr
@@ -145,6 +154,10 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		legsDone:     make(chan struct{}),
 		totalKnown:   make(chan struct{}),
 		closed:       make(chan struct{}),
+	}
+	c.chunkPool.New = func() any {
+		b := make([]byte, chunkSize)
+		return &b
 	}
 	for _, leg := range legs {
 		c.writersWG.Add(1)
@@ -269,7 +282,12 @@ func (c *Conn) writeLeg(leg net.Conn) {
 		// still-queued tail chunk is ever abandoned to the closed/flush signal.
 		select {
 		case job := <-c.writeQueue:
-			if !c.writeChunk(leg, frame, job) {
+			// writeChunk copies job.data into frame before sending, so the
+			// borrowed buffer is free to reuse the moment it returns - whether
+			// the send succeeded or failed the whole Conn.
+			ok := c.writeChunk(leg, frame, job)
+			c.chunkPool.Put(job.buf)
+			if !ok {
 				return
 			}
 			continue
@@ -278,7 +296,9 @@ func (c *Conn) writeLeg(leg net.Conn) {
 
 		select {
 		case job := <-c.writeQueue:
-			if !c.writeChunk(leg, frame, job) {
+			ok := c.writeChunk(leg, frame, job)
+			c.chunkPool.Put(job.buf)
+			if !ok {
 				return
 			}
 		case <-c.flush:
@@ -370,7 +390,8 @@ func (c *Conn) Write(p []byte) (int, error) {
 		if n > c.chunkSize {
 			n = c.chunkSize
 		}
-		data := make([]byte, n)
+		bufp := c.chunkPool.Get().(*[]byte)
+		data := (*bufp)[:n]
 		copy(data, p[:n])
 		p = p[n:]
 
@@ -378,9 +399,12 @@ func (c *Conn) Write(p []byte) (int, error) {
 		c.writeSeq++
 
 		select {
-		case c.writeQueue <- writeJob{seq: seq, data: data}:
+		case c.writeQueue <- writeJob{seq: seq, data: data, buf: bufp}:
 			total += n
 		case <-c.closed:
+			// This chunk never entered the queue, so no worker will return its
+			// buffer - hand it back here instead of leaking it from the pool.
+			c.chunkPool.Put(bufp)
 			return total, c.currentErr()
 		}
 	}

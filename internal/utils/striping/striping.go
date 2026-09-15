@@ -371,16 +371,24 @@ func (c *Conn) writeLeg(i int, leg net.Conn) {
 	frame := make([]byte, headerSize+c.chunkSize)
 	for {
 		if c.quarantined(i) {
-			// A quarantined leg stays out of the sequential path so it can't
-			// gate the reorder buffer. It still honours a graceful close (drain
-			// everything, below) and periodically takes one chunk to re-measure
-			// so a leg whose throttling lifted can rejoin.
+			// A quarantined leg stays out of the *sequential* path so it can't
+			// gate the reorder buffer - but it still services the reroute queue.
+			// A reroute is a stalled sequence number that needs any live carrier
+			// now; when the leg holding the original is frozen, a quarantined but
+			// alive leg is exactly the leg that must move it (otherwise, in a
+			// two-leg flow where the fast leg froze, the reroute would have no
+			// worker at all). It also honours a graceful close and periodically
+			// takes one normal chunk to re-measure so a recovered leg can rejoin.
 			select {
 			case <-c.flush:
 				c.flushRemaining(i, leg, frame)
 				return
 			case <-c.closed:
 				return
+			case job := <-c.resendQueue:
+				if !c.writeChunkTracked(i, leg, frame, job) {
+					return
+				}
 			case <-time.After(quarantineProbeEvery):
 				select {
 				case job := <-c.writeQueue:
@@ -546,7 +554,12 @@ func (c *Conn) reevaluateLocked() {
 
 // ensureActiveLocked guarantees at least one leg stays out of quarantine, so a
 // transient where every leg looks slow can never leave the flow with no writer.
-// Caller holds schedMu.
+// It prefers to reactivate a leg that is NOT currently mid-write: a leg frozen
+// in flight (the one scanStuck just quarantined) can't take new work until its
+// stuck write returns, so reactivating it would leave the flow with a nominally-
+// active but blocked writer while everything else stays quarantined. Only if
+// every leg is in flight does it fall back to the highest-rate one. Caller holds
+// schedMu.
 func (c *Conn) ensureActiveLocked() {
 	for i := range c.sched {
 		if !c.sched[i].quar {
@@ -555,8 +568,20 @@ func (c *Conn) ensureActiveLocked() {
 	}
 	best := -1
 	for i := range c.sched {
+		if c.sched[i].inFly {
+			continue // frozen mid-write; can't service work now
+		}
 		if best < 0 || c.sched[i].rate > c.sched[best].rate {
 			best = i
+		}
+	}
+	if best < 0 {
+		// Every leg is in flight; pick the highest-rate one anyway so the
+		// invariant (at least one non-quarantined leg) still holds.
+		for i := range c.sched {
+			if best < 0 || c.sched[i].rate > c.sched[best].rate {
+				best = i
+			}
 		}
 	}
 	if best >= 0 {

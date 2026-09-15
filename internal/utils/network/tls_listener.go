@@ -43,7 +43,7 @@ func ResolveCertPairs(certFile, keyFile string, certFiles, keyFiles []string) ([
 // is directly reachable and a censor can fingerprint it. The OpenSSL path only
 // exists in binaries built with the "openssl" build tag; otherwise it returns
 // an explanatory error instead of silently falling back.
-func NewTLSListener(engine, addr string, certFiles, keyFiles []string, rcvBuf, sndBuf int) (net.Listener, error) {
+func NewTLSListener(engine, addr string, certFiles, keyFiles []string, rcvBuf, sndBuf int, sndForce bool) (net.Listener, error) {
 	if len(certFiles) == 0 || len(certFiles) != len(keyFiles) {
 		return nil, fmt.Errorf("tls: need matching cert/key file lists (got %d certs, %d keys)", len(certFiles), len(keyFiles))
 	}
@@ -63,13 +63,13 @@ func NewTLSListener(engine, addr string, certFiles, keyFiles []string, rcvBuf, s
 			Certificates: certs,
 			MinVersion:   tls.VersionTLS12,
 		}
-		inner, err := listenTCPForced(addr, rcvBuf, sndBuf)
+		inner, err := listenTCPForced(addr, rcvBuf, sndBuf, sndForce)
 		if err != nil {
 			return nil, err
 		}
 		return tls.NewListener(inner, cfg), nil
 	case TLSEngineOpenSSL:
-		return newOpenSSLListener(addr, certFiles, keyFiles, rcvBuf, sndBuf)
+		return newOpenSSLListener(addr, certFiles, keyFiles, rcvBuf, sndBuf, sndForce)
 	default:
 		return nil, fmt.Errorf("unknown tls_engine %q (want %q or %q)", engine, TLSEngineGo, TLSEngineOpenSSL)
 	}
@@ -91,7 +91,12 @@ func NewTLSListener(engine, addr string, certFiles, keyFiles []string, rcvBuf, s
 // symmetric. The local port listeners already go through ListenWithBuffers,
 // which sets the reuse options too; the TLS listener previously did not, which
 // is why a config-change or control-loss restart could hit EADDRINUSE on :443.
-func listenTCPForced(addr string, rcvBuf, sndBuf int) (net.Listener, error) {
+//
+// sndForce marks sndBuf as a *derived default* rather than an operator-set size:
+// it is applied only via SO_SNDBUFFORCE and, if that is unavailable (no
+// CAP_NET_ADMIN), left untouched so the socket keeps autotuning instead of being
+// pinned to a wmem_max-clamped (possibly tiny) buffer. See setSendBufForce.
+func listenTCPForced(addr string, rcvBuf, sndBuf int, sndForce bool) (net.Listener, error) {
 	lc := &net.ListenConfig{
 		Control: func(network, address string, c syscall.RawConn) error {
 			// Reuse the address/port first, so a restart's fresh listener can
@@ -108,7 +113,11 @@ func listenTCPForced(addr string, rcvBuf, sndBuf int) (net.Listener, error) {
 					}
 				}
 				if sndBuf > 0 {
-					if e := setSendBuf(int(fd), sndBuf); e != nil {
+					if sndForce {
+						// Best-effort: a derived default must never pin a clamped
+						// buffer, so a FORCE failure just leaves autotuning on.
+						_ = setSendBufForce(int(fd), sndBuf)
+					} else if e := setSendBuf(int(fd), sndBuf); e != nil {
 						setErr = fmt.Errorf("set SO_SNDBUF: %w", e)
 						return
 					}

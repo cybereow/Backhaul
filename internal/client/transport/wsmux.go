@@ -548,25 +548,6 @@ func (c *WsMuxTransport) reconnectControl(old *network.WebSocketConn) {
 	}
 }
 
-// tunnelLegRecvBuf is the SO_RCVBUF forced on the client's dialed tunnel legs.
-// The server -> client direction - the user's *upload* - is received on these
-// sockets, so the client's TCP receive window has to hold the same in-flight
-// data the server is now allowed to send (see the server's tunnelLegSendBuf).
-// Left to autotuning it is bounded by net.ipv4.tcp_rmem[2], which - like the
-// send ceiling on the server - a sysctl may not have raised in a restricted
-// deployment, re-capping upload at the receiver even after the sender was
-// unpinned. Forcing it (via SO_RCVBUFFORCE when privileged; see setRecvBuf)
-// to the smux session window keeps both ends of the upload path sized to the
-// same window the download direction already sustains. The download direction
-// is the client's *send* side, which is left on autotuning (SO_SNDBUF), so this
-// does not touch it. An explicit so_rcvbuf in the config still wins.
-func (c *WsMuxTransport) tunnelLegRecvBuf() int {
-	if c.config.SO_RCVBUF > 0 {
-		return c.config.SO_RCVBUF
-	}
-	return c.config.MaxReceiveBuffer
-}
-
 func (c *WsMuxTransport) tunnelDialer() {
 	// Count this attempt as in flight only for the dialing phase, so the
 	// proactive refill (poolMaintainer) doesn't re-dial a connection that is
@@ -577,7 +558,7 @@ func (c *WsMuxTransport) tunnelDialer() {
 	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
 
 	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.tunnelLegRecvBuf(), c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
+	tunnelWSConn, err := network.WebSocketDialer(c.ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
 	if err != nil {
 		atomic.AddInt32(&c.pendingDials, -1)
 		c.logger.Errorf("tunnel server dialer: %v", err)

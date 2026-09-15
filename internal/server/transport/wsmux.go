@@ -525,7 +525,8 @@ func (s *WsMuxTransport) tunnelListener() {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, s.tunnelLegSendBuf())
+			sndBuf, sndForce := s.tunnelLegSendBuf()
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, sndBuf, sndForce)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}
@@ -571,13 +572,20 @@ func (s *WsMuxTransport) tunnelListener() {
 // so matching it on the send side restores symmetry rather than guessing a BDP.
 // Only the handful of pool connections land on this listener, so a fixed buffer
 // costs no memory on the many short-lived user connections - those arrive on the
-// separate local port listeners, which are left on autotuning. An explicit
-// so_sndbuf in the config still wins.
-func (s *WsMuxTransport) tunnelLegSendBuf() int {
+// separate local port listeners, which are left on autotuning.
+//
+// The second return value marks this as a *derived default*, applied force-only:
+// setting SO_SNDBUF pins the socket out of autotuning, and without CAP_NET_ADMIN
+// it is clamped to net.core.wmem_max, so if the FORCE path is unavailable the
+// listener leaves autotuning on rather than pinning a possibly-tiny buffer that
+// would undershoot the tcp_wmem[2] window autotuning already reaches (see
+// setSendBufForce). An explicit so_sndbuf in the config wins and keeps the
+// ordinary clamped-fallback behavior, since the operator asked for a fixed size.
+func (s *WsMuxTransport) tunnelLegSendBuf() (size int, force bool) {
 	if s.config.SO_SNDBUF > 0 {
-		return s.config.SO_SNDBUF
+		return s.config.SO_SNDBUF, false
 	}
-	return s.config.MaxReceiveBuffer
+	return s.config.MaxReceiveBuffer, true
 }
 
 func (s *WsMuxTransport) parsePortMappings() {

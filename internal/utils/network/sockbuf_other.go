@@ -15,3 +15,12 @@ func setRecvBuf(fd int, size int) error {
 func setSendBuf(fd int, size int) error {
 	return syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF, size)
 }
+
+// setSendBufForce is the force-only send-buffer setter used for derived defaults
+// (see the Linux build). There is no SO_SNDBUFFORCE equivalent off Linux, and
+// the autotuning-disable + wmem_max-clamp hazard it guards against is
+// Linux-specific, so on other platforms a derived default simply leaves the OS
+// send-buffer sizing alone rather than pinning it.
+func setSendBufForce(fd int, size int) error {
+	return nil
+}

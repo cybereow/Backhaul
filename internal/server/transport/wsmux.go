@@ -525,7 +525,8 @@ func (s *WsMuxTransport) tunnelListener() {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, s.config.SO_SNDBUF)
+			sndBuf, sndForce := s.tunnelLegSendBuf()
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, sndBuf, sndForce)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}
@@ -549,6 +550,42 @@ func (s *WsMuxTransport) tunnelListener() {
 	if err := server.Shutdown(context.Background()); err != nil {
 		s.logger.Errorf("Failed to gracefully shutdown the server: %v", err)
 	}
+}
+
+// tunnelLegSendBuf is the SO_SNDBUF forced on the server's accepted tunnel
+// legs (the wssmux TLS listener). The server -> client direction - the user's
+// *upload* - is sent out of these sockets. Left to kernel autotuning their send
+// window is bounded by net.ipv4.tcp_wmem[2] (4 MB by default), which on a
+// high-RTT tunnel caps upload at ~4 MB / RTT (~357 Mbps at 94 ms) while the
+// download direction runs unthrottled under the far larger tcp_rmem ceiling -
+// the "fast download, throttled upload" asymmetry.
+//
+// ApplyTCPTuning raises tcp_wmem[2] to lift that ceiling, but it does so with
+// `sysctl -w`, which silently fails in the unprivileged/containerized server
+// deployments this tunnel commonly runs in - leaving upload pinned at ~357 Mbps
+// even though the download side is fine. Forcing an explicit SO_SNDBUF here
+// (via SO_SNDBUFFORCE when privileged; see setSendBuf) makes upload throughput
+// deterministic and independent of whether that sysctl took effect.
+//
+// It is sized to the smux session receive window (MaxReceiveBuffer): that is
+// the in-flight budget the *download* direction already sustains at line rate,
+// so matching it on the send side restores symmetry rather than guessing a BDP.
+// Only the handful of pool connections land on this listener, so a fixed buffer
+// costs no memory on the many short-lived user connections - those arrive on the
+// separate local port listeners, which are left on autotuning.
+//
+// The second return value marks this as a *derived default*, applied force-only:
+// setting SO_SNDBUF pins the socket out of autotuning, and without CAP_NET_ADMIN
+// it is clamped to net.core.wmem_max, so if the FORCE path is unavailable the
+// listener leaves autotuning on rather than pinning a possibly-tiny buffer that
+// would undershoot the tcp_wmem[2] window autotuning already reaches (see
+// setSendBufForce). An explicit so_sndbuf in the config wins and keeps the
+// ordinary clamped-fallback behavior, since the operator asked for a fixed size.
+func (s *WsMuxTransport) tunnelLegSendBuf() (size int, force bool) {
+	if s.config.SO_SNDBUF > 0 {
+		return s.config.SO_SNDBUF, false
+	}
+	return s.config.MaxReceiveBuffer, true
 }
 
 func (s *WsMuxTransport) parsePortMappings() {

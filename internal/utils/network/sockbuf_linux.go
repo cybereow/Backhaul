@@ -30,3 +30,19 @@ func setSendBuf(fd int, size int) error {
 	}
 	return unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, size)
 }
+
+// setSendBufForce sets the send buffer ONLY via SO_SNDBUFFORCE and does NOT fall
+// back to a plain SO_SNDBUF when that fails. This is for a *derived default*
+// (not an operator-requested size), where the plain fallback would do more harm
+// than good: setting SO_SNDBUF at all pins the socket out of TCP send-buffer
+// autotuning, and without CAP_NET_ADMIN it is additionally clamped to
+// net.core.wmem_max - which, in the very unprivileged/containerized deployment
+// this default targets, may be a low kernel default. Pinning a small buffer
+// there would drop throughput below what autotuning (bounded by tcp_wmem[2])
+// already delivers. So when the FORCE path is unavailable we leave the socket on
+// autotuning untouched, and the returned error is treated as "left as-is", not a
+// failure. An operator's explicit so_sndbuf still goes through setSendBuf, which
+// keeps the clamped fallback because they asked for a fixed size.
+func setSendBufForce(fd int, size int) error {
+	return unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUFFORCE, size)
+}

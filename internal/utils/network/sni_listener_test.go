@@ -78,7 +78,7 @@ func TestNewTLSListenerSNISelectsByServerName(t *testing.T) {
 	certB, keyB := writeNamedCert(t, "beta.test")
 
 	ln, err := NewTLSListener(TLSEngineGo, "127.0.0.1:0",
-		[]string{certA, certB}, []string{keyA, keyB}, 0, 0)
+		[]string{certA, certB}, []string{keyA, keyB}, 0, 0, false)
 	if err != nil {
 		t.Fatalf("NewTLSListener: %v", err)
 	}

@@ -68,6 +68,11 @@ const endMarkerLen = 0xFFFFFFFF
 type chunk struct {
 	seq  uint32
 	data []byte
+	// base is the full-size backing buffer that data slices into, borrowed from
+	// the Conn's readPool by readLeg. Read returns it to the pool once the
+	// chunk's bytes have been fully copied out to the caller. nil for a
+	// zero-length chunk, which borrows no buffer.
+	base *[]byte
 }
 
 type writeJob struct {
@@ -109,6 +114,17 @@ type Conn struct {
 	nextSeq uint32
 	pending map[uint32]chunk
 	readBuf []byte
+	// readBufBase is the pooled backing buffer for readBuf. It's returned to
+	// readPool once readBuf drains to empty, so the next inbound chunk can reuse
+	// it. Guarded by rmu, like the rest of the reassembly state.
+	readBufBase *[]byte
+	// readPool recycles chunkSize payload buffers on the read/reassembly path,
+	// mirroring chunkPool on the write side: readLeg borrows one per inbound
+	// chunk instead of allocating a fresh buffer for every 16KB chunk, and Read
+	// hands it back once the chunk has been fully consumed. A sustained striped
+	// download then reuses a small set of buffers instead of churning one per
+	// chunk through the garbage collector.
+	readPool sync.Pool
 
 	errMu   sync.Mutex
 	permErr error // sticky once set: every Read/Write after this returns it
@@ -159,6 +175,10 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		b := make([]byte, chunkSize)
 		return &b
 	}
+	c.readPool.New = func() any {
+		b := make([]byte, chunkSize)
+		return &b
+	}
 	for _, leg := range legs {
 		c.writersWG.Add(1)
 		go c.readLeg(leg)
@@ -201,17 +221,30 @@ func (c *Conn) readLeg(leg net.Conn) {
 			return
 		}
 
-		data := make([]byte, length)
+		// Borrow a payload buffer from readPool instead of allocating one per
+		// chunk. A zero-length chunk carries no payload, so it borrows nothing.
+		ch := chunk{seq: seq}
 		if length > 0 {
-			if _, err := io.ReadFull(leg, data); err != nil {
+			bufp := c.readPool.Get().(*[]byte)
+			ch.data = (*bufp)[:length]
+			ch.base = bufp
+			if _, err := io.ReadFull(leg, ch.data); err != nil {
+				// Never delivered: recycle immediately so a mid-chunk read error
+				// doesn't drop the buffer out of the pool.
+				c.readPool.Put(bufp)
 				c.fail(err)
 				return
 			}
 		}
 
 		select {
-		case c.chunkCh <- chunk{seq: seq, data: data}:
+		case c.chunkCh <- ch:
 		case <-c.closed:
+			// The chunk never reached Read, so nothing else will return its
+			// buffer - hand it back here instead of leaking it from the pool.
+			if ch.base != nil {
+				c.readPool.Put(ch.base)
+			}
 			return
 		}
 	}
@@ -415,10 +448,30 @@ func (c *Conn) Write(p []byte) (int, error) {
 // buffer, otherwise it waits in pending until its turn comes.
 func (c *Conn) stash(ch chunk) {
 	if ch.seq == c.nextSeq {
-		c.readBuf = ch.data
+		c.setReadBuf(ch)
 		c.nextSeq++
 	} else {
 		c.pending[ch.seq] = ch
+	}
+}
+
+// setReadBuf installs ch as the current read buffer and remembers its pooled
+// backing buffer so releaseReadBuf can return it once the bytes are consumed.
+// readBuf is only ever replaced when empty (all call sites are guarded by a
+// len(readBuf)==0 check), so any previous buffer has already been released.
+// Caller holds rmu.
+func (c *Conn) setReadBuf(ch chunk) {
+	c.readBuf = ch.data
+	c.readBufBase = ch.base
+}
+
+// releaseReadBuf returns the fully-consumed read buffer's pooled backing buffer
+// to readPool. Called under rmu once readBuf has drained to empty; niling the
+// reference makes it safe against a double return.
+func (c *Conn) releaseReadBuf() {
+	if c.readBufBase != nil {
+		c.readPool.Put(c.readBufBase)
+		c.readBufBase = nil
 	}
 }
 
@@ -466,7 +519,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 			// available before surfacing the sticky error.
 			if ch, ok := c.pending[c.nextSeq]; ok {
 				delete(c.pending, c.nextSeq)
-				c.readBuf = ch.data
+				c.setReadBuf(ch)
 				c.nextSeq++
 			} else {
 				return 0, err
@@ -485,7 +538,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 		if ch, ok := c.pending[c.nextSeq]; ok {
 			delete(c.pending, c.nextSeq)
-			c.readBuf = ch.data
+			c.setReadBuf(ch)
 			c.nextSeq++
 			continue
 		}
@@ -551,6 +604,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 
 	n := copy(p, c.readBuf)
 	c.readBuf = c.readBuf[n:]
+	// Once the chunk's bytes are fully copied out to the caller, its pooled
+	// backing buffer is free to be reused by the next inbound chunk.
+	if len(c.readBuf) == 0 {
+		c.releaseReadBuf()
+	}
 	return n, nil
 }
 

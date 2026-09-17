@@ -186,6 +186,11 @@ type Conn struct {
 	// readPool once readBuf drains to empty, so the next inbound chunk can reuse
 	// it. Guarded by rmu, like the rest of the reassembly state.
 	readBufBase *[]byte
+	// readTimer is the reusable stall timer for Read's blocking loop, created
+	// lazily on first use and re-armed with Reset on every turn instead of a
+	// fresh time.NewTimer per turn. Guarded by rmu (Read holds it for its whole
+	// duration), so one timer serves every Read call and every loop turn.
+	readTimer *time.Timer
 	// readPool recycles chunkSize payload buffers on the read/reassembly path,
 	// mirroring chunkPool on the write side: readLeg borrows one per inbound
 	// chunk instead of allocating a fresh buffer for every 16KB chunk, and Read
@@ -918,20 +923,39 @@ func (c *Conn) Read(p []byte) (int, error) {
 			totalKnown = c.totalKnown
 		}
 
-		timer := time.NewTimer(c.stallTimeout)
+		// Arm the reusable stall timer for this turn. Created once and re-armed
+		// with Reset on every subsequent turn (and every subsequent Read call),
+		// instead of allocating a fresh time.NewTimer per turn on the reassembly
+		// hot path. Under striping, chunks routinely arrive out of order, so a
+		// Read blocked on sequence N wakes once per earlier-arriving chunk and
+		// loops again still waiting - each of those turns previously allocated
+		// (and leaked to the GC) a new 20s timer. Stop-then-drain-then-Reset
+		// re-arms without leaving a stale tick behind (the drain covers a timer
+		// that fired between the previous select and this Stop), giving every
+		// select the same full stallTimeout budget the per-turn timer did.
+		if c.readTimer == nil {
+			c.readTimer = time.NewTimer(c.stallTimeout)
+		} else {
+			if !c.readTimer.Stop() {
+				select {
+				case <-c.readTimer.C:
+				default:
+				}
+			}
+			c.readTimer.Reset(c.stallTimeout)
+		}
+		timer := c.readTimer
+
 		select {
 		case ch := <-c.chunkCh:
-			timer.Stop()
 			c.stash(ch)
 
 		case <-totalKnown:
-			timer.Stop()
 			// The total just became known; loop to re-check completion and
 			// drain whatever is buffered.
 			c.drainAvailable()
 
 		case <-c.legsDone:
-			timer.Stop()
 			// Every leg ended. Absorb anything still buffered; if that
 			// completes the stream we'll report EOF on the next loop, otherwise
 			// a byte range no leg carried is genuinely lost.
@@ -946,7 +970,6 @@ func (c *Conn) Read(p []byte) (int, error) {
 			}
 
 		case err := <-c.errCh:
-			timer.Stop()
 			c.setPermErr(err)
 			// A leg erroring doesn't necessarily mean the chunk we're waiting
 			// on is lost - absorb whatever is already queued before giving up.

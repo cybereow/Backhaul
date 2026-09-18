@@ -11,6 +11,22 @@ the machine it ran on. So every run measures the **same workload twice**: once
 straight to the origin service, once through a backhaul tunnel, back to back on
 the same host under the same emulated network. What is reported is the ratio.
 
+## Reading the ratios
+
+On the **unshaped** profile the baseline is loopback: an RTT of tens of
+microseconds. A tunnel inherently adds two process hops and its own framing, so
+its fixed cost — a few hundred microseconds — looks enormous next to that while
+being irrelevant on any real path. On that profile read the **absolute** added
+latency, not the percentage.
+
+The **wan** profile is the one whose ratios mean something, because there the
+baseline pays a realistic RTT too.
+
+Neither profile says anything about behaviour under concurrency: the `rr`
+workload is a single connection issuing one exchange at a time, which is the
+worst case for the pooled and multiplexed transports, since there is nothing to
+multiplex.
+
 ## The two workloads
 
 | workload | what it is | what it stresses |
@@ -31,11 +47,22 @@ stream. CI fails the job if any of the four measurements reports
 `--netem wan` adds 40ms ± 5ms each way and 0.01% loss, i.e. an 80ms RTT — a
 realistic intercontinental path for how this project is actually deployed.
 
-The shaping is attached to the **origin port and the tunnel port**, and to
-neither of the two local hops. That keeps the comparison honest: without a
-tunnel a user crosses the WAN to reach the origin directly; with one, the WAN is
-the backhaul client↔server link and both its ends are local. Each path crosses
-the emulated WAN exactly once.
+Each path must cross the emulated WAN **exactly once**, or the comparison is
+rigged. That is why the origin service is served on two ports by two identical
+instances:
+
+| port | who reaches it | shaped? |
+|---|---|---|
+| 19000 | a user going direct, with no tunnel — across the WAN | yes |
+| 19002 | the backhaul **client**, which sits beside the service | no |
+
+A single shared origin port cannot express this. Shaping it would also shape
+the tunnel's last hop, so the tunnel would cross the WAN twice while the
+baseline crossed it once — which is exactly the bug the first version of this
+harness had, and it made the tunnel look about 20x worse than it is.
+
+So the shaping goes on port 19000 and the tunnel link (18080), and nowhere
+else.
 
 The `rr` workload is strictly sequential — one exchange per round trip — so the
 WAN profile caps it at 1/RTT, about 12.5 exchanges per second. The workload is

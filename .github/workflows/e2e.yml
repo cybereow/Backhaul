@@ -114,7 +114,20 @@ jobs:
             "| p50 latency us | " + (.baseline.rr.p50_micros|tostring)
               + " | " + (.tunnel.rr.p50_micros|tostring) + " | |\n" +
             "| p99 latency us | " + (.baseline.rr.p99_micros|tostring)
-              + " | " + (.tunnel.rr.p99_micros|tostring) + " | |\n"
+              + " | " + (.tunnel.rr.p99_micros|tostring) + " | |\n\n" +
+            "Latency the tunnel adds at p50: **"
+              + ((.tunnel.rr.p50_micros - .baseline.rr.p50_micros)|tostring) + " us**.\n\n" +
+            (if .netem == "off" then
+              "> On this profile the baseline is loopback, an RTT of tens of microseconds. "
+              + "The tunnel adds two process hops and its framing, so a fixed cost of a few "
+              + "hundred microseconds looks enormous as a ratio while being irrelevant on any "
+              + "real path. Read the absolute figure above, and read the net=wan rows for the "
+              + "ratio that means something.\n"
+             else
+              "> Each path crosses the emulated WAN exactly once: the baseline reaches the "
+              + "service across it, the tunnel carries the WAN on its client<->server link "
+              + "while both of its end hops are local.\n"
+             end)
           ' /tmp/result.json >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4

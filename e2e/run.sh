@@ -72,7 +72,20 @@ WORK="$(mktemp -d)"
 BACKHAUL="${BACKHAUL_BIN:-$WORK/backhaul}"
 LOADGEN="${LOADGEN_BIN:-$WORK/loadgen}"
 
-ORIGIN_PORT=19000   # the service being tunnelled to
+# The origin service is served on two ports by two identical instances. They
+# exist to model where the service sits relative to the emulated WAN:
+#
+#   ORIGIN_DIRECT_PORT  what a user reaches WITHOUT a tunnel - across the WAN,
+#                       so this port is shaped.
+#   ORIGIN_TUNNEL_PORT  what the backhaul CLIENT dials. The client is
+#                       co-located with the service in every real deployment,
+#                       so this hop is local and must NOT be shaped.
+#
+# One shared origin port cannot express that: shaping it would put the WAN on
+# the tunnel's last hop as well, making the tunnel cross the emulated WAN twice
+# while the baseline crosses it once.
+ORIGIN_DIRECT_PORT=19000
+ORIGIN_TUNNEL_PORT=19002
 TUNNEL_PORT=18080   # backhaul server <-> backhaul client (the inter-site link)
 PUBLIC_PORT=19001   # the port backhaul exposes to users
 TOKEN="e2e-test-token"
@@ -124,11 +137,12 @@ fi
 
 # ---------------------------------------------------------------- network
 
-# The emulated WAN must sit on the link that BOTH paths cross, or the
-# comparison is rigged. Without a tunnel a user reaches the origin service
-# directly across the WAN; with one, the WAN is the backhaul client <-> server
-# link and both of its ends are local. So netem is attached to the origin port
-# and the tunnel port, and to neither of the two local hops.
+# The emulated WAN must be crossed EXACTLY ONCE by each path, or the comparison
+# is rigged. Without a tunnel a user reaches the service directly across the
+# WAN (ORIGIN_DIRECT_PORT). With one, the WAN is the backhaul client <-> server
+# link (TUNNEL_PORT); the user->server hop and the client->service hop are both
+# local. So those two ports are shaped and nothing else is - in particular
+# ORIGIN_TUNNEL_PORT is left alone, which is the whole reason it exists.
 if [[ "$NETEM" == "wan" ]]; then
   if ! command -v tc >/dev/null 2>&1; then
     echo "netem requested but tc is not installed" >&2
@@ -142,7 +156,7 @@ if [[ "$NETEM" == "wan" ]]; then
   NETEM_APPLIED=1
   "${TC[@]}" qdisc add dev lo parent 1:3 handle 30: netem \
       delay "$NETEM_DELAY" "$NETEM_JITTER" distribution normal loss "$NETEM_LOSS"
-  for p in "$ORIGIN_PORT" "$TUNNEL_PORT"; do
+  for p in "$ORIGIN_DIRECT_PORT" "$TUNNEL_PORT"; do
     "${TC[@]}" filter add dev lo protocol ip parent 1:0 prio 3 u32 \
         match ip dport "$p" 0xffff flowid 1:3
     "${TC[@]}" filter add dev lo protocol ip parent 1:0 prio 3 u32 \
@@ -152,10 +166,13 @@ fi
 
 # ---------------------------------------------------------------- origin
 
-log "starting origin service on $ORIGIN_PORT"
-"$LOADGEN" -role=origin -listen="127.0.0.1:$ORIGIN_PORT" >"$WORK/origin.log" 2>&1 &
+log "starting origin services on $ORIGIN_DIRECT_PORT (shaped) and $ORIGIN_TUNNEL_PORT (local)"
+"$LOADGEN" -role=origin -listen="127.0.0.1:$ORIGIN_DIRECT_PORT" >"$WORK/origin-direct.log" 2>&1 &
 PIDS+=($!)
-wait_port "$ORIGIN_PORT"
+"$LOADGEN" -role=origin -listen="127.0.0.1:$ORIGIN_TUNNEL_PORT" >"$WORK/origin-tunnel.log" 2>&1 &
+PIDS+=($!)
+wait_port "$ORIGIN_DIRECT_PORT"
+wait_port "$ORIGIN_TUNNEL_PORT"
 
 measure() { # measure <target-port> <mode>
   local port="$1" mode="$2"
@@ -167,9 +184,9 @@ measure() { # measure <target-port> <mode>
   esac
 }
 
-log "measuring BASELINE (no tunnel)"
-BASE_BULK="$(measure "$ORIGIN_PORT" bulk)"
-BASE_RR="$(measure "$ORIGIN_PORT" rr)"
+log "measuring BASELINE (no tunnel, straight across the WAN)"
+BASE_BULK="$(measure "$ORIGIN_DIRECT_PORT" bulk)"
+BASE_RR="$(measure "$ORIGIN_DIRECT_PORT" rr)"
 
 # ---------------------------------------------------------------- tunnel
 
@@ -183,7 +200,7 @@ keepalive_period = 75
 heartbeat = 40
 nodelay = true
 log_level = "info"
-ports = ["$PUBLIC_PORT=127.0.0.1:$ORIGIN_PORT"]
+ports = ["$PUBLIC_PORT=127.0.0.1:$ORIGIN_TUNNEL_PORT"]
 EOF
 
 cat > "$WORK/client.toml" <<EOF

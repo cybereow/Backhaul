@@ -461,6 +461,11 @@ func (c *UdpTransport) udpCopy(srcConn, dstConn *net.UDPConn, port int) {
 			c.usageMonitor.AddOrUpdatePort(port, uint64(totalWritten))
 		}
 
-		c.logger.Debugf("forwarded %d bytes from %s to %s", n, srcConn.LocalAddr().String(), dstConn.RemoteAddr().String())
+		// Guarded: the two String() calls format fresh IP:port strings and the
+		// variadic call boxes its arguments into an []any - all of it paid on
+		// every forwarded packet, even at the default (non-debug) level.
+		if c.logger.IsLevelEnabled(logrus.DebugLevel) {
+			c.logger.Debugf("forwarded %d bytes from %s to %s", n, srcConn.LocalAddr().String(), dstConn.RemoteAddr().String())
+		}
 	}
 }

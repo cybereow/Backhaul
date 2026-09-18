@@ -636,6 +636,13 @@ func (s *UdpTransport) udpCopy(udpLocal *LocalUDPConn, udpTunnel *TunnelUDPConn,
 func (s *UdpTransport) udpLocalCopy(from *LocalUDPConn, to *TunnelUDPConn) {
 	inactivityTimeout := 60 * time.Second // Define a 60-second inactivity timeout
 
+	// One idle timer for the whole pump, re-armed per packet, instead of a
+	// fresh time.After on every loop turn - see udpToTCP in accept_udp.go for
+	// why the per-turn form is costly (a Timer + channel allocated per packet,
+	// each parked in the runtime timer heap for the full 60s).
+	idle := time.NewTimer(inactivityTimeout)
+	defer idle.Stop()
+
 	for {
 		select {
 		case data, ok := <-from.payload: // Wait for data on the UDP payload channel
@@ -660,9 +667,24 @@ func (s *UdpTransport) udpLocalCopy(from *LocalUDPConn, to *TunnelUDPConn) {
 				s.usageMonitor.AddOrUpdatePort(from.listener.LocalAddr().(*net.UDPAddr).Port, uint64(totalWritten))
 			}
 
-			s.logger.Debugf("forwarded %d bytes from local connection %s to tunnel", packetSize, from.addr.String())
+			// Guarded: a variadic log call boxes its arguments into an []any
+			// before the call, and addr.String() formats a fresh IP:port
+			// string - both paid on every packet even at the default level.
+			if s.logger.IsLevelEnabled(logrus.DebugLevel) {
+				s.logger.Debugf("forwarded %d bytes from local connection %s to tunnel", packetSize, from.addr.String())
+			}
 
-		case <-time.After(inactivityTimeout): // Timeout after 30 seconds of inactivity
+			// Re-arm for the next packet (stop-drain-reset, so a timeout that
+			// fired mid-write leaves no stale value on the channel).
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(inactivityTimeout)
+
+		case <-idle.C: // Timeout after 60 seconds of inactivity
 			s.logger.Debugf("connection idle for 60 seconds, closing UDP connection for %s", from.addr.String())
 			return
 		}
@@ -671,6 +693,13 @@ func (s *UdpTransport) udpLocalCopy(from *LocalUDPConn, to *TunnelUDPConn) {
 
 func (s *UdpTransport) udpTunnelCopy(from *TunnelUDPConn, to *LocalUDPConn) {
 	inactivityTimeout := 60 * time.Second // Define a 60-second inactivity timeout
+
+	// One idle timer for the whole pump, re-armed per packet, instead of a
+	// fresh time.After on every loop turn - see udpToTCP in accept_udp.go for
+	// why the per-turn form is costly (a Timer + channel allocated per packet,
+	// each parked in the runtime timer heap for the full 60s).
+	idle := time.NewTimer(inactivityTimeout)
+	defer idle.Stop()
 
 	for {
 		select {
@@ -696,9 +725,24 @@ func (s *UdpTransport) udpTunnelCopy(from *TunnelUDPConn, to *LocalUDPConn) {
 				s.usageMonitor.AddOrUpdatePort(to.listener.LocalAddr().(*net.UDPAddr).Port, uint64(totalWritten))
 			}
 
-			s.logger.Debugf("forwarded %d bytes from local connection %s to tunnel", packetSize, from.addr.String())
+			// Guarded: a variadic log call boxes its arguments into an []any
+			// before the call, and addr.String() formats a fresh IP:port
+			// string - both paid on every packet even at the default level.
+			if s.logger.IsLevelEnabled(logrus.DebugLevel) {
+				s.logger.Debugf("forwarded %d bytes from local connection %s to tunnel", packetSize, from.addr.String())
+			}
 
-		case <-time.After(inactivityTimeout): // Timeout after 30 seconds of inactivity
+			// Re-arm for the next packet (stop-drain-reset, so a timeout that
+			// fired mid-write leaves no stale value on the channel).
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(inactivityTimeout)
+
+		case <-idle.C: // Timeout after 60 seconds of inactivity
 			s.logger.Debugf("connection idle for 60 seconds, closing UDP connection for %s", from.addr.String())
 			return
 		}

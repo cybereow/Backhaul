@@ -37,6 +37,13 @@ tunnel a user crosses the WAN to reach the origin directly; with one, the WAN is
 the backhaul client↔server link and both its ends are local. Each path crosses
 the emulated WAN exactly once.
 
+The `rr` workload is strictly sequential — one exchange per round trip — so the
+WAN profile caps it at 1/RTT, about 12.5 exchanges per second. The workload is
+therefore scaled to the profile (300 exchanges and 16MB bulk under `wan`, 3000
+and 64MB without it); passing `--rr-requests`/`--bulk-bytes` overrides that. Each
+run reports the workload it actually used, so a WAN row is never mistaken for an
+unshaped one.
+
 It needs `sch_netem`/`sch_prio` and root. The workflow probes for them first and
 fails loudly rather than reporting a "WAN" run that silently had no WAN.
 

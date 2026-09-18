@@ -24,9 +24,12 @@ set -euo pipefail
 TRANSPORT="ws"
 NETEM="off"
 OUT=""
-BULK_BYTES=$((64 * 1024 * 1024))
-RR_REQUESTS=3000
+# Left empty so that "did the caller set this?" can be answered after parsing;
+# the defaults depend on the network profile (see below).
+BULK_BYTES=""
+RR_REQUESTS=""
 RR_SIZE=512
+CLIENT_TIMEOUT=""
 
 # Emulated WAN applied to the inter-site link. 40ms each way = 80ms RTT, which
 # is a realistic intercontinental path for this project's usual deployment.
@@ -45,6 +48,24 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# The rr workload is strictly sequential: one exchange per round trip. Under the
+# emulated WAN that puts a hard ceiling of 1/RTT exchanges per second - about
+# 12.5/s at 80ms - so the off-profile count would take roughly four minutes per
+# measurement and simply time out. Scale the workload to the profile instead,
+# and give the client a deadline with room to spare.
+case "$NETEM" in
+  wan)
+    : "${BULK_BYTES:=$((16 * 1024 * 1024))}"
+    : "${RR_REQUESTS:=300}"
+    : "${CLIENT_TIMEOUT:=300s}"
+    ;;
+  *)
+    : "${BULK_BYTES:=$((64 * 1024 * 1024))}"
+    : "${RR_REQUESTS:=3000}"
+    : "${CLIENT_TIMEOUT:=120s}"
+    ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -139,9 +160,10 @@ wait_port "$ORIGIN_PORT"
 measure() { # measure <target-port> <mode>
   local port="$1" mode="$2"
   case "$mode" in
-    bulk) "$LOADGEN" -role=client -connect="127.0.0.1:$port" -mode=bulk -bytes="$BULK_BYTES" ;;
+    bulk) "$LOADGEN" -role=client -connect="127.0.0.1:$port" -mode=bulk \
+             -bytes="$BULK_BYTES" -timeout="$CLIENT_TIMEOUT" ;;
     rr)   "$LOADGEN" -role=client -connect="127.0.0.1:$port" -mode=rr \
-             -requests="$RR_REQUESTS" -size="$RR_SIZE" ;;
+             -requests="$RR_REQUESTS" -size="$RR_SIZE" -timeout="$CLIENT_TIMEOUT" ;;
   esac
 }
 
@@ -230,6 +252,7 @@ RESULT=$(cat <<EOF
 {
   "transport": "$TRANSPORT",
   "netem": "$NETEM",
+  "workload": { "bulk_bytes": $BULK_BYTES, "rr_requests": $RR_REQUESTS, "rr_size": $RR_SIZE },
   "baseline": { "bulk": $BASE_BULK, "rr": $BASE_RR },
   "tunnel":   { "bulk": $TUN_BULK,  "rr": $TUN_RR }
 }

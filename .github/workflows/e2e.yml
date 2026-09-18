@@ -1,12 +1,20 @@
 name: Tests & E2E
 
 on:
+  # A branch with an open PR would otherwise run this whole matrix twice, once
+  # for the push and once for the pull_request event.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Superseded runs are wasted runner time; a new push makes the old one moot.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   unit:
@@ -92,6 +100,9 @@ jobs:
         run: |
           jq -r '
             "### " + .transport + " (net=" + .netem + ")\n\n" +
+            "_workload: " + (.workload.rr_requests|tostring) + " x "
+              + (.workload.rr_size|tostring) + "B exchanges, "
+              + ((.workload.bulk_bytes/1048576)|floor|tostring) + "MB bulk_\n\n" +
             "| workload | direct (no tunnel) | through backhaul | ratio |\n" +
             "|---|---|---|---|\n" +
             "| bulk MB/s | " + (.baseline.bulk.mb_per_sec|tostring|.[0:7])

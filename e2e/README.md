@@ -22,17 +22,30 @@ latency, not the percentage.
 The **wan** profile is the one whose ratios mean something, because there the
 baseline pays a realistic RTT too.
 
-Neither profile says anything about behaviour under concurrency: the `rr`
-workload is a single connection issuing one exchange at a time, which is the
-worst case for the pooled and multiplexed transports, since there is nothing to
-multiplex.
+### What concurrency did and did not change
+
+`conc` was added expecting the multiplexed transports to close the gap under
+load. Measured on the unshaped profile, they did not — the ratio stays in the
+same 13–22% band as the single-connection figure for all four transports.
+
+What it did show is that **the tunnel scales**: ws goes from ~4,000 req/s on one
+connection to ~43,000 across 32, about 11x, while the direct baseline scales
+about 12x over the same range. Both sides scale with the cores available, so the
+ratio holds roughly constant — the tunnel is not serialising, it just has a
+constant per-exchange cost.
+
+That constant cost is the honest answer to "how much does the tunnel cost": on a
+loopback baseline it is most of the number, because a loopback round trip is
+tens of microseconds and there is nothing else in the budget. On a real path it
+is a rounding error next to the RTT.
 
 ## The two workloads
 
 | workload | what it is | what it stresses |
 |---|---|---|
 | `bulk` | one long stream | copy loops, socket buffers — a file transfer or speedtest |
-| `rr` | small request/response exchanges | per-message overhead: syscalls, framing, wakeups — interactive traffic (SSH, gaming, HTTP APIs) |
+| `rr` | small exchanges on **one** connection | per-message overhead: syscalls, framing, wakeups — interactive traffic (SSH, gaming, HTTP APIs) |
+| `conc` | the same exchanges over **32 connections at once** | what a tunnel is actually built for, and the only workload where pooling and multiplexing can pay for themselves |
 
 Both matter and they move independently: a change can leave bulk throughput flat
 and still halve the cost of small messages, or the reverse.

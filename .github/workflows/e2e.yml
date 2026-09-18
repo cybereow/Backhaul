@@ -86,7 +86,8 @@ jobs:
       # truncation check on a real tunnel.
       - name: Assert payload integrity
         run: |
-          for path in .baseline.bulk .baseline.rr .tunnel.bulk .tunnel.rr; do
+          for path in .baseline.bulk .baseline.rr .baseline.conc \
+                      .tunnel.bulk .tunnel.rr .tunnel.conc; do
             ok="$(jq -r "$path.verified" /tmp/result.json)"
             if [ "$ok" != "true" ]; then
               echo "payload verification failed at $path" >&2
@@ -94,7 +95,7 @@ jobs:
               exit 1
             fi
           done
-          echo "all four measurements verified their payload"
+          echo "all six measurements verified their payload"
 
       - name: Summary
         run: |
@@ -108,9 +109,13 @@ jobs:
             "| bulk MB/s | " + (.baseline.bulk.mb_per_sec|tostring|.[0:7])
               + " | " + (.tunnel.bulk.mb_per_sec|tostring|.[0:7])
               + " | " + ((.tunnel.bulk.mb_per_sec / .baseline.bulk.mb_per_sec * 100)|tostring|.[0:5]) + "% |\n" +
-            "| req/s | " + (.baseline.rr.req_per_sec|tostring|.[0:7])
+            "| req/s, 1 conn | " + (.baseline.rr.req_per_sec|tostring|.[0:7])
               + " | " + (.tunnel.rr.req_per_sec|tostring|.[0:7])
               + " | " + ((.tunnel.rr.req_per_sec / .baseline.rr.req_per_sec * 100)|tostring|.[0:5]) + "% |\n" +
+            "| req/s, " + (.workload.conc_conns|tostring) + " conns | "
+              + (.baseline.conc.req_per_sec|tostring|.[0:7])
+              + " | " + (.tunnel.conc.req_per_sec|tostring|.[0:7])
+              + " | " + ((.tunnel.conc.req_per_sec / .baseline.conc.req_per_sec * 100)|tostring|.[0:5]) + "% |\n" +
             "| p50 latency us | " + (.baseline.rr.p50_micros|tostring)
               + " | " + (.tunnel.rr.p50_micros|tostring) + " | |\n" +
             "| p99 latency us | " + (.baseline.rr.p99_micros|tostring)
@@ -148,7 +153,11 @@ jobs:
               + ((.tunnel.rr.req_per_sec/.baseline.rr.req_per_sec*100)|tostring|.[0:5]) + "%)"
             + " | p50 " + (.baseline.rr.p50_micros|tostring) + " -> "
               + (.tunnel.rr.p50_micros|tostring) + " us (+"
-              + ((.tunnel.rr.p50_micros - .baseline.rr.p50_micros)|tostring) + ")"' \
+              + ((.tunnel.rr.p50_micros - .baseline.rr.p50_micros)|tostring) + ")"
+            + " | conc" + (.workload.conc_conns|tostring) + " "
+              + (.baseline.conc.req_per_sec|tostring|.[0:6]) + " -> "
+              + (.tunnel.conc.req_per_sec|tostring|.[0:6]) + " ("
+              + ((.tunnel.conc.req_per_sec/.baseline.conc.req_per_sec*100)|tostring|.[0:5]) + "%)"' \
             /tmp/result.json
 
   syscalls:

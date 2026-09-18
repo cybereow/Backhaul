@@ -7,8 +7,11 @@
 #
 # Two workloads, because they stress different things:
 #   bulk - one long stream; dominated by copy loops and socket buffers.
-#   rr   - small request/response exchanges; dominated by per-message overhead
-#          (syscalls, framing, wakeups), which is what interactive traffic is.
+#   rr   - small request/response exchanges on ONE connection; dominated by
+#          per-message overhead (syscalls, framing, wakeups).
+#   conc - the same exchanges over many connections at once. The only workload
+#          where connection pooling and stream multiplexing can pay for
+#          themselves; on a single sequential connection they are pure cost.
 #
 # Every byte is verified against a deterministic pattern, so a run that reports
 # numbers has also proved the tunnel did not corrupt or truncate the stream.
@@ -29,6 +32,8 @@ OUT=""
 BULK_BYTES=""
 RR_REQUESTS=""
 RR_SIZE=512
+CONC_CONNS=""
+CONC_REQUESTS=""
 CLIENT_TIMEOUT=""
 
 # Emulated WAN applied to the inter-site link. 40ms each way = 80ms RTT, which
@@ -45,6 +50,8 @@ while [[ $# -gt 0 ]]; do
     --bulk-bytes)  BULK_BYTES="$2";  shift 2 ;;
     --rr-requests) RR_REQUESTS="$2"; shift 2 ;;
     --rr-size)     RR_SIZE="$2";     shift 2 ;;
+    --conc-conns)    CONC_CONNS="$2";    shift 2 ;;
+    --conc-requests) CONC_REQUESTS="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -58,11 +65,15 @@ case "$NETEM" in
   wan)
     : "${BULK_BYTES:=$((16 * 1024 * 1024))}"
     : "${RR_REQUESTS:=300}"
+    : "${CONC_CONNS:=32}"
+    : "${CONC_REQUESTS:=1600}"
     : "${CLIENT_TIMEOUT:=300s}"
     ;;
   *)
     : "${BULK_BYTES:=$((64 * 1024 * 1024))}"
     : "${RR_REQUESTS:=3000}"
+    : "${CONC_CONNS:=32}"
+    : "${CONC_REQUESTS:=6400}"
     : "${CLIENT_TIMEOUT:=120s}"
     ;;
 esac
@@ -181,12 +192,16 @@ measure() { # measure <target-port> <mode>
              -bytes="$BULK_BYTES" -timeout="$CLIENT_TIMEOUT" ;;
     rr)   "$LOADGEN" -role=client -connect="127.0.0.1:$port" -mode=rr \
              -requests="$RR_REQUESTS" -size="$RR_SIZE" -timeout="$CLIENT_TIMEOUT" ;;
+    conc) "$LOADGEN" -role=client -connect="127.0.0.1:$port" -mode=conc \
+             -conns="$CONC_CONNS" -requests="$CONC_REQUESTS" -size="$RR_SIZE" \
+             -timeout="$CLIENT_TIMEOUT" ;;
   esac
 }
 
 log "measuring BASELINE (no tunnel, straight across the WAN)"
 BASE_BULK="$(measure "$ORIGIN_DIRECT_PORT" bulk)"
 BASE_RR="$(measure "$ORIGIN_DIRECT_PORT" rr)"
+BASE_CONC="$(measure "$ORIGIN_DIRECT_PORT" conc)"
 
 # ---------------------------------------------------------------- tunnel
 
@@ -262,6 +277,7 @@ fi
 log "measuring THROUGH TUNNEL ($TRANSPORT)"
 TUN_BULK="$(measure "$PUBLIC_PORT" bulk)"
 TUN_RR="$(measure "$PUBLIC_PORT" rr)"
+TUN_CONC="$(measure "$PUBLIC_PORT" conc)"
 
 # ---------------------------------------------------------------- report
 
@@ -269,9 +285,10 @@ RESULT=$(cat <<EOF
 {
   "transport": "$TRANSPORT",
   "netem": "$NETEM",
-  "workload": { "bulk_bytes": $BULK_BYTES, "rr_requests": $RR_REQUESTS, "rr_size": $RR_SIZE },
-  "baseline": { "bulk": $BASE_BULK, "rr": $BASE_RR },
-  "tunnel":   { "bulk": $TUN_BULK,  "rr": $TUN_RR }
+  "workload": { "bulk_bytes": $BULK_BYTES, "rr_requests": $RR_REQUESTS, "rr_size": $RR_SIZE,
+                "conc_conns": $CONC_CONNS, "conc_requests": $CONC_REQUESTS },
+  "baseline": { "bulk": $BASE_BULK, "rr": $BASE_RR, "conc": $BASE_CONC },
+  "tunnel":   { "bulk": $TUN_BULK,  "rr": $TUN_RR,  "conc": $TUN_CONC }
 }
 EOF
 )

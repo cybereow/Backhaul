@@ -23,6 +23,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -76,6 +77,7 @@ func fill(buf []byte, off int64) {
 
 type report struct {
 	Mode      string  `json:"mode"`
+	Conns     int     `json:"conns,omitempty"`
 	Bytes     int64   `json:"bytes"`
 	Seconds   float64 `json:"seconds"`
 	MBPerSec  float64 `json:"mb_per_sec"`
@@ -92,8 +94,9 @@ func main() {
 	connect := flag.String("connect", "127.0.0.1:9000", "client target address")
 	mode := flag.String("mode", "bulk", "bulk or rr")
 	nbytes := flag.Int64("bytes", 64<<20, "bulk: bytes to transfer")
-	requests := flag.Int("requests", 2000, "rr: number of exchanges")
-	reqSize := flag.Int("size", 512, "rr: bytes per exchange")
+	requests := flag.Int("requests", 2000, "rr/conc: total number of exchanges")
+	reqSize := flag.Int("size", 512, "rr/conc: bytes per exchange")
+	conns := flag.Int("conns", 32, "conc: how many connections run at once")
 	timeout := flag.Duration("timeout", 120*time.Second, "overall client deadline")
 	flag.Parse()
 
@@ -102,7 +105,7 @@ func main() {
 	case "origin":
 		err = runOrigin(*listen)
 	case "client":
-		err = runClient(*connect, *mode, *nbytes, *requests, *reqSize, *timeout)
+		err = runClient(*connect, *mode, *nbytes, *requests, *reqSize, *conns, *timeout)
 	default:
 		err = fmt.Errorf("unknown role %q", *role)
 	}
@@ -167,14 +170,117 @@ func serveOrigin(c net.Conn) {
 	}
 }
 
-func runClient(addr, mode string, nbytes int64, requests, reqSize int, timeout time.Duration) error {
+func runClient(addr, mode string, nbytes int64, requests, reqSize, conns int, timeout time.Duration) error {
 	switch mode {
 	case "bulk":
 		return clientBulk(addr, nbytes, timeout)
 	case "rr":
 		return clientRR(addr, requests, reqSize, timeout)
+	case "conc":
+		return clientConc(addr, conns, requests, reqSize, timeout)
 	}
 	return fmt.Errorf("unknown mode %q", mode)
+}
+
+// clientConc runs the rr exchange pattern over `conns` connections in
+// parallel, dividing the total exchange count between them.
+//
+// The single-connection rr number is the worst case for a pooled or
+// multiplexed transport: one exchange is in flight at a time, so a pool has
+// nothing to spread and a mux has nothing to interleave, and their framing is
+// pure cost. Real tunnel traffic is many connections at once, which is what
+// this measures.
+func clientConc(addr string, conns, requests, size int, timeout time.Duration) error {
+	if conns < 1 {
+		return fmt.Errorf("conns must be at least 1")
+	}
+	perConn := requests / conns
+	if perConn < 1 {
+		perConn = 1
+	}
+
+	type result struct {
+		lat []time.Duration
+		err error
+	}
+	results := make([]result, conns)
+
+	var wg sync.WaitGroup
+	wg.Add(conns)
+	start := time.Now()
+	for i := 0; i < conns; i++ {
+		go func(idx int) {
+			defer wg.Done()
+			results[idx].lat, results[idx].err = runExchanges(addr, perConn, size, timeout)
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	var all []time.Duration
+	for i, r := range results {
+		if r.err != nil {
+			return fmt.Errorf("connection %d: %w", i, r.err)
+		}
+		all = append(all, r.lat...)
+	}
+	if len(all) == 0 {
+		return fmt.Errorf("no exchanges completed")
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
+
+	total := int64(len(all)) * int64(size)
+	emit(report{
+		Mode:      "conc",
+		Conns:     conns,
+		Bytes:     total * 2,
+		Seconds:   elapsed.Seconds(),
+		MBPerSec:  float64(total*2) / elapsed.Seconds() / (1 << 20),
+		Requests:  len(all),
+		ReqPerSec: float64(len(all)) / elapsed.Seconds(),
+		P50Micros: all[len(all)*50/100].Microseconds(),
+		P99Micros: all[len(all)*99/100].Microseconds(),
+		Verified:  true,
+	})
+	return nil
+}
+
+// runExchanges opens one connection and runs n verified exchanges on it,
+// returning their latencies. Shared by rr and conc so both measure the same
+// thing on the wire.
+func runExchanges(addr string, n, size int, timeout time.Duration) ([]time.Duration, error) {
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(timeout))
+
+	if _, err := fmt.Fprint(c, "ECHO\n"); err != nil {
+		return nil, err
+	}
+
+	out := make([]byte, size)
+	in := make([]byte, size)
+	lat := make([]time.Duration, 0, n)
+
+	var off int64
+	for i := 0; i < n; i++ {
+		fill(out, off)
+		t0 := time.Now()
+		if _, err := c.Write(out); err != nil {
+			return nil, err
+		}
+		if _, err := io.ReadFull(c, in); err != nil {
+			return nil, fmt.Errorf("exchange %d: %w", i, err)
+		}
+		lat = append(lat, time.Since(t0))
+		if err := verify(in, off); err != nil {
+			return nil, fmt.Errorf("exchange %d: %w", i, err)
+		}
+		off += int64(size)
+	}
+	return lat, nil
 }
 
 // clientBulk pulls one long stream and verifies every byte.
@@ -227,37 +333,10 @@ func clientBulk(addr string, nbytes int64, timeout time.Duration) error {
 // clientRR runs small request/response exchanges over one connection, the
 // workload where per-message overhead dominates.
 func clientRR(addr string, requests, size int, timeout time.Duration) error {
-	c, err := net.Dial("tcp", addr)
+	start := time.Now()
+	lat, err := runExchanges(addr, requests, size, timeout)
 	if err != nil {
 		return err
-	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(timeout))
-
-	if _, err := fmt.Fprint(c, "ECHO\n"); err != nil {
-		return err
-	}
-
-	out := make([]byte, size)
-	in := make([]byte, size)
-	lat := make([]time.Duration, 0, requests)
-
-	start := time.Now()
-	var off int64
-	for i := 0; i < requests; i++ {
-		fill(out, off)
-		t0 := time.Now()
-		if _, err := c.Write(out); err != nil {
-			return err
-		}
-		if _, err := io.ReadFull(c, in); err != nil {
-			return fmt.Errorf("exchange %d: %w", i, err)
-		}
-		lat = append(lat, time.Since(t0))
-		if err := verify(in, off); err != nil {
-			return fmt.Errorf("exchange %d: %w", i, err)
-		}
-		off += int64(size)
 	}
 	elapsed := time.Since(start)
 

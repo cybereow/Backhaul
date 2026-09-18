@@ -484,7 +484,14 @@ func (s *WsMuxTransport) tunnelListener() {
 				s.controlMu.Unlock()
 
 			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
-				session, err := smux.Client(netConn, s.smuxConfig)
+				// conn.NetConn(), never the raw netConn from ws.UpgradeHTTP.
+				// The upgrade reads the request through a bufio.Reader, so any
+				// bytes the client pipelined behind its handshake are already
+				// off the socket and sitting in that buffer. NewWebSocketConn
+				// folds them back in front of the connection; the bare netConn
+				// cannot see them, and handing it to smux would start the mux
+				// session mid-frame with the stream's first bytes missing.
+				session, err := smux.Client(conn.NetConn(), s.smuxConfig)
 				if err != nil {
 					s.logger.Errorf("failed to create MUX session for connection %s: %v", conn.RemoteAddr().String(), err)
 					conn.Close()

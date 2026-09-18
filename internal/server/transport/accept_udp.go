@@ -186,10 +186,33 @@ func UDPConnectionHandler(udp *LocalAcceptUDPConn, tcp net.Conn, logger *logrus.
 }
 
 func udpToTCP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	// Create a header (2 bytes) to hold the size of the data
-	header := make([]byte, 2)
+	udpToTCPWithTimeout(tcp, udp, logger, usage, remotePort, sniffer, 60*time.Second)
+}
 
-	inactivityTimeout := 60 * time.Second // Define a 60-second inactivity timeout
+// udpToTCPWithTimeout is udpToTCP with the inactivity timeout injected, so
+// tests can exercise the idle path without waiting a real minute.
+func udpToTCPWithTimeout(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool, inactivityTimeout time.Duration) {
+	// One idle timer for the whole pump, re-armed per packet, instead of a
+	// fresh time.After on every loop turn. time.After allocates a Timer plus
+	// its channel each turn and - worse - parks that timer in the runtime's
+	// timer heap for the full 60s even though the select abandons it after the
+	// next packet. A flow doing P packets/sec therefore carries ~60*P dead
+	// timers at steady state (600k at a modest 10k pps), which every other
+	// deadline in the process then has to sift past. Re-arming one timer keeps
+	// the semantics identical - fire 60s after the last packet - at zero
+	// steady-state cost.
+	idle := time.NewTimer(inactivityTimeout)
+	defer idle.Stop()
+
+	// Reusable staging buffer holding the 2-byte length header followed by the
+	// payload. The previous `append(header, data...)` allocated a fresh
+	// packetSize+2 buffer for every packet, because header's capacity was
+	// exactly 2 and so append always had to grow. BufferSize is an exact fit:
+	// udpListener reads into a BufferSize-2 buffer, so header+payload never
+	// exceeds it. The grow path below only guards against a future caller
+	// feeding this pump larger packets. This mirrors tcpToUDP, which already
+	// keeps a per-connection BufferSize read buffer for the other direction.
+	packet := make([]byte, BufferSize)
 
 	for {
 		select {
@@ -206,14 +229,18 @@ func udpToTCP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usag
 				continue
 			}
 
-			binary.BigEndian.PutUint16(header, uint16(packetSize)) // Store the packet size at 2 bytes
-
-			// Prepend the header to the data
-			packet := append(header, data...)
+			// Build header+payload in the reusable buffer.
+			frameLen := 2 + packetSize
+			if cap(packet) < frameLen {
+				packet = make([]byte, frameLen)
+			}
+			frame := packet[:frameLen]
+			binary.BigEndian.PutUint16(frame, uint16(packetSize)) // Store the packet size at 2 bytes
+			copy(frame[2:], data)
 
 			totalWritten := 0
-			for totalWritten < len(packet) { // Use the total packet length (header + data)
-				w, err := tcp.Write(packet[totalWritten:])
+			for totalWritten < frameLen { // Use the total packet length (header + data)
+				w, err := tcp.Write(frame[totalWritten:])
 				if err != nil {
 					logger.Errorf("failed to write UDP payload to TCP: %v", err)
 					return
@@ -221,13 +248,29 @@ func udpToTCP(tcp net.Conn, udp *LocalAcceptUDPConn, logger *logrus.Logger, usag
 				totalWritten += w
 			}
 
-			logger.Tracef("received %d bytes, forwarded %d bytes from UDP to TCP", packetSize, totalWritten-2)
+			// Guarded because the arguments to a variadic log call are boxed
+			// into an []any before the call, so an unguarded Tracef allocates
+			// on every packet even at the default (non-trace) level.
+			if logger.IsLevelEnabled(logrus.TraceLevel) {
+				logger.Tracef("received %d bytes, forwarded %d bytes from UDP to TCP", packetSize, totalWritten-2)
+			}
 
 			if sniffer {
 				usage.AddOrUpdatePort(remotePort, uint64(totalWritten))
 			}
 
-		case <-time.After(inactivityTimeout): // Timeout after 30 seconds of inactivity
+			// Re-arm for the next packet. Stop-then-drain before Reset so a
+			// timeout that fired while this packet was being written does not
+			// leave a stale value queued on the channel.
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(inactivityTimeout)
+
+		case <-idle.C: // Timeout after 60 seconds of inactivity
 			logger.Debugf("connection with timestamp %d and address %s idle for 60 seconds, closing", udp.timeCreated, udp.clientAddr.String())
 			return
 		}

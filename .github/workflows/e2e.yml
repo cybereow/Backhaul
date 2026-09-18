@@ -1,0 +1,169 @@
+name: Tests & E2E
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files are not gofmt'd:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (race)
+        run: go test -race ./... -count=1
+
+  e2e:
+    name: E2E ${{ matrix.transport }} / net=${{ matrix.netem }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        transport: [ws, wss, wsmux, wssmux]
+        netem: [off, wan]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Build binaries
+        run: |
+          go build -o /tmp/backhaul ./main.go
+          go build -o /tmp/loadgen ./e2e/loadgen
+
+      # netem lives in sch_netem/sch_prio; the runner images ship them, but fail
+      # loudly here rather than later reporting a "WAN" run that had no WAN.
+      - name: Check netem is available
+        if: matrix.netem == 'wan'
+        run: |
+          sudo modprobe sch_netem || true
+          sudo modprobe sch_prio || true
+          sudo tc qdisc add dev lo root netem delay 1ms
+          sudo tc qdisc del dev lo root
+
+      - name: Run end-to-end comparison
+        env:
+          BACKHAUL_BIN: /tmp/backhaul
+          LOADGEN_BIN: /tmp/loadgen
+          SUDO: sudo
+        run: |
+          ./e2e/run.sh \
+            --transport ${{ matrix.transport }} \
+            --netem ${{ matrix.netem }} \
+            --out /tmp/result.json
+
+      # Every reported number comes from a run that also verified each byte
+      # against a deterministic pattern, so this doubles as a corruption and
+      # truncation check on a real tunnel.
+      - name: Assert payload integrity
+        run: |
+          for path in .baseline.bulk .baseline.rr .tunnel.bulk .tunnel.rr; do
+            ok="$(jq -r "$path.verified" /tmp/result.json)"
+            if [ "$ok" != "true" ]; then
+              echo "payload verification failed at $path" >&2
+              jq . /tmp/result.json >&2
+              exit 1
+            fi
+          done
+          echo "all four measurements verified their payload"
+
+      - name: Summary
+        run: |
+          jq -r '
+            "### " + .transport + " (net=" + .netem + ")\n\n" +
+            "| workload | direct (no tunnel) | through backhaul | ratio |\n" +
+            "|---|---|---|---|\n" +
+            "| bulk MB/s | " + (.baseline.bulk.mb_per_sec|tostring|.[0:7])
+              + " | " + (.tunnel.bulk.mb_per_sec|tostring|.[0:7])
+              + " | " + ((.tunnel.bulk.mb_per_sec / .baseline.bulk.mb_per_sec * 100)|tostring|.[0:5]) + "% |\n" +
+            "| req/s | " + (.baseline.rr.req_per_sec|tostring|.[0:7])
+              + " | " + (.tunnel.rr.req_per_sec|tostring|.[0:7])
+              + " | " + ((.tunnel.rr.req_per_sec / .baseline.rr.req_per_sec * 100)|tostring|.[0:5]) + "% |\n" +
+            "| p50 latency us | " + (.baseline.rr.p50_micros|tostring)
+              + " | " + (.tunnel.rr.p50_micros|tostring) + " | |\n" +
+            "| p99 latency us | " + (.baseline.rr.p99_micros|tostring)
+              + " | " + (.tunnel.rr.p99_micros|tostring) + " | |\n"
+          ' /tmp/result.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: e2e-${{ matrix.transport }}-${{ matrix.netem }}
+          path: /tmp/result.json
+
+  syscalls:
+    name: Syscall count vs base branch
+    runs-on: ubuntu-latest
+    # Only meaningful when there is a base to compare against.
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install strace
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
+
+      - name: Build both binaries
+        run: |
+          go build -o /tmp/loadgen ./e2e/loadgen
+          go build -o /tmp/backhaul-pr ./main.go
+          git worktree add /tmp/base origin/${{ github.base_ref }}
+          ( cd /tmp/base && go build -o /tmp/backhaul-base ./main.go )
+
+      # strace slows the server down, so the timings under it mean nothing - but
+      # the syscall counts are exact and, unlike timings, are not perturbed by a
+      # noisy shared runner. That makes this the reliable signal on CI.
+      - name: Count syscalls on both builds
+        env:
+          LOADGEN_BIN: /tmp/loadgen
+        run: |
+          for t in ws wsmux; do
+            BACKHAUL_BIN=/tmp/backhaul-base ./e2e/syscalls.sh --transport "$t" \
+              --rr-requests 4000 --out "/tmp/base-$t.json"
+            BACKHAUL_BIN=/tmp/backhaul-pr   ./e2e/syscalls.sh --transport "$t" \
+              --rr-requests 4000 --out "/tmp/pr-$t.json"
+          done
+
+      - name: Summary
+        run: |
+          {
+            echo "### Server read syscalls per request"
+            echo
+            echo "| transport | ${{ github.base_ref }} | this PR | change |"
+            echo "|---|---|---|---|"
+            for t in ws wsmux; do
+              b="$(jq -r .reads_per_request "/tmp/base-$t.json")"
+              p="$(jq -r .reads_per_request "/tmp/pr-$t.json")"
+              d="$(awk -v b="$b" -v p="$p" 'BEGIN{ if (b>0) printf "%+.1f%%", (p-b)/b*100; else print "n/a" }')"
+              echo "| $t | $b | $p | $d |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: syscall-counts
+          path: /tmp/*.json

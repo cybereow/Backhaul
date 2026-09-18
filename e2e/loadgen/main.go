@@ -194,10 +194,19 @@ func clientConc(addr string, conns, requests, size int, timeout time.Duration) e
 	if conns < 1 {
 		return fmt.Errorf("conns must be at least 1")
 	}
-	perConn := requests / conns
-	if perConn < 1 {
-		perConn = 1
+	if requests < 1 {
+		return fmt.Errorf("requests must be at least 1")
 	}
+	// Run exactly `requests` exchanges, no more and no fewer. Plain floor
+	// division would drop the remainder (1000 over 32 connections would run
+	// 992), and clamping a zero quotient up to 1 would overshoot instead (1
+	// request over 32 connections would run 32) - either way the totals stop
+	// matching the configured workload and the run takes a different amount of
+	// time than it claims.
+	if conns > requests {
+		conns = requests
+	}
+	base, remainder := requests/conns, requests%conns
 
 	type result struct {
 		lat []time.Duration
@@ -209,10 +218,15 @@ func clientConc(addr string, conns, requests, size int, timeout time.Duration) e
 	wg.Add(conns)
 	start := time.Now()
 	for i := 0; i < conns; i++ {
-		go func(idx int) {
+		// The first `remainder` connections each carry one extra exchange.
+		n := base
+		if i < remainder {
+			n++
+		}
+		go func(idx, count int) {
 			defer wg.Done()
-			results[idx].lat, results[idx].err = runExchanges(addr, perConn, size, timeout)
-		}(i)
+			results[idx].lat, results[idx].err = runExchanges(addr, count, size, timeout)
+		}(i, n)
 	}
 	wg.Wait()
 	elapsed := time.Since(start)

@@ -135,6 +135,22 @@ jobs:
           name: e2e-${{ matrix.transport }}-${{ matrix.netem }}
           path: /tmp/result.json
 
+      # Last step on purpose: one greppable line at the very end of the log, so
+      # the headline numbers can be read without paging through the whole job.
+      - name: One-line result
+        run: |
+          jq -r '"RESULT " + .transport + " net=" + .netem
+            + " | bulk " + (.baseline.bulk.mb_per_sec|tostring|.[0:6]) + " -> "
+              + (.tunnel.bulk.mb_per_sec|tostring|.[0:6]) + " MB/s ("
+              + ((.tunnel.bulk.mb_per_sec/.baseline.bulk.mb_per_sec*100)|tostring|.[0:5]) + "%)"
+            + " | rps " + (.baseline.rr.req_per_sec|tostring|.[0:6]) + " -> "
+              + (.tunnel.rr.req_per_sec|tostring|.[0:6]) + " ("
+              + ((.tunnel.rr.req_per_sec/.baseline.rr.req_per_sec*100)|tostring|.[0:5]) + "%)"
+            + " | p50 " + (.baseline.rr.p50_micros|tostring) + " -> "
+              + (.tunnel.rr.p50_micros|tostring) + " us (+"
+              + ((.tunnel.rr.p50_micros - .baseline.rr.p50_micros)|tostring) + ")"' \
+            /tmp/result.json
+
   syscalls:
     name: Syscall count vs base branch
     runs-on: ubuntu-latest

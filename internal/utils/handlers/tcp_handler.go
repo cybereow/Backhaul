@@ -83,30 +83,100 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 	to.Close()
 }
 
-// transferData pumps from -> to until either side closes or errors.
-//
-// io.CopyBuffer replaces what used to be a manual Read/Write loop. That
-// matters beyond style: when both from and to are *net.TCPConn - true for
-// tcp/tcpmux forwarding, where neither end is multiplexed - Go's runtime
-// routes the copy straight to splice(2) on Linux, moving bytes kernel-side
-// without ever landing them in this process's memory. wsmux/ws legs can't
-// take that path (one end is always a smux.Stream or a WS connection, not a
-// raw socket), but still benefit from the pooled buffer below instead of a
-// fresh allocation per connection.
-func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	var n int64
-	var err error
+// onlyReader hides every method but Read, the mirror of onlyWriter. Together
+// they stop io.CopyBuffer from re-deriving a WriteTo/ReadFrom fast path that
+// pickCopyMode has already ruled out.
+type onlyReader struct {
+	io.Reader
+}
 
-	_, isWT := from.(io.WriterTo)
-	_, isRF := to.(io.ReaderFrom)
+// copyMode is how transferData should move bytes between one particular pair of
+// conns. See pickCopyMode for what each one costs.
+type copyMode int
 
-	if isWT || isRF {
-		n, err = io.CopyBuffer(to, from, nil)
-	} else {
-		bufPtr := copyBufferPool.Get().(*[]byte)
-		n, err = io.CopyBuffer(to, from, *bufPtr)
-		copyBufferPool.Put(bufPtr)
+const (
+	// copySplice: both ends are raw kernel sockets, so io.Copy reaches
+	// splice(2) on Linux and the bytes never enter this process at all. This
+	// is tcp/tcpmux forwarding, where neither end is multiplexed.
+	copySplice copyMode = iota
+	// copyWriteTo: the source hands the destination buffers it already holds.
+	// smux.Stream's WriteTo does exactly this - the frames it received are
+	// written straight out, with no intermediate buffer to copy through or
+	// allocate. This is the tunnel -> socket hop of every muxed flow.
+	copyWriteTo
+	// copyReadFrom: the mirror of copyWriteTo, for a destination that pulls
+	// into buffers of its own.
+	copyReadFrom
+	// copyPooled: no genuine fast path exists, so copy through the shared 64KB
+	// buffer. This is the socket -> tunnel hop, which on the server carries the
+	// user's upload.
+	copyPooled
+)
+
+// spliceable reports whether c is a raw kernel socket, i.e. one end of a pair
+// Go can move with splice(2) without the bytes ever entering this process.
+// *net.TCPConn and *net.UnixConn advertise io.ReaderFrom/io.WriterTo
+// unconditionally, but those methods only reach the kernel fast path when the
+// OTHER end is a socket too; against anything else they fall back to a generic
+// buffered copy of their own. Telling those two cases apart is the whole job of
+// pickCopyMode.
+func spliceable(c net.Conn) bool {
+	switch c.(type) {
+	case *net.TCPConn, *net.UnixConn:
+		return true
 	}
+	return false
+}
+
+// pickCopyMode chooses the cheapest copy path that actually applies to this
+// pair of conns.
+//
+// The previous rule - "if either end implements WriteTo/ReadFrom, hand
+// io.CopyBuffer a nil buffer and let it pick" - looked like a zero-copy fast
+// path but was a pessimisation on every muxed transport. *net.TCPConn always
+// satisfies both interfaces, so the test passed for every wsmux/wssmux flow even
+// though the peer is an smux stream or a striping.Conn and no kernel path
+// exists. io.Copy then called (*TCPConn).WriteTo -> net.genericWriteTo, which
+// allocates its OWN 32KB buffer per connection and loops on that - so the pooled
+// 64KB buffer above was unreachable dead code for exactly the flows it was added
+// for. Measured on the server's upload ingress hop (user socket -> smux stream):
+// 32777 B/op, 2 allocs/op, every read capped at 32KB instead of 64KB.
+func pickCopyMode(from net.Conn, to net.Conn) copyMode {
+	fromSock, toSock := spliceable(from), spliceable(to)
+	if fromSock && toSock {
+		return copySplice
+	}
+	if _, ok := from.(io.WriterTo); ok && !fromSock {
+		return copyWriteTo
+	}
+	if _, ok := to.(io.ReaderFrom); ok && !toSock {
+		return copyReadFrom
+	}
+	return copyPooled
+}
+
+// copyStream moves from -> to over whichever path pickCopyMode selected.
+func copyStream(to net.Conn, from net.Conn) (int64, error) {
+	switch pickCopyMode(from, to) {
+	case copySplice:
+		return io.Copy(to, from)
+	case copyWriteTo:
+		return from.(io.WriterTo).WriteTo(to)
+	case copyReadFrom:
+		return to.(io.ReaderFrom).ReadFrom(from)
+	}
+
+	bufPtr := copyBufferPool.Get().(*[]byte)
+	defer copyBufferPool.Put(bufPtr)
+	// Both interfaces are hidden so io.CopyBuffer cannot route around the
+	// pooled buffer and back into a generic copy that allocates its own.
+	return io.CopyBuffer(onlyWriter{to}, onlyReader{from}, *bufPtr)
+}
+
+// transferData pumps from -> to until either side closes or errors, over
+// whichever copy path copyStream picks for this pair of conns.
+func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
+	n, err := copyStream(to, from)
 
 	if err != nil && !errors.Is(err, net.ErrClosed) {
 		// A copy that ends on a real transport error - not a clean EOF, and not

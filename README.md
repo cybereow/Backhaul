@@ -95,7 +95,7 @@ To start using the solution, you'll need to configure both server and client com
     mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
     mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
     mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
-    mux_streambuffer = 65536      # 64 KB. The maximum buffer size per individual stream within a connection. (optional)
+    mux_streambuffer = 0          # The per-stream receive window: the most data smux will keep in flight on ONE stream before it must wait a full tunnel round-trip for the peer's window update. A stream therefore tops out at mux_streambuffer/RTT, so a small value is the throughput ceiling of every individual flow on mux_version = 2. Leave it unset/0 and it is derived as mux_recievebuffer / mux_con (4 MB / 8 = 512 KB by default), which is each stream's fair share of the session budget the pool already reserves - raising it costs no extra memory, because smux caps everything a connection buffers at mux_recievebuffer regardless. Set it explicitly only to override that. (optional, default: derived, floor 65536)
     mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping. Every pool connection pings on the same fixed interval, which is a traffic-pattern signal; disabling it relies on TCP keepalive instead. (optional, default: false)
     mux_stripe = 1                 # wsmux/wssmux: split a single flow's data across this many pool connections instead of pinning it to one, so one flow isn't capped by a single connection's congestion window/RTT (the win on a lossy, high-RTT link). Must match on both server and client. 1 disables it (default). The earlier deadlock, tail data-loss, silent-truncation, and connection-pool leak bugs are fixed and covered by tests (incl. -race and end-to-end concurrent load). Still newer than the single-connection path; on its own (mux_stripe_parity = 0) it has no leg-failure recovery - if a pool connection drops mid-transfer the flow ends (surfacing as a reset, never silent corruption) - see mux_stripe_parity below to tolerate that. Because each striped flow is reassembled in order, one leg whose transport backs up can briefly head-of-line-stall that single flow under very high concurrency; it no longer degrades the whole tunnel. Raise it above 1 when the bottleneck is genuinely one long-lived throughput-bound flow. (optional, default: 1)
     mux_stripe_parity = 0          # wsmux/wssmux: Reed-Solomon parity legs added on top of mux_stripe, so up to this many of the mux_stripe+mux_stripe_parity pool legs carrying a striped flow can die mid-transfer (a CDN/LB resetting a pooled connection, a mobile handover) without the flow ending - the missing legs' data is reconstructed from the survivors instead. Requires mux_stripe >= 2 and must match on both server and client. Costs bandwidth (mux_stripe_parity/mux_stripe extra data sent) and a little latency (a chunk can't be delivered until mux_stripe of its shards arrive). 0 disables it (default, and the only value that changes nothing about the wire format).
@@ -158,7 +158,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
    mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
    mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
-   mux_streambuffer = 65536      # 64 KB. The maximum buffer size per individual stream within a connection. (optional)
+   mux_streambuffer = 0          # The per-stream receive window; see the server config above. Leave it unset/0 to get the derived default (mux_recievebuffer / 8 = 512 KB), which is what keeps a single flow from being pinned to 64 KB per round-trip. (optional, default: derived, floor 65536)
    mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping (see server config for details). (optional, default: false)
    mux_stripe = 1                 # wsmux/wssmux (prototype): split a single flow's data across this many pool connections (see server config for details). Must match the server. (optional, default: 1)
    mux_stripe_parity = 0          # wsmux/wssmux: Reed-Solomon parity legs on top of mux_stripe, tolerating that many dead legs per flow (see server config for details). Must match the server. (optional, default: 0)
@@ -246,7 +246,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1
    mux_framesize = 32768 
    mux_recievebuffer = 4194304
-   mux_streambuffer = 65536 
+   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
    web_port = 2060
    sniffer_log = "/root/backhaul.json"
@@ -269,7 +269,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1
    mux_framesize = 32768 
    mux_recievebuffer = 4194304
-   mux_streambuffer = 65536 
+   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
    web_port = 2060
    sniffer_log = "/root/backhaul.json"
@@ -419,7 +419,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1
    mux_framesize = 32768 
    mux_recievebuffer = 4194304
-   mux_streambuffer = 65536 
+   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
    web_port = 2060
    sniffer_log = "/root/backhaul.json"
@@ -443,7 +443,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1
    mux_framesize = 32768 
    mux_recievebuffer = 4194304
-   mux_streambuffer = 65536 
+   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
    web_port = 2060
    sniffer_log = "/root/backhaul.json"
@@ -467,7 +467,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1
    mux_framesize = 32768 
    mux_recievebuffer = 4194304
-   mux_streambuffer = 65536 
+   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    tls_cert = "/root/server.crt"      
    tls_key = "/root/server.key"
    sniffer = false 
@@ -493,7 +493,7 @@ To start using the solution, you'll need to configure both server and client com
    mux_version = 1
    mux_framesize = 32768 
    mux_recievebuffer = 4194304
-   mux_streambuffer = 65536  
+   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
    web_port = 2060
    sniffer_log = "/root/backhaul.json"
@@ -606,6 +606,8 @@ On these boxes the per-byte CPU cost is almost entirely **TLS/AES**, not moving 
 * **Check AES-NI first:** `grep -m1 -o aes /proc/cpuinfo`. Cheap VPS instances often don't expose it to the guest, and without it TLS termination is several times more expensive - frequently the entire reason a 2-core box stalls below 1Gbps. If it's present, make sure the negotiated cipher is AES-GCM (hardware-accelerated) rather than ChaCha20.
 * **Get nginx out of the tunnel's data path** - it's usually the real bottleneck. When nginx fronts the tunnel to serve a decoy site under the same hostname (path-based camouflage), it must terminate TLS and reverse-proxy the WebSocket, and it has **no zero-copy path for a proxied WebSocket** - it copies every byte in userspace, burning roughly a core per Gbps. On a 2-core box, a single ~1Gbps flow then eats one core in nginx and another in backhaul, saturating both. Point the CDN/origin **straight at backhaul** (`transport = "wss"`/`"wssmux"`, backhaul terminates the origin TLS itself) and let the `fallback` option (below) preserve the decoy - so the camouflage stays but nginx no longer copies the tunnel's bytes.
 * **Trim nginx waste on the tunnel vhost:** `access_log off;`, `gzip off;`, `ssl_protocols TLSv1.2 TLSv1.3;` only, and `worker_cpu_affinity auto;` so workers spread across every core. Keep `proxy_buffering off;` - that's correct for a streamed tunnel.
+* **Upload much slower than download on `wsmux`/`wssmux`?** On `mux_version = 2` smux adds *per-stream* flow control: a stream may have at most `mux_streambuffer` bytes in flight before it blocks waiting for the peer's window update, which costs a full tunnel round-trip. One stream therefore tops out at `mux_streambuffer / RTT` no matter how much bandwidth the path has - at the old fixed 64 KB and a 30 ms tunnel that is ~2.2 MB/s (~18 Mbps) per stream, measured, while the connection was already allowed to buffer `mux_recievebuffer` (4 MB). That ceiling is why raising socket buffers or `so_sndbuf` on the tunnel legs never moved upload: smux was never letting more than 64 KB per stream reach those sockets. `mux_streambuffer` now defaults to `mux_recievebuffer / mux_con` (512 KB) instead, which is each stream's fair share of the budget the pool already reserves. If you pinned `mux_streambuffer = 65536` in your config (older sample configs did), **set it to 0** to pick the derived value up. Memory does not grow either way - smux caps everything a connection buffers at `mux_recievebuffer` regardless of the per-stream window.
+
 * **`mux_*` settings only apply to the mux transports.** On plain `ws`/`wss` (and `tcp`), `mux_con`, `mux_framesize`, `mux_recievebuffer`, `mux_streambuffer`, `mux_stripe` and `mux_stripe_parity` are silently ignored - each forwarded connection is its own WebSocket. If you set large mux buffers expecting them to take effect, switch the transport to `wsmux`/`wssmux` (still just WebSocket-over-TLS, so it passes through a CDN exactly like `ws`/`wss`).
 * **If one core is pinned while the other is idle** (a single big flow bottlenecked on one connection's copy/decrypt), the mux transports' `mux_stripe = N` splits that one flow across N pooled connections so it can use more than one core - or, more commonly on an intercontinental link, across N congestion windows so per-flow packet loss doesn't cap it. The earlier deadlock and tail data-loss bugs are fixed (see the option docs). If *both* cores are already saturated (aggregate-bound), striping won't help anyway - you're out of CPU, so reduce per-byte cost with the points above instead.
   * **Striping targets a *single* fat flow, not many connections.** Each striped flow is reassembled in order across its legs, so a leg whose transport backs up (smux flow control filling under load) can head-of-line-block *that one flow* until the byte it's carrying arrives. That's inherent to reassembling one ordered stream across independent legs, so the gain is on a single long-lived, throughput-bound flow on a lossy/high-RTT link - not on many short parallel connections. (A separate bug where striping never released connection-pool slots, so heavy concurrent load leaked smux sessions until the whole tunnel stalled, is fixed - concurrency no longer degrades the tunnel, though a single flow can still see the occasional head-of-line latency spike.) When the workload is many connections rather than one fat flow, `mux_stripe = 1` (the default) is the right choice.

@@ -23,6 +23,20 @@ type delayedChunk struct {
 	data []byte
 }
 
+// leg is the shared lifetime of one in-memory tunnel leg. Closing either end
+// stops the delivery workers AND unblocks both ends' pending Read/Write, which
+// a real socket does too: smux.Session.Close closes the underlying conn and
+// then expects its recvLoop's blocked Read to return. Without that, every
+// benchmark iteration would strand two recvLoop goroutines (and the large
+// buffered channels they hold) on a channel receive that never completes -
+// a growing live heap across iterations, and GC work charged to later ones.
+type leg struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func (l *leg) stop() { l.once.Do(func() { close(l.done) }) }
+
 // delayConn is one end of an in-memory tunnel leg with a fixed one-way delay.
 //
 // Delivery MUST stay in order: smux is a framed protocol over a byte stream, so
@@ -31,6 +45,7 @@ type delayedChunk struct {
 // equally but does not preserve order under load, so the delay runs through one
 // FIFO scheduler goroutine per direction instead.
 type delayConn struct {
+	leg     *leg
 	queue   chan delayedChunk
 	in      chan []byte
 	pending []byte
@@ -38,11 +53,15 @@ type delayConn struct {
 
 func (d *delayConn) Read(p []byte) (int, error) {
 	for len(d.pending) == 0 {
-		b, ok := <-d.in
-		if !ok {
+		select {
+		case <-d.leg.done:
 			return 0, io.EOF
+		case b, ok := <-d.in:
+			if !ok {
+				return 0, io.EOF
+			}
+			d.pending = b
 		}
-		d.pending = b
 	}
 	n := copy(p, d.pending)
 	d.pending = d.pending[n:]
@@ -52,11 +71,15 @@ func (d *delayConn) Read(p []byte) (int, error) {
 func (d *delayConn) Write(p []byte) (int, error) {
 	b := make([]byte, len(p))
 	copy(b, p)
-	d.queue <- delayedChunk{at: time.Now().Add(legDelay), data: b}
-	return len(p), nil
+	select {
+	case <-d.leg.done:
+		return 0, net.ErrClosed
+	case d.queue <- delayedChunk{at: time.Now().Add(legDelay), data: b}:
+		return len(p), nil
+	}
 }
 
-func (d *delayConn) Close() error                     { return nil }
+func (d *delayConn) Close() error                     { d.leg.stop(); return nil }
 func (d *delayConn) LocalAddr() net.Addr              { return delayAddr{} }
 func (d *delayConn) RemoteAddr() net.Addr             { return delayAddr{} }
 func (d *delayConn) SetDeadline(time.Time) error      { return nil }
@@ -96,21 +119,22 @@ func deliver(queue <-chan delayedChunk, out chan<- []byte, done <-chan struct{})
 	}
 }
 
-// delayLeg returns the two ends of one tunnel leg plus a stop func.
+// delayLeg returns the two ends of one tunnel leg plus a stop func. Closing
+// either end stops the leg too, so a session teardown is enough on its own;
+// the returned func makes the benchmark's cleanup explicit and is idempotent.
 func delayLeg() (net.Conn, net.Conn, func()) {
 	a2b := make(chan []byte, 8192)
 	b2a := make(chan []byte, 8192)
 	qa := make(chan delayedChunk, 8192)
 	qb := make(chan delayedChunk, 8192)
-	done := make(chan struct{})
+	l := &leg{done: make(chan struct{})}
 
-	a := &delayConn{queue: qa, in: b2a}
-	b := &delayConn{queue: qb, in: a2b}
-	go deliver(qa, a2b, done)
-	go deliver(qb, b2a, done)
+	a := &delayConn{leg: l, queue: qa, in: b2a}
+	b := &delayConn{leg: l, queue: qb, in: a2b}
+	go deliver(qa, a2b, l.done)
+	go deliver(qb, b2a, l.done)
 
-	var once sync.Once
-	return a, b, func() { once.Do(func() { close(done) }) }
+	return a, b, l.stop
 }
 
 // benchStreamWindow moves data server -> client (the direction carrying the

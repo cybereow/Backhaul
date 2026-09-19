@@ -23,11 +23,15 @@ const ( // Default values
 	defaultMuxVersion       = 1
 	defaultMaxFrameSize     = 32768   // 32KB
 	defaultMaxReceiveBuffer = 4194304 // 4MB
-	defaultMaxStreamBuffer  = 65536   // 64KB
-	defaultSnifferLog       = "backhaul.json"
-	defaultMuxCon           = 8
-	defaultMuxStripe        = 1    // 1 disables striping - one flow, one connection
-	defaultUDPBuffer        = 2048 // datagrams queued per UDP flow before dropping (wsmux/wssmux)
+	// minMaxStreamBuffer is the floor for the *derived* per-stream receive
+	// window (see deriveStreamBuffer). It is the value that used to be the
+	// fixed default, so the derivation can only ever widen the window, never
+	// narrow it below what earlier releases ran with.
+	minMaxStreamBuffer = 65536 // 64KB
+	defaultSnifferLog  = "backhaul.json"
+	defaultMuxCon      = 8
+	defaultMuxStripe   = 1    // 1 disables striping - one flow, one connection
+	defaultUDPBuffer   = 2048 // datagrams queued per UDP flow before dropping (wsmux/wssmux)
 )
 
 func applyDefaults(cfg *config.Config) {
@@ -99,12 +103,15 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Client.MaxReceiveBuffer <= 0 {
 		cfg.Client.MaxReceiveBuffer = defaultMaxReceiveBuffer
 	}
-	// MaxStreamBuffer
+	// MaxStreamBuffer - derived from the session budget instead of pinned at
+	// 64KB; see deriveStreamBuffer. An explicit mux_streambuffer still wins.
+	// The client has no mux_con of its own (stream concurrency per session is
+	// the server's setting), so it derives from the default.
 	if cfg.Server.MaxStreamBuffer <= 0 {
-		cfg.Server.MaxStreamBuffer = defaultMaxStreamBuffer
+		cfg.Server.MaxStreamBuffer = deriveStreamBuffer(cfg.Server.MaxReceiveBuffer, cfg.Server.MuxCon)
 	}
 	if cfg.Client.MaxStreamBuffer <= 0 {
-		cfg.Client.MaxStreamBuffer = defaultMaxStreamBuffer
+		cfg.Client.MaxStreamBuffer = deriveStreamBuffer(cfg.Client.MaxReceiveBuffer, defaultMuxCon)
 	}
 	// WebPort returns 0 if not exists
 
@@ -162,4 +169,53 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Client.StripeParity < 0 {
 		cfg.Client.StripeParity = 0
 	}
+}
+
+// deriveStreamBuffer sizes the smux per-stream receive window (mux_streambuffer)
+// from the session receive budget (mux_recievebuffer) and how many streams share
+// a session (mux_con), instead of pinning it at a fixed 64KB.
+//
+// Why this is the tunnel's throughput ceiling on mux_version = 2: v2 adds
+// per-stream flow control, and smux's writeV2 will not put more than
+// MaxStreamBuffer bytes in flight on a stream before it blocks waiting for the
+// peer's window update - one full tunnel RTT away. A stream therefore tops out
+// at MaxStreamBuffer/RTT no matter how much bandwidth the path has. At the old
+// fixed 64KB and a 30ms tunnel that is ~2.2MB/s (~18 Mbps) per stream, while the
+// session was already allowed to buffer 4MB - so ~98% of the budget the pool had
+// reserved could never be used. Measured over an smux pair with 30ms of injected
+// RTT (BenchmarkStreamWindow): 1 stream 2.23 -> 15.9 MB/s, 8 streams 17.5 ->
+// 122.1 MB/s, both ~7x.
+//
+// That cap is what made upload lag download on wsmux/wssmux. The server's tunnel
+// legs already force a 4MB SO_SNDBUF for the server -> client direction that
+// carries the user's upload (see tunnelLegSendBuf), but smux never let more than
+// 64KB per stream reach that socket, so the larger kernel buffer was unreachable.
+// Sizing the window to the session budget is what lets those two agree.
+//
+// Memory does not grow: smux's session token bucket caps everything a session
+// buffers at MaxReceiveBuffer and pauses reading the socket when it is spent, so
+// per-stream windows only decide how that fixed budget is shared, never how big
+// it is. Dividing by muxCon is exactly the fair share - the streams on a session
+// can collectively fill the session window and no single one is throttled below
+// its slice of it.
+//
+// The result is clamped to at least the historical 64KB (so a tiny configured
+// receive buffer can't shrink the window below what earlier releases used) and
+// to at most maxReceiveBuffer, which smux's VerifyConfig requires.
+func deriveStreamBuffer(maxReceiveBuffer, muxCon int) int {
+	if muxCon < 1 {
+		muxCon = defaultMuxCon // defaults are applied later in applyDefaults
+	}
+	if maxReceiveBuffer <= 0 {
+		maxReceiveBuffer = defaultMaxReceiveBuffer
+	}
+
+	buf := maxReceiveBuffer / muxCon
+	if buf < minMaxStreamBuffer {
+		buf = minMaxStreamBuffer
+	}
+	if buf > maxReceiveBuffer {
+		buf = maxReceiveBuffer
+	}
+	return buf
 }

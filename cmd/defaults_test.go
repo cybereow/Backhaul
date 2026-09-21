@@ -61,6 +61,84 @@ func TestDeriveStreamBuffer(t *testing.T) {
 	}
 }
 
+func TestApplyDefaultsStripe(t *testing.T) {
+	tests := []struct {
+		name          string
+		serverFactor  int
+		clientFactor  int
+		serverParity  int
+		clientParity  int
+		wantSrvFactor int
+		wantCliFactor int
+		wantSrvParity int
+		wantCliParity int
+	}{
+		{
+			// Width one is the deliberate default: one flow, one connection.
+			// Raising it is an operator opt-in, not an automatic improvement.
+			name:          "unset factor defaults to one on both roles",
+			wantSrvFactor: 1, wantCliFactor: 1,
+			wantSrvParity: 0, wantCliParity: 0,
+		},
+		{
+			// A nonpositive value (stray config typo) is normalized to the
+			// default without changing it to something wider.
+			name:         "nonpositive factor is normalized to one",
+			serverFactor: -3, clientFactor: 0,
+			wantSrvFactor: 1, wantCliFactor: 1,
+			wantSrvParity: 0, wantCliParity: 0,
+		},
+		{
+			// An explicit positive width must be preserved intact so that
+			// operator opt-in configurations survive applyDefaults.
+			name:         "explicit positive factor is preserved",
+			serverFactor: 4, clientFactor: 2,
+			wantSrvFactor: 4, wantCliFactor: 2,
+			wantSrvParity: 0, wantCliParity: 0,
+		},
+		{
+			// Negative parity is a stray config typo; zero (disabled) is correct.
+			name:         "negative parity is normalized to zero",
+			serverFactor: 1, clientFactor: 1,
+			serverParity: -1, clientParity: -5,
+			wantSrvFactor: 1, wantCliFactor: 1,
+			wantSrvParity: 0, wantCliParity: 0,
+		},
+		{
+			// Positive parity is an explicit opt-in and must survive.
+			name:         "explicit positive parity is preserved",
+			serverFactor: 3, clientFactor: 3,
+			serverParity: 1, clientParity: 2,
+			wantSrvFactor: 3, wantCliFactor: 3,
+			wantSrvParity: 1, wantCliParity: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Server.StripeFactor = tt.serverFactor
+			cfg.Client.StripeFactor = tt.clientFactor
+			cfg.Server.StripeParity = tt.serverParity
+			cfg.Client.StripeParity = tt.clientParity
+			applyDefaults(cfg)
+
+			if cfg.Server.StripeFactor != tt.wantSrvFactor {
+				t.Errorf("server StripeFactor = %d, want %d", cfg.Server.StripeFactor, tt.wantSrvFactor)
+			}
+			if cfg.Client.StripeFactor != tt.wantCliFactor {
+				t.Errorf("client StripeFactor = %d, want %d", cfg.Client.StripeFactor, tt.wantCliFactor)
+			}
+			if cfg.Server.StripeParity != tt.wantSrvParity {
+				t.Errorf("server StripeParity = %d, want %d", cfg.Server.StripeParity, tt.wantSrvParity)
+			}
+			if cfg.Client.StripeParity != tt.wantCliParity {
+				t.Errorf("client StripeParity = %d, want %d", cfg.Client.StripeParity, tt.wantCliParity)
+			}
+		})
+	}
+}
+
 func TestApplyDefaultsStreamBuffer(t *testing.T) {
 	t.Run("derived when unset", func(t *testing.T) {
 		cfg := &config.Config{}

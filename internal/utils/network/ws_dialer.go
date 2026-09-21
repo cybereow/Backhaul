@@ -133,7 +133,8 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 			return nil, fmt.Errorf("invalid address format, failed to parse: %w", err)
 		}
 
-		edgeIP = fmt.Sprintf("%s:%s", edgeIP, port)
+		// ponytail: JoinHostPort brackets IPv6 bare literals; Sprintf("%s:%s") would not.
+		edgeIP = net.JoinHostPort(edgeIP, port)
 	} else {
 		edgeIP = addr
 	}

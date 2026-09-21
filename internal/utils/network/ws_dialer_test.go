@@ -265,3 +265,93 @@ func TestWebSocketDialerMuxFraming(t *testing.T) {
 		})
 	}
 }
+
+func TestWebSocketDialerIPv6Edge(t *testing.T) {
+	// Subtest 1: deterministic address construction — always runs, no network needed.
+	t.Run("address_construction", func(t *testing.T) {
+		// net.JoinHostPort must bracket bare IPv6 literals.
+		assert.Equal(t, "[::1]:8080", net.JoinHostPort("::1", "8080"))
+		assert.Equal(t, "[2001:db8::1]:443", net.JoinHostPort("2001:db8::1", "443"))
+		// IPv6 with zone identifier must also be bracketed.
+		assert.Equal(t, "[fe80::1%eth0]:9000", net.JoinHostPort("fe80::1%eth0", "9000"))
+		// IPv4 and empty override are unaffected.
+		assert.Equal(t, "127.0.0.1:8080", net.JoinHostPort("127.0.0.1", "8080"))
+		assert.Equal(t, ":8080", net.JoinHostPort("", "8080"))
+
+		// Confirm SplitHostPort round-trips for valid addresses.
+		for _, tc := range []struct{ addr, wantHost, wantPort string }{
+			{"[::1]:8080", "::1", "8080"},
+			{"127.0.0.1:443", "127.0.0.1", "443"},
+			{"hostname:9000", "hostname", "9000"},
+		} {
+			h, p, err := net.SplitHostPort(tc.addr)
+			require.NoError(t, err, "addr=%s", tc.addr)
+			assert.Equal(t, tc.wantHost, h)
+			assert.Equal(t, tc.wantPort, p)
+		}
+
+		// Invalid original address must be rejected (no panic).
+		_, _, err := net.SplitHostPort("not-an-addr")
+		assert.Error(t, err, "bare hostname without port must be an error")
+	})
+
+	// Subtest 2: integration with an IPv6 loopback listener.
+	t.Run("ipv6_loopback_integration", func(t *testing.T) {
+		// Bind an IPv6-only listener to verify the skip condition.
+		ln, err := net.Listen("tcp6", "[::1]:0")
+		if err != nil {
+			t.Skipf("IPv6 loopback not available on this host: %v", err)
+		}
+		ln.Close()
+
+		// Build a WS server on IPv6 loopback that records the Host header.
+		var capturedHost string
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			capturedHost = r.Host
+			_, _, _, wsErr := ws.UpgradeHTTP(r, w)
+			if wsErr != nil {
+				http.Error(w, wsErr.Error(), http.StatusBadRequest)
+			}
+		})
+
+		srv := &http.Server{Handler: mux}
+		ipv6ln, err := net.Listen("tcp6", "[::1]:0")
+		require.NoError(t, err)
+		defer ipv6ln.Close()
+
+		go srv.Serve(ipv6ln) //nolint:errcheck
+		defer srv.Close()
+
+		// The socket address comes from the IPv6 listener; the "logical" addr
+		// uses a numeric IPv4 form so it parses but routes via edgeIP override.
+		_, portStr, err := net.SplitHostPort(ipv6ln.Addr().String())
+		require.NoError(t, err)
+		logicalAddr := net.JoinHostPort("127.0.0.1", portStr) // Host header / SNI
+		edgeAddr := "::1"                                       // bare IPv6 — the bug target
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		conn, err := WebSocketDialer(
+			ctx,
+			logicalAddr,
+			edgeAddr,
+			"/testpath",
+			5*time.Second,
+			0,
+			true,
+			"test-token",
+			"test-agent",
+			config.WS,
+			1,
+			0, 0, 0, false,
+		)
+		require.NoError(t, err, "dial via bare IPv6 edge address must succeed")
+		require.NotNil(t, conn)
+		conn.Close()
+
+		// HTTP Host header must reflect the logical hostname, not the edge IP.
+		assert.Equal(t, logicalAddr, capturedHost)
+	})
+}

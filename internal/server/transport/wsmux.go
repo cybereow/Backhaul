@@ -887,11 +887,16 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 				if !g.own(netConn) {
 					return
 				}
-				// Raw (legacy) mode gives smux the socket itself; framed mode wraps
-				// it in binary WebSocket messages. The stream is built on conn, so
-				// bytes already buffered at upgrade time are kept, and closing it
-				// closes netConn.
-				var leg io.ReadWriteCloser = netConn
+				// Raw (legacy) mode gives smux the byte stream itself; framed mode
+				// wraps it in binary WebSocket messages. Both are built on conn, never
+				// on the raw netConn from ws.UpgradeHTTP: the upgrade reads the request
+				// through a bufio.Reader, so any bytes the client pipelined behind its
+				// handshake are already off the socket and sitting in that buffer.
+				// NewWebSocketConn folds them back in front of the connection; the bare
+				// netConn cannot see them, and handing it to smux would start the mux
+				// session mid-frame with the stream's first bytes missing. Closing
+				// either view closes netConn.
+				var leg io.ReadWriteCloser = conn.NetConn()
 				if s.config.WSFraming {
 					leg = conn.Stream()
 				}

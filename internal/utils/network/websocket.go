@@ -40,17 +40,40 @@ type WebSocketConn struct {
 	writeMu sync.Mutex
 }
 
+// wsReadBufferSize is the size of the read buffer placed in front of the socket.
+//
+// Every WebSocket frame opens with a 2-14 byte header, and gobwas reads it with
+// two separate io.ReadFull calls (first two bytes, then the extended length and
+// mask). On an unbuffered socket that is two syscalls per message before a
+// single payload byte moves - measured at three socket reads per message, two
+// of them for the header alone. Buffering collapses those into one read, and
+// small messages arrive whole in that same read.
+//
+// Deliberately kept well below handlers.copyBufferSize (64KB): bufio.Reader
+// reads straight into the caller's buffer whenever its own buffer is empty and
+// the request is at least as large, so a full-size payload read still lands
+// directly in the copy buffer. Sizing this at or above the copy buffer would
+// instead put an extra 64KB memcpy on every large message.
+const wsReadBufferSize = 4 * 1024
+
 func NewWebSocketConn(conn net.Conn, state ws.State, br *bufio.Reader) *WebSocketConn {
-	var wrap net.Conn = conn
+	var src io.Reader = conn
 	if br != nil && br.Buffered() > 0 {
 		peek, _ := br.Peek(br.Buffered())
 		// create a multi reader to consume the buffered bytes then raw conn
 		// we use peek to avoid taking ownership of the bufio reader's internal lock,
 		// but since we only need the buffered bytes:
-		wrap = &bufferedConn{
-			Conn: conn,
-			r:    io.MultiReader(bytes.NewReader(peek), conn),
-		}
+		src = io.MultiReader(bytes.NewReader(peek), conn)
+	}
+
+	// Every read path on this conn - NextReader, ReadMessage, and the raw conn
+	// handed out by NetConn - goes through this one buffered source. Sharing it
+	// is what makes the buffer safe: bytes pulled off the socket by one path
+	// are visible to all of them, so none can be stranded in a buffer another
+	// path cannot see.
+	wrap := &bufferedConn{
+		Conn: conn,
+		r:    bufio.NewReaderSize(src, wsReadBufferSize),
 	}
 
 	r := wsutil.NewReader(wrap, state)

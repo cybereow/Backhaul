@@ -707,6 +707,13 @@ Enable **BBR** congestion control (`net.ipv4.tcp_congestion_control=bbr` with `n
 
 For in-depth information, please visit the dedicated [Benchmark page](./benchmark/).
 
+**Built-in speedtest** (`wsmux`/`wssmux` with `mux_version ≥ 2`): hit `GET /speedtest?dir=both&scope=all&seconds=10` on the server's `web_port`. Two measurement concepts deliberately differ:
+
+- **Per-path rate** (`per_cdn[].down_mbps` / `up_mbps`): bytes received by the far end divided by the *receiver-measured* data-window elapsed — the goodput of that individual connection, excluding setup overhead.
+- **Aggregate rate** (`total_down_mbps` / `total_up_mbps`): sum of all receivers' bytes divided by the *local phase wall time* (from just before launching all concurrent goroutines to after all return), which includes launch and drain overhead. This is the effective whole-phase throughput and will differ from the sum of per-path rates by design — it captures real contention on shared bottlenecks rather than an inflated arithmetic sum of isolated windows.
+
+Requested `seconds` is the workload duration only, never the rate denominator.
+
 
 ## License
 

@@ -328,7 +328,7 @@ func TestWebSocketDialerIPv6Edge(t *testing.T) {
 		_, portStr, err := net.SplitHostPort(ipv6ln.Addr().String())
 		require.NoError(t, err)
 		logicalAddr := net.JoinHostPort("127.0.0.1", portStr) // Host header / SNI
-		edgeAddr := "::1"                                       // bare IPv6 — the bug target
+		edgeAddr := "::1"                                     // bare IPv6 — the bug target
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()

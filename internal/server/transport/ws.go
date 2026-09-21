@@ -644,7 +644,7 @@ func (s *WsTransport) handleLoop() {
 					}
 
 					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(localConn.remoteAddr)); err != nil {
-						s.logger.Debugf("%v", err) // failed to send port number
+						s.logger.Debugf("%v", err)                               // failed to send port number
 						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
 						tunnelConnection.conn.Close()
 						// If the write failed due to a deadline (budget exhausted)

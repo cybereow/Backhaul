@@ -63,3 +63,30 @@ jobs:
         with:
           name: backhaul_linux_amd64_openssl
           path: backhaul_linux_amd64_openssl
+
+  test-linux-amd64:
+    name: Test (linux/amd64)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Test (full suite)
+        run: go test -mod=readonly -count=1 -timeout=180s ./...
+
+      - name: Test with race detector (targeted packages)
+        env:
+          CGO_ENABLED: 1
+        run: >
+          go test -mod=readonly -race -count=1 -timeout=300s
+          ./internal/utils/network
+          ./internal/utils/handlers
+          ./internal/utils/striping
+          ./internal/client/transport
+          ./internal/server/transport

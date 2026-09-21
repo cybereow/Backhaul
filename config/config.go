@@ -51,6 +51,8 @@ type ServerConfig struct {
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	ProxyProtocol        bool          `toml:"proxy_protocol"`
+	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: carry every mux leg as standards-framed RFC 6455 binary messages, negotiated with the backhaul-mux-v1 subprotocol. Enabled by default (a server rejects peers that do not offer it); set false on BOTH ends for the legacy raw mode. Ignored by other transports.
+	MuxHalfClose         bool          `toml:"mux_half_close"` // wsmux/wssmux (mux_version >= 2): plain flows carry a request-EOF-then-reply-safe (directional EOF) envelope. STRICT: upgrades from clients that do not offer the halfclose-v1 capability are rejected. Default false. Promotable flows (promote_bytes) keep legacy full-close semantics. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
@@ -89,6 +91,7 @@ type ClientConfig struct {
 	MSS                  int           `toml:"mss"`
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
+	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: see the server option; must match it. Enabled by default; a server that does not confirm backhaul-mux-v1 is a hard error, never a silent fallback to raw. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	TLSVerify            bool          `toml:"tls_verify"` // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
 }

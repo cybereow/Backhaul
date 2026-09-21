@@ -267,12 +267,27 @@ const (
 	FlowUDP       byte = 0x03
 	FlowPing      byte = 0x04
 	FlowSpeedtest byte = 0x05
+	// FlowPlainHC is a non-promotable plain flow whose stream payload is wrapped
+	// in the half-close envelope (handlers.NewHalfCloseConn, plan 024). Header
+	// identical to FlowPlain (flowID is always 0). Only ever sent to a peer that
+	// offered the halfclose-v1 capability: an older client would misparse it.
+	FlowPlainHC byte = 0x06
 )
 
 func SendFlowPlain(conn net.Conn, flowID uint64, remoteAddr string) error {
+	return sendFlowPlainKind(conn, FlowPlain, flowID, remoteAddr)
+}
+
+// SendFlowPlainHC writes the FlowPlainHC header; the caller then wraps the
+// stream in the half-close envelope before any payload.
+func SendFlowPlainHC(conn net.Conn, flowID uint64, remoteAddr string) error {
+	return sendFlowPlainKind(conn, FlowPlainHC, flowID, remoteAddr)
+}
+
+func sendFlowPlainKind(conn net.Conn, kind byte, flowID uint64, remoteAddr string) error {
 	const headerSize = 1 + 8 + 2
 	buf := make([]byte, headerSize+len(remoteAddr))
-	buf[0] = FlowPlain
+	buf[0] = kind
 	binary.BigEndian.PutUint64(buf[1:9], flowID)
 	binary.BigEndian.PutUint16(buf[9:11], uint16(len(remoteAddr)))
 	copy(buf[11:], remoteAddr)
@@ -297,6 +312,12 @@ func ReceiveFlowPlain(conn net.Conn) (flowID uint64, remoteAddr string, err erro
 		}
 	}
 	return flowID, string(addrBuf), nil
+}
+
+// ReceiveFlowPlainHC reads the FlowPlainHC header (same layout as FlowPlain);
+// the kind byte is consumed separately by ReadFlowKind.
+func ReceiveFlowPlainHC(conn net.Conn) (flowID uint64, remoteAddr string, err error) {
+	return ReceiveFlowPlain(conn)
 }
 
 // SendFlowUDP marks a freshly opened stream as carrying a UDP flow and carries

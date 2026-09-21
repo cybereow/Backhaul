@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"net"
 	"sync/atomic"
 	"time"
@@ -48,11 +49,11 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 			// upgrade) an aging connection still carries traffic until the CDN
 			// resets it, while a closed one carries nothing.
 			replaced = make(chan struct{})
-			go func(ch chan struct{}) {
-				if s.awaitReplacement(session) {
+			go func(ch chan struct{}, g *wsGeneration) {
+				if s.awaitReplacement(g, session) {
 					close(ch)
 				}
-			}(replaced)
+			}(replaced, s.gen)
 			continue
 
 		case <-replaced:
@@ -82,6 +83,8 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 			var promotable bool
 
 			if s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0 {
+				// Always promotable, so it keeps FlowPlain (legacy full-close):
+				// only dispatchPlain's non-promotable flows use FlowPlainHC (plan 024).
 				promotable = true
 				flowID = uint64(time.Now().UnixNano())
 				if err := utils.SendFlowPlain(stream, flowID, incomingConn.remoteAddr); err != nil {
@@ -119,7 +122,7 @@ func (s *WsMuxTransport) handleSession(session *smux.Session) {
 			// Handle data exchange between connections
 			go func() {
 				if promotable {
-					s.dispatchPromotable(incomingConn.conn, stream, flowID, incomingConn.remoteAddr)
+					s.dispatchPromotable(s.gen, incomingConn.conn, stream, flowID, incomingConn.remoteAddr)
 				} else {
 					handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 				}
@@ -147,7 +150,7 @@ func (s *WsMuxTransport) requestReplacement() {
 // retireSession takes a pool session out of service before it is old enough
 // for a CDN/LB max-age reset to kill it mid-flow, waiting for the streams
 // already running on it to finish. Callers only get here once a replacement
-// connection has actually joined the pool (see requestReplacement), so this
+// connection has actually joined the pool (see awaitReplacement), so this
 // never shrinks the pool. The caller closes the session once this returns.
 //
 // Draining is the point: a long-lived flow - an SSH session, a large download -
@@ -184,12 +187,16 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 // in handleSession: at max_conn_age the session is pulled out of the leg pool
 // so no new stripe legs land on it, then drained and closed. The sessionCounter
 // decrement is left to the CloseChan watcher registered in handleLoop.
-func (s *WsMuxTransport) rotateStripedSession(session *smux.Session) {
+//
+// The session stays owned by the generation (see wsGeneration) while it drains:
+// unregistering it only stops new legs landing on it, so a restart during the
+// drain still closes it.
+func (s *WsMuxTransport) rotateStripedSession(g *wsGeneration, session *smux.Session) {
 	rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
 	defer rotateTimer.Stop()
 
 	select {
-	case <-s.ctx.Done():
+	case <-g.ctx.Done():
 		return
 	case <-session.CloseChan():
 		return
@@ -197,51 +204,147 @@ func (s *WsMuxTransport) rotateStripedSession(session *smux.Session) {
 	}
 
 	// Make before break. Unlike the non-striped path this can block: the session
-	// keeps serving legs from the registry until unregisterSession below, so
-	// waiting here costs no capacity.
-	if !s.awaitReplacement(session) {
+	// keeps serving legs from the registry until awaitReplacement takes it out,
+	// so waiting here costs no capacity. On true the session is already
+	// unregistered and the decision gate already released: draining below must
+	// not hold up another rotation's decision.
+	if !s.awaitReplacement(g, session) {
 		return
 	}
 
-	s.unregisterSession(session)
 	s.retireSession(session)
 	session.Close()
 }
 
-// awaitReplacement asks for a replacement pool connection and waits until one
-// has actually been admitted, re-asking on every retry because the client's
-// tunnelDialer abandons a failed dial for good. Returns false if the context
-// ended or the session died while waiting - in both cases there is nothing left
-// to rotate. It never gives up otherwise: retiring a connection the pool has no
-// replacement for would leave less capacity than before rotation started.
-func (s *WsMuxTransport) awaitReplacement(session *smux.Session) bool {
-	// Mark first, ask second: a replacement admitted from here on counts.
-	mark := atomic.LoadInt32(&s.admittedSessions)
+// rotatePollEvery is how often a rotation re-checks the registry for its
+// replacement (WsMuxTransport.rotatePoll overrides it, tests shorten it).
+const rotatePollEvery = time.Second
+
+// awaitReplacement is one rotation's make-before-break decision. It takes the
+// generation's decision gate, snapshots which sessions the pool has right now,
+// asks for a replacement, and waits until a session outside that snapshot is
+// registered and live. Only then, in one step under the registry lock, it takes
+// the old session out of eligibility, and releases the gate (before the caller
+// drains it). Returns true if the caller now owns the draining of session, false
+// if the generation ended or the session died while waiting - in both cases there
+// is nothing left to rotate. It never gives up otherwise: retiring a connection
+// the pool has no replacement for would leave less capacity than before.
+//
+// Why the gate and a per-decision snapshot: a bare admission counter let two
+// rotations share one increment, or count a replacement that had already died,
+// so both retired against a single (or no) successor. Serial decisions, each
+// snapshotting only after it holds the gate, make a successor usable once: the
+// next rotation's snapshot already contains it. The old session stays eligible
+// (and serving) for the whole wait, re-asking on every retry because the client's
+// tunnelDialer abandons a failed dial for good.
+//
+// ponytail: decisions are serial - one rotation waits for its replacement while
+// the others queue behind it. Rotation is minutes apart, so per-request
+// replacement tickets are unnecessary until measured rotation throughput says so.
+func (s *WsMuxTransport) awaitReplacement(g *wsGeneration, session *smux.Session) bool {
+	ctx := s.ctx
+	if g != nil {
+		ctx = g.ctx
+	}
+	if !g.acquireRotate(ctx, session) {
+		return false
+	}
+	defer g.releaseRotate()
+
+	// Snapshot first, ask second: only a session admitted from here on counts.
+	seen := s.snapshotSessions()
 	s.requestReplacement()
 
-	// ponytail: poll the counter instead of signalling admissions to whoever is
+	// ponytail: poll the registry instead of signalling admissions to whoever is
 	// waiting. Rotation is not latency-sensitive - a second either way is noise
 	// against a max_conn_age measured in minutes.
-	poll := time.NewTicker(time.Second)
+	pollEvery := s.rotatePoll
+	if pollEvery <= 0 {
+		pollEvery = rotatePollEvery
+	}
+	poll := time.NewTicker(pollEvery)
 	defer poll.Stop()
 	reask := time.NewTicker(utils.JitterDuration(rotateRetryInterval))
 	defer reask.Stop()
 
+	// One event per decision for a replacement that is late (the anomaly worth
+	// seeing), one when the aging session is retired: two per rotation at most,
+	// so rotation cannot flush the ring of control-channel history.
+	deferred := false
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-ctx.Done():
 			return false
 		case <-session.CloseChan():
 			return false
 		case <-reask.C:
 			s.logger.Debugf("rotation deferred: replacement pool connection is not up, keeping the aging one in service (re-asking every ~%s)", rotateRetryInterval)
+			if !deferred {
+				deferred = true
+				s.recordEvent("rotation_deferred", "replacement pool connection not up; aging session kept in service, re-asking")
+			}
 			s.requestReplacement()
 		case <-poll.C:
 		}
-		if atomic.LoadInt32(&s.admittedSessions) > mark {
+		if s.retireIfReplaced(session, seen) {
+			s.recordEvent("rotation_retired", "replacement admitted; aging session out of eligibility, draining")
 			return true
 		}
 	}
+}
+
+// acquireRotate takes the generation's rotation decision gate, giving up when
+// ctx ends or session dies first (a nil generation has no gate to take).
+func (g *wsGeneration) acquireRotate(ctx context.Context, session *smux.Session) bool {
+	if g == nil {
+		return true
+	}
+	select {
+	case g.rotate <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-session.CloseChan():
+		return false
+	}
+}
+
+func (g *wsGeneration) releaseRotate() {
+	if g != nil {
+		<-g.rotate
+	}
+}
+
+// snapshotSessions is the set of pool sessions registered right now.
+func (s *WsMuxTransport) snapshotSessions() map[*smux.Session]struct{} {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	seen := make(map[*smux.Session]struct{}, len(s.sessions))
+	for _, ps := range s.sessions {
+		seen[ps.session] = struct{}{}
+	}
+	return seen
+}
+
+// retireIfReplaced authorizes retiring old if the registry holds a live session
+// that was not in seen, and in that same critical section takes old out of
+// eligibility, so no other rotation can observe old as still eligible after it
+// has been paid for. A successor that has died since it was admitted does not
+// count.
+func (s *WsMuxTransport) retireIfReplaced(old *smux.Session, seen map[*smux.Session]struct{}) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	for _, ps := range s.sessions {
+		if ps.session == old || ps.session == nil || ps.session.IsClosed() {
+			continue
+		}
+		if _, known := seen[ps.session]; known {
+			continue
+		}
+		s.unregisterLocked(old)
+		return true
+	}
+	return false
 }
 
 func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err error) {

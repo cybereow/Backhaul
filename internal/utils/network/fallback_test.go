@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -55,6 +56,55 @@ func TestNewFallbackProxyForwards(t *testing.T) {
 	}
 	if gotHost != "n1.example.sbs" {
 		t.Fatalf("expected decoy to see original host n1.example.sbs, got %q", gotHost)
+	}
+}
+
+// TestNewFallbackProxyFixedTarget: the upstream is fixed at construction time
+// by the operator-supplied address. Requests carrying different Host headers,
+// paths, and query strings all reach the same configured backend; a second
+// loopback fixture must receive no traffic, proving no request field can
+// redirect the proxy to another upstream.
+func TestNewFallbackProxyFixedTarget(t *testing.T) {
+	var hits atomic.Int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	var otherHits atomic.Int32
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		otherHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer other.Close()
+
+	h, err := NewFallbackProxy(strings.TrimPrefix(backend.URL, "http://"))
+	if err != nil {
+		t.Fatalf("NewFallbackProxy: %v", err)
+	}
+
+	cases := []struct{ url, host string }{
+		// Request URL and Host both name the other fixture; neither may steer the proxy.
+		{other.URL + "/a?x=1", strings.TrimPrefix(other.URL, "http://")},
+		{"http://n1.example.sbs/", "n1.example.sbs"},
+		{"http://n1.example.sbs/some/path?q=1", "n1.example.sbs"},
+		{"http://n2.example.sbs/other", "n2.example.sbs"},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodGet, c.url, nil)
+		req.Host = c.host
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("url=%s host=%s: want 200, got %d", c.url, c.host, rec.Code)
+		}
+	}
+	if got := hits.Load(); got != int32(len(cases)) {
+		t.Errorf("configured backend received %d requests, want %d", got, len(cases))
+	}
+	if got := otherHits.Load(); got != 0 {
+		t.Errorf("other server received %d requests, want 0", got)
 	}
 }
 

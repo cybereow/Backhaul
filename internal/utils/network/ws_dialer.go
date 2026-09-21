@@ -172,10 +172,12 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 			Header:  ws.HandshakeHeaderHTTP(headers),
 			Timeout: 45 * time.Second,
 			NetDial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				// insecureSkipVerify is the inverse of the operator's tls_verify:
-				// off by default (self-signed friendly), but an on-path party can
-				// then MITM the token-bearing handshake, so tls_verify=true is
-				// available to pin the certificate.
+				// insecureSkipVerify is the inverse of tls_verify. Verification
+				// is ON by default: the server must present a valid certificate
+				// and matching hostname. tls_verify=false disables this, allowing
+				// self-signed certs at the cost of exposing the token to an
+				// on-path MITM. This is standard certificate-chain/hostname
+				// verification, not certificate pinning.
 				return UtlsDialTLS(ctx, edgeIP, sniHost, !tlsVerify, []string{"http/1.1"}, timeout, keepalive, nodelay, SO_RCVBUF, SO_SNDBUF, mss)
 			},
 		}

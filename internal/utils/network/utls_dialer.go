@@ -45,8 +45,8 @@ func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecu
 	// The Chrome preset's canned spec carries its own hardcoded ALPN
 	// extension (real Chrome always offers ["h2", "http/1.1"]), which
 	// overrides Config.NextProtos when the preset is applied as-is. wss/
-	// wssmux ride gorilla/websocket, which only understands HTTP/1.1 - if
-	// the server picks "h2" off that hardcoded list, gorilla's plain
+	// wssmux ride gobwas/ws, which only understands HTTP/1.1 - if
+	// the server picks "h2" off that hardcoded list, gobwas's plain
 	// HTTP/1.1 Upgrade request lands on an HTTP/2 connection and fails.
 	// Building the spec explicitly and overwriting its ALPN extension
 	// keeps every other part of the Chrome fingerprint intact while

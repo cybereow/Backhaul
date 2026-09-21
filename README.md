@@ -148,7 +148,7 @@ To start using the solution, you'll need to configure both server and client com
    edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket-based transports.(Optional, default none)
    edge_ips = []                 # ws/wss/wsmux/wssmux: optional edge IP to dial per remote_addrs entry (aligned by index); empty entries resolve/dial the domain directly. (optional, default: none)
    path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. Must match the server. (optional, default: none)
-   tls_verify = false            # wss/wssmux: verify the server's TLS certificate. Enabled by default, set to false for self-signed setups (but while off an on-path party can MITM the token-bearing handshake). (optional, default: true)
+   tls_verify = true             # wss/wssmux: verify the server's TLS certificate chain and hostname (normal PKI validation, not pinning). Enabled by default; omit it to keep verification on. Set to false ONLY for self-signed setups: while off, an on-path party can impersonate the server and read the auth token. Plain ws/wsmux has no TLS at all (no confidentiality); use verified wss/wssmux when that protection is needed. (optional, default: true)
    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
    token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
    connection_pool = 8           # Number of pre-established connections.(optional, default: 8).

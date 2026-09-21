@@ -545,24 +545,70 @@ func (s *WsTransport) acceptLocalConn(listener net.Listener, remoteAddr string) 
 }
 
 func (s *WsTransport) handleLoop() {
+	const setupBudget = 3000 * time.Millisecond
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case localConn := <-s.localChannel:
+			// Compute remaining budget from the original creation timestamp so
+			// retries after a failed tunnel write never get a fresh 3 seconds.
+			age := time.Duration(time.Now().UnixMilli()-localConn.timeCreated) * time.Millisecond
+			remaining := setupBudget - age
+			if remaining <= 0 {
+				s.logger.Debugf("timeouted local connection: %d ms", age.Milliseconds())
+				localConn.conn.Close()
+				continue
+			}
+			// Absolute deadline for this local socket's entire setup phase.
+			setupDeadline := time.Unix(0, localConn.timeCreated*int64(time.Millisecond)).Add(setupBudget)
+			setupTimer := time.NewTimer(remaining)
+
 		loop:
 			for {
-				if time.Now().UnixMilli()-localConn.timeCreated > 3000 { // 3000ms
-					s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-localConn.timeCreated)
-					localConn.conn.Close()
-					break loop
-				}
-
 				select {
 				case <-s.ctx.Done():
+					setupTimer.Stop()
+					localConn.conn.Close()
 					return
+
+				case <-setupTimer.C:
+					age := time.Duration(time.Now().UnixMilli()-localConn.timeCreated) * time.Millisecond
+					s.logger.Debugf("timeouted local connection: %d ms", age.Milliseconds())
+					localConn.conn.Close()
+					break loop
+
 				case tunnelConnection := <-s.tunnelChannel:
+					// Recheck expiry and cancellation before committing to this
+					// tunnel; another attempt can only draw from the same budget.
+					if s.ctx.Err() != nil {
+						// drain timer so it can be GC'd
+						if !setupTimer.Stop() {
+							select {
+							case <-setupTimer.C:
+							default:
+							}
+						}
+						localConn.conn.Close()
+						tunnelConnection.conn.Close()
+						return
+					}
+					select {
+					case <-setupTimer.C:
+						age := time.Duration(time.Now().UnixMilli()-localConn.timeCreated) * time.Millisecond
+						s.logger.Debugf("timeouted local connection: %d ms", age.Milliseconds())
+						localConn.conn.Close()
+						tunnelConnection.conn.Close()
+						break loop
+					default:
+					}
+
 					close(tunnelConnection.ping)
+					// Apply the remaining setup deadline to the underlying net.Conn
+					// now, before acquiring the handover lock, so that any
+					// in-progress keepAlive write is unblocked by the deadline
+					// rather than leaving Lock() stuck indefinitely.
+					tunnelConnection.conn.NetConn().SetDeadline(setupDeadline) //nolint:errcheck
 					// Taken and deliberately never released: from here the
 					// connection belongs to WSConnectionHandler, and the
 					// keepAlive goroutine must never write another ping into the
@@ -571,11 +617,65 @@ func (s *WsTransport) handleLoop() {
 					// the per-connection struct, so nothing leaks - do not
 					// "balance" it with an Unlock.
 					tunnelConnection.mu.Lock()
-					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(localConn.remoteAddr)); err != nil {
-						s.logger.Debugf("%v", err) // failed to send port number
+
+					// Recheck after acquiring the lock: cancel or timer may have
+					// fired while we were waiting.
+					if s.ctx.Err() != nil {
+						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
 						tunnelConnection.conn.Close()
+						if !setupTimer.Stop() {
+							select {
+							case <-setupTimer.C:
+							default:
+							}
+						}
+						localConn.conn.Close()
+						return
+					}
+					select {
+					case <-setupTimer.C:
+						age := time.Duration(time.Now().UnixMilli()-localConn.timeCreated) * time.Millisecond
+						s.logger.Debugf("timeouted local connection: %d ms", age.Milliseconds())
+						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
+						tunnelConnection.conn.Close()
+						localConn.conn.Close()
+						break loop
+					default:
+					}
+
+					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(localConn.remoteAddr)); err != nil {
+						s.logger.Debugf("%v", err)                               // failed to send port number
+						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
+						tunnelConnection.conn.Close()
+						// If the write failed due to a deadline (budget exhausted)
+						// or cancellation, treat it as terminal for this socket.
+						if s.ctx.Err() != nil {
+							if !setupTimer.Stop() {
+								select {
+								case <-setupTimer.C:
+								default:
+								}
+							}
+							localConn.conn.Close()
+							return
+						}
+						// Timer may have just fired; check before retrying.
+						select {
+						case <-setupTimer.C:
+							age := time.Duration(time.Now().UnixMilli()-localConn.timeCreated) * time.Millisecond
+							s.logger.Debugf("timeouted local connection: %d ms", age.Milliseconds())
+							localConn.conn.Close()
+							break loop
+						default:
+						}
 						continue loop
 					}
+
+					// SUCCESS: clear the setup deadline before handing the
+					// tunnel connection to WSConnectionHandler so data-path
+					// I/O is not subject to the setup timeout.
+					tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
+					setupTimer.Stop()
 					// Handle data exchange between connections
 					go handlers.WSConnectionHandler(s.ctx, s.config.ProxyProtocol, tunnelConnection.conn, localConn.conn, s.logger, s.usageMonitor, localConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 					break loop

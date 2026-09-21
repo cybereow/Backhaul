@@ -1,11 +1,17 @@
 package transport
 
 import (
+	"context"
 	"io"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/gobwas/ws"
+	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/sirupsen/logrus"
 	"github.com/xtaci/smux"
 )
@@ -114,7 +120,7 @@ func TestControlGraceHoldsWhilePoolAlive(t *testing.T) {
 	s.graceStart = time.Now() // just lost the control channel; well within the cap
 	// controlChannel is nil (lost) and not reattached.
 
-	s.onControlGraceExpired()
+	s.onControlGraceExpired(nil, 0) // the initial epoch of an untracked transport
 
 	// It must have recorded a hold (not a restart) and re-armed the timer.
 	ev := s.snapshotEvents()
@@ -174,5 +180,376 @@ func TestLiveSessionCount(t *testing.T) {
 	s.sessions[0].session.Close()
 	if got := s.liveSessionCount(); got != 0 {
 		t.Fatalf("a closed session must not count as live, got %d", got)
+	}
+}
+
+// --- grace expiry versus control reattachment (plan 012) -------------------
+//
+// The tests below drive onControlGraceExpired directly with the (generation,
+// epoch) its timer would have captured, and pause it between "decided to
+// restart" and "revalidate" with graceRevalidateHook. Every ordering is forced
+// with channels; nothing waits on the real 30 second window.
+
+// newGraceRace returns a transport with a tracked generation and a control
+// channel already adopted. Its parent context is cancelled, so a Restart that
+// does run tears the generation down and then abandons instead of starting a new
+// one (which needs a full transport): "g is stopped" then means "Restart ran".
+func newGraceRace(t *testing.T) (*WsMuxTransport, *wsGeneration, *network.WebSocketConn) {
+	t.Helper()
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	g := newWsGeneration(context.Background())
+	t.Cleanup(g.stop)
+	s := &WsMuxTransport{
+		logger:    logger,
+		config:    &WsMuxConfig{Mode: config.WSMUX},
+		parentctx: parent,
+		gen:       g,
+		ctx:       g.ctx,
+	}
+	t.Cleanup(func() {
+		s.controlMu.Lock()
+		s.invalidateGraceLocked() // don't leave a 30s timer running in the test process
+		s.controlMu.Unlock()
+	})
+	c1 := graceConn(t)
+	if _, first, ok := s.adoptControl(g, c1); !ok || !first {
+		t.Fatalf("initial adoption: first=%v ok=%v", first, ok)
+	}
+	return s, g, c1
+}
+
+// graceConn is a control connection nothing reads or writes; only its identity
+// and Close matter to the grace logic.
+func graceConn(t *testing.T) *network.WebSocketConn {
+	t.Helper()
+	a, b := net.Pipe()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	return network.NewWebSocketConn(a, ws.StateServerSide, nil)
+}
+
+func graceEpoch(s *WsMuxTransport) uint64 {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	return s.graceEpoch
+}
+
+func graceEvents(s *WsMuxTransport, kind string) int {
+	n := 0
+	for _, e := range s.snapshotEvents() {
+		if e.Kind == kind {
+			n++
+		}
+	}
+	return n
+}
+
+// pauseGrace makes the next expiry callback stop after it has gathered the live
+// count, and reports when it has (gathered) and lets it go (resume).
+func pauseGrace(s *WsMuxTransport) (gathered <-chan struct{}, resume func()) {
+	in, out := make(chan struct{}), make(chan struct{})
+	s.graceRevalidateHook = func() { close(in); <-out }
+	return in, func() { close(out) }
+}
+
+// runGrace runs one expiry callback and reports when it has returned.
+func runGrace(s *WsMuxTransport, g *wsGeneration, epoch uint64) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.onControlGraceExpired(g, epoch)
+	}()
+	return done
+}
+
+// TestControlGraceReattachWins: the callback has decided to restart (empty pool)
+// and paused; the client reattaches; the callback resumes. The adoption won, so
+// the callback must not claim a restart and the recovered channel stays current.
+func TestControlGraceReattachWins(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	s.onControlLost(g, c1)
+	epoch := graceEpoch(s)
+	gathered, resume := pauseGrace(s)
+
+	done := runGrace(s, g, epoch)
+	lcWaitClosed(t, "the callback to reach its revalidation point", gathered)
+
+	c2 := graceConn(t)
+	if _, first, ok := s.adoptControl(g, c2); !ok || first {
+		t.Fatalf("reattach: first=%v ok=%v, want an adopted reattach", first, ok)
+	}
+	resume()
+	lcWaitClosed(t, "the callback to return", done)
+
+	if g.isStopped() || graceEvents(s, "restart") != 0 {
+		t.Fatal("the callback restarted a transport whose control channel had just reattached")
+	}
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if s.controlChannel != c2 {
+		t.Fatal("the reattached control channel is no longer current")
+	}
+	if s.restartClaim != nil || s.graceTimer != nil {
+		t.Fatalf("stale claim/timer left behind: claim=%v timer=%v", s.restartClaim != nil, s.graceTimer != nil)
+	}
+	if want := "Connected (" + string(config.WSMUX) + ")"; s.config.TunnelStatus != want {
+		t.Fatalf("status = %q, want %q", s.config.TunnelStatus, want)
+	}
+}
+
+// TestControlGraceRestartClaimWins: the callback claims the restart first. That
+// happens exactly once for the epoch, and a control channel arriving afterwards is
+// refused rather than adopted into the generation that is being torn down.
+func TestControlGraceRestartClaimWins(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	s.onControlLost(g, c1)
+	epoch := graceEpoch(s)
+
+	lcWaitClosed(t, "the callback to return", runGrace(s, g, epoch))
+	if !g.isStopped() || graceEvents(s, "restart") != 1 {
+		t.Fatalf("expected exactly one restart of the generation: stopped=%v restarts=%d", g.isStopped(), graceEvents(s, "restart"))
+	}
+
+	// A repeated callback for the same epoch is inert: no second claim.
+	lcWaitClosed(t, "the repeated callback to return", runGrace(s, g, epoch))
+	if n := graceEvents(s, "restart"); n != 1 {
+		t.Fatalf("a repeated callback for the same epoch claimed again: %d restarts", n)
+	}
+
+	if _, _, ok := s.adoptControl(g, graceConn(t)); ok {
+		t.Fatal("a control channel was adopted into a generation whose restart was claimed")
+	}
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if s.controlChannel != nil {
+		t.Fatal("the refused control channel became current")
+	}
+}
+
+// TestControlGraceClaimRefusesAdoptionBeforeStop: the claim alone, before Restart
+// has stopped the generation, already closes the generation to adoption.
+func TestControlGraceClaimRefusesAdoptionBeforeStop(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	s.onControlLost(g, c1)
+	s.controlMu.Lock()
+	s.restartClaim = g
+	s.controlMu.Unlock()
+	if g.isStopped() {
+		t.Fatal("test setup: generation must not be stopped yet")
+	}
+	if _, _, ok := s.adoptControl(g, graceConn(t)); ok {
+		t.Fatal("adopted into a generation with a restart claim")
+	}
+	// A different generation is not affected by the claim.
+	if _, _, ok := s.adoptControl(newWsGeneration(context.Background()), graceConn(t)); !ok {
+		t.Fatal("a claim on one generation refused adoption into another")
+	}
+}
+
+// TestControlGraceOldEpoch: a callback from loss 1 that runs late, after the
+// channel reattached and was lost again (loss 2), must neither restart nor extend
+// loss 1's grace into loss 2: the pending timer and the epoch stay loss 2's.
+func TestControlGraceOldEpoch(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	s.onControlLost(g, c1)
+	oldEpoch := graceEpoch(s)
+	gathered, resume := pauseGrace(s)
+
+	done := runGrace(s, g, oldEpoch)
+	lcWaitClosed(t, "the callback to reach its revalidation point", gathered)
+
+	c2 := graceConn(t)
+	if _, _, ok := s.adoptControl(g, c2); !ok {
+		t.Fatal("reattach refused")
+	}
+	s.onControlLost(g, c2) // loss 2
+	s.controlMu.Lock()
+	timer2, epoch2 := s.graceTimer, s.graceEpoch
+	s.controlMu.Unlock()
+	if timer2 == nil || epoch2 == oldEpoch {
+		t.Fatal("loss 2 did not start its own epoch and timer")
+	}
+
+	resume()
+	lcWaitClosed(t, "the callback to return", done)
+
+	if g.isStopped() || graceEvents(s, "restart") != 0 || graceEvents(s, "control_hold") != 0 {
+		t.Fatalf("the old-epoch callback acted: stopped=%v events=%+v", g.isStopped(), s.snapshotEvents())
+	}
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if s.graceTimer != timer2 || s.graceEpoch != epoch2 {
+		t.Fatal("the old-epoch callback replaced loss 2's timer or epoch")
+	}
+}
+
+// TestControlGraceHoldRearmsSameEpoch: holding re-arms the timer for the same
+// epoch and does not restart the loss clock, so the 90s cap counts from the
+// original loss however many times the window is re-armed.
+func TestControlGraceHoldRearmsSameEpoch(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	defer livePoolSession(t, s)()
+	s.onControlLost(g, c1)
+	s.controlMu.Lock()
+	epoch, start := s.graceEpoch, s.graceStart
+	first := s.graceTimer
+	s.controlMu.Unlock()
+
+	lcWaitClosed(t, "the callback to return", runGrace(s, g, epoch))
+
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if graceEvents(s, "control_hold") != 1 || graceEvents(s, "restart") != 0 {
+		t.Fatalf("expected a hold: %+v", s.snapshotEvents())
+	}
+	if s.graceEpoch != epoch || !s.graceStart.Equal(start) {
+		t.Fatal("re-arming changed the loss epoch or restarted the loss clock")
+	}
+	if s.graceTimer == nil || s.graceTimer == first {
+		t.Fatal("the hold did not re-arm a fresh timer")
+	}
+}
+
+// TestControlGraceHoldCapStillRestarts: the 90s cap is unchanged - a loss held
+// past it restarts even with a live session.
+func TestControlGraceHoldCapStillRestarts(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	defer livePoolSession(t, s)()
+	s.onControlLost(g, c1)
+	s.controlMu.Lock()
+	epoch := s.graceEpoch
+	s.graceStart = time.Now().Add(-maxControlGraceHold - time.Second)
+	s.controlMu.Unlock()
+
+	lcWaitClosed(t, "the callback to return", runGrace(s, g, epoch))
+	if !g.isStopped() || graceEvents(s, "restart") != 1 {
+		t.Fatalf("a hold past the cap must restart: stopped=%v events=%+v", g.isStopped(), s.snapshotEvents())
+	}
+}
+
+// gateCloseConn blocks Close until released, so a test can hold onControlLost at
+// the point after it has dropped controlMu.
+type gateCloseConn struct {
+	net.Conn
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *gateCloseConn) Close() error {
+	c.once.Do(func() { close(c.entered) })
+	<-c.release
+	return c.Conn.Close()
+}
+
+// TestControlGraceLateReconnectingStatus: onControlLost is still closing the
+// dead socket when the client reattaches. Its Reconnecting status must not land
+// after (and overwrite) the Connected one the reattach published.
+func TestControlGraceLateReconnectingStatus(t *testing.T) {
+	s, g, _ := newGraceRace(t)
+	a, b := net.Pipe()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	gate := &gateCloseConn{Conn: a, entered: make(chan struct{}), release: make(chan struct{})}
+	dying := network.NewWebSocketConn(gate, ws.StateServerSide, nil)
+	if _, _, ok := s.adoptControl(g, dying); !ok { // replaces c1 with the connection about to die
+		t.Fatal("adoption refused")
+	}
+
+	lost := make(chan struct{})
+	go func() {
+		defer close(lost)
+		s.onControlLost(g, dying)
+	}()
+	lcWaitClosed(t, "onControlLost to reach the socket close", gate.entered)
+
+	if _, _, ok := s.adoptControl(g, graceConn(t)); !ok {
+		t.Fatal("reattach refused")
+	}
+	close(gate.release)
+	lcWaitClosed(t, "onControlLost to return", lost)
+
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if want := "Connected (" + string(config.WSMUX) + ")"; s.config.TunnelStatus != want {
+		t.Fatalf("status = %q after a late loss report, want %q", s.config.TunnelStatus, want)
+	}
+	if s.controlChannel == nil || s.controlChannel == dying {
+		t.Fatal("the reattached control channel is not current")
+	}
+}
+
+// TestControlGraceStaleLossIsInert: a loss report for a connection that is no
+// longer registered changes nothing (no epoch, no timer, no status).
+func TestControlGraceStaleLossIsInert(t *testing.T) {
+	s, g, c1 := newGraceRace(t)
+	c2 := graceConn(t)
+	if _, _, ok := s.adoptControl(g, c2); !ok {
+		t.Fatal("reattach refused")
+	}
+	epoch := graceEpoch(s)
+	s.onControlLost(g, c1) // c1 was replaced
+	if graceEpoch(s) != epoch {
+		t.Fatal("a stale loss advanced the epoch")
+	}
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if s.controlChannel != c2 || s.graceTimer != nil || !strings.HasPrefix(s.config.TunnelStatus, "Connected") {
+		t.Fatalf("a stale loss disturbed the current channel: current=%v timer=%v status=%q", s.controlChannel == c2, s.graceTimer != nil, s.config.TunnelStatus)
+	}
+}
+
+// TestControlGraceReattachKeepsFlow is the end-to-end form of the race: a real
+// transport with a pool session and a running flow. The control channel drops,
+// the grace callback decides to restart (the hold is past the cap) and pauses,
+// the client reattaches, and the callback resumes. The flow must carry exactly
+// the bytes it is sent afterwards, on the same pool session, in the same
+// generation.
+func TestControlGraceReattachKeepsFlow(t *testing.T) {
+	h := newLCHarness(t)
+	ctl := h.control()
+	peer := h.pool()
+	lcWaitFor(t, "an admitted session", func() bool { return h.sessions() == 1 })
+	user := h.user()
+	lcEcho(t, user, "before")
+	gen := h.s.gen
+
+	ctl.Close()
+	lcWaitFor(t, "the server to notice the lost control channel", func() bool {
+		h.s.controlMu.Lock()
+		defer h.s.controlMu.Unlock()
+		return h.s.controlChannel == nil && h.s.graceTimer != nil
+	})
+	h.s.controlMu.Lock()
+	epoch := h.s.graceEpoch
+	h.s.graceStart = time.Now().Add(-maxControlGraceHold - time.Second) // past the cap: restart is the decision
+	h.s.controlMu.Unlock()
+
+	gathered, resume := pauseGrace(h.s)
+	done := runGrace(h.s, gen, epoch)
+	lcWaitClosed(t, "the callback to reach its revalidation point", gathered)
+
+	h.control() // the client reattaches while the callback is paused
+	lcWaitFor(t, "the control channel to be reattached", func() bool {
+		h.s.controlMu.Lock()
+		defer h.s.controlMu.Unlock()
+		return h.s.controlChannel != nil
+	})
+	resume()
+	lcWaitClosed(t, "the callback to return", done)
+
+	payload := strings.Repeat("0123456789abcdef", 64)
+	lcEcho(t, user, payload)
+	select {
+	case <-peer.readClosed:
+		t.Fatal("the pool session was closed although the control channel had reattached")
+	default:
+	}
+	if h.s.gen != gen || gen.isStopped() || graceEvents(h.s, "restart") != 0 {
+		t.Fatal("the grace callback restarted the transport after the reattach")
+	}
+	if n := h.sessions(); n != 1 {
+		t.Fatalf("session counter is %d, want 1", n)
 	}
 }

@@ -101,6 +101,8 @@ func (c *Client) Start() {
 	case config.WS, config.WSS:
 		WsConfig := &transport.WsConfig{
 			RemoteAddr:     c.config.RemoteAddr,
+			RemoteAddrs:    c.config.RemoteAddrs,
+			EdgeIPs:        c.config.EdgeIPs,
 			Nodelay:        c.config.Nodelay,
 			KeepAlive:      time.Duration(c.config.Keepalive) * time.Second,
 			RetryInterval:  time.Duration(c.config.RetryInterval) * time.Second,
@@ -154,6 +156,7 @@ func (c *Client) Start() {
 			EdgeIP:               c.config.EdgeIP,
 			Path:                 c.config.Path,
 			TLSVerify:            c.config.TLSVerify,
+			WSFraming:            c.config.MuxWSFraming,
 		}
 		if c.config.Transport == config.WSSMUX && !c.config.TLSVerify {
 			c.logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")

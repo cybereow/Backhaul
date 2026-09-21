@@ -51,6 +51,16 @@ func TCPConnectionHandler(ctx context.Context, proxyProtocol bool, from net.Conn
 	go func() {
 		select {
 		case <-ctx.Done():
+			// A half-close envelope conn must abort BEFORE its peer conn is
+			// closed: closing the plain side first makes transferData see
+			// net.ErrClosed, treat it as a clean end and send END, so the remote
+			// end would read a clean EOF for a cancelled flow. Deliberately only
+			// this type (plan 024): other conns keep today's cancel behavior.
+			for _, c := range [2]net.Conn{from, to} {
+				if hc, ok := c.(*halfCloseConn); ok {
+					hc.AbortWrite()
+				}
+			}
 			from.Close()
 			to.Close()
 		case <-done:

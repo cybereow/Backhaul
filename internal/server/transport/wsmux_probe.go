@@ -13,12 +13,12 @@ import (
 // the probe to its echoer) and only while striping is on, so a non-striped
 // deployment pays nothing. It exits when the session closes or the transport
 // shuts down.
-func (s *WsMuxTransport) probeSessionRTT(ps *pooledSession) {
+func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 	ticker := time.NewTicker(rttProbeEvery)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-g.ctx.Done():
 			return
 		case <-ps.session.CloseChan():
 			return

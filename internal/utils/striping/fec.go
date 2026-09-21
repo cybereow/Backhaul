@@ -54,6 +54,7 @@ const fecEndMarkerSeq = 0xFFFFFFFF
 
 type fecRow struct {
 	seq  uint32
+	at   time.Time // when Read filed it in pending (out-of-order arrival)
 	data []byte
 }
 
@@ -64,15 +65,13 @@ type fecShardJob struct {
 }
 
 // pendingRow accumulates the shards seen so far for one row until enough
-// have arrived to reconstruct it. firstSeen lets a stale entry - e.g. one
-// recreated by a shard that straggled in after its row was already decoded
-// and removed - be swept instead of sitting in the map forever.
+// have arrived to reconstruct it. Its shards and metadata are charged to the
+// reassembly budget until the row is decoded (or the connection ends).
 type pendingRow struct {
-	shards    [][]byte // len == dataShards+parityShards; nil until received
-	got       int
-	rowLen    uint32
-	rowSeen   bool // rowLen has been set by at least one shard
-	firstSeen time.Time
+	shards  [][]byte // len == dataShards+parityShards; nil until received
+	got     int
+	rowLen  uint32
+	rowSeen bool // rowLen has been set by at least one shard
 }
 
 // FECConn is a net.Conn that stripes one logical flow across
@@ -104,11 +103,26 @@ type FECConn struct {
 
 	rowsMu sync.Mutex
 	rows   map[uint32]*pendingRow
+	// doneBase/done record which rows have already been decoded (every seq below
+	// doneBase, plus the out-of-order ones in done), so a late or duplicate shard
+	// cannot recreate an entry and decode the row a second time. Guarded by
+	// rowsMu - not rmu, which Read holds while waiting on producers. done only
+	// ever holds rows still retained (charged) above the first undecoded row.
+	doneBase uint32
+	done     map[uint32]struct{}
 
-	rmu     sync.Mutex
-	nextSeq uint32
-	pending map[uint32]fecRow
-	readBuf []byte
+	// budget bounds everything retained for reassembly: incomplete shards and
+	// their row metadata, decoded rows in rowCh and pending, and readBuf.
+	budget  reassemblyBudget
+	rowMeta int64 // charge per incomplete row: entry + shard slice headers
+
+	rmu       sync.Mutex
+	nextSeq   uint32
+	pending   map[uint32]fecRow
+	readBuf   []byte
+	readCost  int64
+	gap       gapState
+	readTimer *time.Timer
 
 	errMu   sync.Mutex
 	permErr error
@@ -160,12 +174,15 @@ func NewFEC(legs []net.Conn, chunkSize int, dataShards, parityShards int) (*FECC
 		aliveLegs:    int32(n),
 		flush:        make(chan struct{}),
 		rows:         make(map[uint32]*pendingRow),
+		done:         make(map[uint32]struct{}),
 		pending:      make(map[uint32]fecRow),
-		rowCh:        make(chan fecRow, fecRowChanDepth),
+		budget:       reassemblyBudget{limit: reassemblyBudgetBytes},
+		rowMeta:      int64(2*retainedEntryOverhead + 24*n),
 		errCh:        make(chan error, n),
 		totalKnown:   make(chan struct{}),
 		closed:       make(chan struct{}),
 	}
+	c.rowCh = make(chan fecRow, c.budget.depth(fecRowChanDepth, c.decodedCost(c.rowFullSize)))
 	for i := range legs {
 		c.legAlive[i] = 1
 		c.legQueues[i] = make(chan fecShardJob, fecLegQueueDepth)
@@ -206,8 +223,15 @@ func (c *FECConn) readLeg(leg net.Conn, idx int) {
 			continue
 		}
 
+		// Reserve before retaining; receiveShard/decode own the charge from here.
+		shardCost := int64(c.chunkSize)
+		if !c.budget.reserve(shardCost) {
+			c.fail(c.budget.err(shardCost))
+			return
+		}
 		data := make([]byte, c.chunkSize)
 		if _, err := io.ReadFull(leg, data); err != nil {
+			c.budget.release(shardCost)
 			c.markLegDead(idx, err)
 			return
 		}
@@ -217,20 +241,32 @@ func (c *FECConn) readLeg(leg net.Conn, idx int) {
 }
 
 // receiveShard files one shard under its row and reconstructs/delivers the
-// row once dataShards of its dataShards+parityShards shards have arrived.
+// row once dataShards of its dataShards+parityShards shards have arrived. The
+// shard's chunkSize budget charge (reserved by readLeg) is owned here: kept
+// while the shard is retained, released when it is dropped or its row decoded.
 func (c *FECConn) receiveShard(rowSeq uint32, shardIndex int, rowLen uint32, data []byte) {
+	shardCost := int64(c.chunkSize)
 	c.rowsMu.Lock()
+	if shardIndex < 0 || shardIndex >= c.dataShards+c.parityShards || c.rowDoneLocked(rowSeq) {
+		// Corrupt/hostile shard index, or a straggler for a row already decoded.
+		c.rowsMu.Unlock()
+		c.budget.release(shardCost)
+		return
+	}
 	row, ok := c.rows[rowSeq]
 	if !ok {
-		row = &pendingRow{shards: make([][]byte, c.dataShards+c.parityShards), firstSeen: time.Now()}
+		if !c.budget.reserve(c.rowMeta) {
+			c.rowsMu.Unlock()
+			c.budget.release(shardCost)
+			c.fail(c.budget.err(c.rowMeta))
+			return
+		}
+		row = &pendingRow{shards: make([][]byte, c.dataShards+c.parityShards)}
 		c.rows[rowSeq] = row
-	}
-	if shardIndex < 0 || shardIndex >= len(row.shards) {
-		c.rowsMu.Unlock()
-		return // corrupt/hostile shard index; drop it
 	}
 	if row.shards[shardIndex] != nil {
 		c.rowsMu.Unlock()
+		c.budget.release(shardCost)
 		return // duplicate, ignore
 	}
 	row.shards[shardIndex] = data
@@ -241,40 +277,59 @@ func (c *FECConn) receiveShard(rowSeq uint32, shardIndex int, rowLen uint32, dat
 	}
 
 	if row.got < c.dataShards {
-		c.sweepStaleRows()
 		c.rowsMu.Unlock()
 		return
 	}
 	delete(c.rows, rowSeq)
+	c.markRowDoneLocked(rowSeq)
 	c.rowsMu.Unlock()
 
+	// Exactly dataShards shards are charged: the row completes on the dataShards-th.
+	held := int64(row.got)*shardCost + c.rowMeta
 	full, err := c.decodeRow(row)
 	if err != nil {
+		c.budget.release(held)
 		c.fail(fmt.Errorf("striping: failed to reconstruct row %d: %w", rowSeq, err))
 		return
 	}
+	// The decoded row is never larger than the shards it came from, so swap the
+	// charge in place instead of reserving again.
+	dec := c.decodedCost(len(full))
+	c.budget.release(held - dec)
 
 	select {
 	case c.rowCh <- fecRow{seq: rowSeq, data: full}:
 	case <-c.closed:
+		c.budget.release(dec)
 	}
 }
 
-// sweepStaleRows drops pendingRow entries that have sat incomplete for more
-// than 2*stallTimeout. The one case that matters in practice: a shard
-// straggling in after its row was already decoded and deleted recreates a
-// map entry that will never reach dataShards again (its siblings are gone),
-// so left alone it would sit in the map for the life of the Conn. Caller
-// holds rowsMu.
-func (c *FECConn) sweepStaleRows() {
-	if len(c.rows) == 0 {
+// decodedCost is the budget charge for a decoded row of n bytes.
+func (c *FECConn) decodedCost(n int) int64 { return int64(n) + retainedEntryOverhead }
+
+// rowDoneLocked reports whether the row was already decoded. Caller holds rowsMu.
+func (c *FECConn) rowDoneLocked(seq uint32) bool {
+	if seq < c.doneBase {
+		return true
+	}
+	_, ok := c.done[seq]
+	return ok
+}
+
+// markRowDoneLocked records a decoded row, advancing doneBase over the
+// contiguous decoded prefix. Caller holds rowsMu.
+func (c *FECConn) markRowDoneLocked(seq uint32) {
+	if seq != c.doneBase {
+		c.done[seq] = struct{}{}
 		return
 	}
-	cutoff := time.Now().Add(-2 * c.stallTimeout)
-	for seq, row := range c.rows {
-		if row.firstSeen.Before(cutoff) {
-			delete(c.rows, seq)
+	c.doneBase++
+	for {
+		if _, ok := c.done[c.doneBase]; !ok {
+			return
 		}
+		delete(c.done, c.doneBase)
+		c.doneBase++
 	}
 }
 
@@ -413,7 +468,16 @@ func (c *FECConn) getPermErr() error {
 
 // Write buffers p into the current row, flushing (encoding + dispatching to
 // legs) whenever a full row of dataShards*chunkSize bytes accumulates.
+// After all input bytes are consumed, any remaining partial row is also
+// flushed immediately so that short requests reach the peer without waiting
+// for EOF. This prioritises request-progress over padding efficiency; tiny
+// writes incur more padding overhead than full-row writes. A bounded-delay
+// batching design is a separately justified follow-on, not an unbounded buffer.
+// ponytail: per-Write flush; add batching only when padding overhead is measured.
 func (c *FECConn) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if err := c.getPermErr(); err != nil {
 		return 0, err
 	}
@@ -444,6 +508,16 @@ func (c *FECConn) Write(p []byte) (int, error) {
 			if err := c.flushRow(); err != nil {
 				return total, err
 			}
+		}
+	}
+	// Flush any remaining partial row immediately: a short request must reach
+	// the peer before the caller either waits for a response or writes more
+	// data. flushRow zero-pads the backing row (already zeroed at allocation
+	// via make) and records rowLen as the real byte count so the peer strips
+	// the padding on decode.
+	if c.curRowLen > 0 {
+		if err := c.flushRow(); err != nil {
+			return total, err
 		}
 	}
 	return total, nil
@@ -518,34 +592,98 @@ func (c *FECConn) flushRow() error {
 }
 
 func (c *FECConn) stash(row fecRow) {
-	if row.seq == c.nextSeq {
-		c.readBuf = row.data
+	if row.seq < c.nextSeq {
+		c.budget.release(c.decodedCost(len(row.data)))
+	} else if row.seq == c.nextSeq {
+		c.setReadBuf(row)
 		c.nextSeq++
+	} else if _, dup := c.pending[row.seq]; dup {
+		c.budget.release(c.decodedCost(len(row.data)))
 	} else {
+		row.at = time.Now()
 		c.pending[row.seq] = row
 	}
+}
+
+// setReadBuf installs a decoded row as the current read buffer. Caller holds rmu.
+func (c *FECConn) setReadBuf(row fecRow) {
+	c.readBuf = row.data
+	c.readCost = c.decodedCost(len(row.data))
+	if len(row.data) == 0 {
+		c.releaseReadBuf()
+	}
+}
+
+// releaseReadBuf gives back the drained read buffer's budget charge. Caller holds rmu.
+func (c *FECConn) releaseReadBuf() {
+	c.budget.release(c.readCost)
+	c.readCost = 0
 }
 
 func (c *FECConn) drainAvailable() {
 	for {
 		select {
 		case row := <-c.rowCh:
-			if row.seq >= c.nextSeq {
-				c.pending[row.seq] = row
+			if _, dup := c.pending[row.seq]; row.seq < c.nextSeq || dup {
+				c.budget.release(c.decodedCost(len(row.data)))
+				continue
 			}
+			row.at = time.Now()
+			c.pending[row.seq] = row
 		default:
 			return
 		}
 	}
 }
 
+// earliestPending is the first-evidence time for a new gap: the oldest
+// out-of-order row Read is holding, or now if the evidence is only an END
+// marker. Caller holds rmu.
+func (c *FECConn) earliestPending() time.Time {
+	t := time.Now()
+	for _, row := range c.pending {
+		if row.at.Before(t) {
+			t = row.at
+		}
+	}
+	return t
+}
+
+// dropReassembly gives back everything still retained once the stream has
+// ended for good (EOF or a terminal error). Caller holds rmu.
+func (c *FECConn) dropReassembly() {
+	c.drainAvailable()
+	for seq, row := range c.pending {
+		c.budget.release(c.decodedCost(len(row.data)))
+		delete(c.pending, seq)
+	}
+	c.readBuf = nil
+	c.releaseReadBuf()
+	c.rowsMu.Lock()
+	for seq, row := range c.rows {
+		c.budget.release(int64(row.got)*int64(c.chunkSize) + c.rowMeta)
+		delete(c.rows, seq)
+	}
+	c.rowsMu.Unlock()
+}
+
 // Read reassembles rows arriving out of order into the original in-order
 // byte stream, exactly like Conn.Read but at row granularity: each row is
 // only ever handed to Read once it has already been reconstructed (or
-// confirmed intact) from dataShards of its shards.
-func (c *FECConn) Read(p []byte) (int, error) {
+// confirmed intact) from dataShards of its shards. Like Conn.Read, an idle
+// connection is never timed out; only a proven gap (a later row arrived, or
+// END announced more than was delivered) has an absolute stallTimeout deadline.
+func (c *FECConn) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
+	defer func() {
+		if err != nil {
+			c.dropReassembly()
+		}
+	}()
 
 	if len(c.readBuf) == 0 {
 		if c.complete() {
@@ -554,7 +692,7 @@ func (c *FECConn) Read(p []byte) (int, error) {
 		if err := c.getPermErr(); err != nil {
 			if row, ok := c.pending[c.nextSeq]; ok {
 				delete(c.pending, c.nextSeq)
-				c.readBuf = row.data
+				c.setReadBuf(row)
 				c.nextSeq++
 			} else {
 				return 0, err
@@ -568,7 +706,7 @@ func (c *FECConn) Read(p []byte) (int, error) {
 		}
 		if row, ok := c.pending[c.nextSeq]; ok {
 			delete(c.pending, c.nextSeq)
-			c.readBuf = row.data
+			c.setReadBuf(row)
 			c.nextSeq++
 			continue
 		}
@@ -578,18 +716,28 @@ func (c *FECConn) Read(p []byte) (int, error) {
 			totalKnown = c.totalKnown
 		}
 
-		timer := time.NewTimer(c.stallTimeout)
+		// Time the wait only if a row is provably missing (see Conn.Read).
+		proven := len(c.pending) > 0 ||
+			(atomic.LoadInt32(&c.haveTotal) == 1 && c.nextSeq < atomic.LoadUint32(&c.total))
+		wait := time.Duration(-1)
+		if !proven {
+			c.gap.clear()
+		} else {
+			if c.gap.fresh(c.nextSeq) {
+				c.gap.begin(c.nextSeq, c.earliestPending())
+			}
+			wait = max(c.stallTimeout-time.Since(c.gap.start), 0)
+		}
+		timerC := armTimer(&c.readTimer, wait)
+
 		select {
 		case row := <-c.rowCh:
-			timer.Stop()
 			c.stash(row)
 
 		case <-totalKnown:
-			timer.Stop()
 			c.drainAvailable()
 
 		case err := <-c.errCh:
-			timer.Stop()
 			c.setPermErr(err)
 			c.drainAvailable()
 			if len(c.readBuf) == 0 && !c.complete() {
@@ -598,7 +746,24 @@ func (c *FECConn) Read(p []byte) (int, error) {
 				}
 			}
 
-		case <-timer.C:
+		case <-c.closed:
+			// Closed locally (or torn down by a failure whose error was already
+			// consumed): a Read blocked on an idle connection must not hang.
+			c.drainAvailable()
+			if len(c.readBuf) == 0 && !c.complete() {
+				if _, ok := c.pending[c.nextSeq]; !ok {
+					if err := c.getPermErr(); err != nil {
+						return 0, err
+					}
+					return 0, net.ErrClosed
+				}
+			}
+
+		case <-timerC:
+			c.drainAvailable()
+			if _, ok := c.pending[c.nextSeq]; ok {
+				continue
+			}
 			stallErr := fmt.Errorf("striping: FEC stalled waiting for row %d for %s", c.nextSeq, c.stallTimeout)
 			c.setPermErr(stallErr)
 			c.teardown()
@@ -606,8 +771,11 @@ func (c *FECConn) Read(p []byte) (int, error) {
 		}
 	}
 
-	n := copy(p, c.readBuf)
+	n = copy(p, c.readBuf)
 	c.readBuf = c.readBuf[n:]
+	if len(c.readBuf) == 0 {
+		c.releaseReadBuf()
+	}
 	return n, nil
 }
 

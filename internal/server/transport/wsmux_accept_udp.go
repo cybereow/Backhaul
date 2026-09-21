@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -47,7 +48,7 @@ func (f *udpFlow) touch() {
 // it as a UDP flow, and shuttles length-framed datagrams both ways. UDP over mux
 // relies on the flow-kind byte, which only exists on mux_version >= 2;
 // startPortListeners guards this, so udpListener is never started on a v1 tunnel.
-func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
+func (s *WsMuxTransport) udpListener(g *wsGeneration, localAddr, remoteAddr string) {
 	localUDPAddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
 		s.logger.Fatalf("failed to resolve local udp address: %v", err)
@@ -58,7 +59,15 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 		s.logger.Fatalf("failed to listen on local UDP port: %v", err)
 	}
 
-	defer listener.Close()
+	// Owned from the moment it exists, so the generation closes it (which wakes
+	// the reader below) even if this worker is slow to notice the stop.
+	if !g.own(listener) {
+		return
+	}
+	defer func() {
+		listener.Close()
+		g.release(listener)
+	}()
 
 	s.logger.Infof("UDP listener started successfully, listening on address: %s", listener.LocalAddr().String())
 
@@ -79,15 +88,17 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 
 	buf := make([]byte, 64*1024)
 
-	go func() {
+	// The reader is a worker of its own: this function only waits for the stop, so
+	// without registering it a restart could not tell when the read loop is gone.
+	g.start(func() {
 		for {
 			select {
-			case <-s.ctx.Done():
+			case <-g.ctx.Done():
 				return
 			default:
 				n, addr, err := listener.ReadFromUDP(buf)
 				if err != nil {
-					if s.ctx.Err() != nil {
+					if g.ctx.Err() != nil {
 						return
 					}
 					s.logger.Errorf("failed to read from UDP listener: %v", err)
@@ -118,19 +129,25 @@ func (s *WsMuxTransport) udpListener(localAddr, remoteAddr string) {
 				active[key] = f
 				mu.Unlock()
 
-				go s.serveUDPFlow(listener, remoteAddr, key, f, active, mu)
+				if !g.start(func() { s.serveUDPFlow(g, listener, remoteAddr, key, f, active, mu) }) {
+					mu.Lock()
+					if active[key] == f {
+						delete(active, key)
+					}
+					mu.Unlock()
+				}
 			}
 		}
-	}()
+	})
 
-	<-s.ctx.Done()
+	<-g.ctx.Done()
 }
 
 // serveUDPFlow opens the tunnel stream for one source and pumps datagrams in
 // both directions until the flow goes idle, the stream drops, or the transport
 // shuts down.
-func (s *WsMuxTransport) serveUDPFlow(listener *net.UDPConn, remoteAddr, key string, f *udpFlow, active map[string]*udpFlow, mu *sync.Mutex) {
-	stream, err := s.openUDPStream(remoteAddr)
+func (s *WsMuxTransport) serveUDPFlow(g *wsGeneration, listener *net.UDPConn, remoteAddr, key string, f *udpFlow, active map[string]*udpFlow, mu *sync.Mutex) {
+	stream, err := s.openUDPStream(g.ctx, remoteAddr)
 	if err != nil {
 		s.logger.Errorf("failed to open udp tunnel stream for %s: %v", key, err)
 		mu.Lock()
@@ -143,8 +160,12 @@ func (s *WsMuxTransport) serveUDPFlow(listener *net.UDPConn, remoteAddr, key str
 
 	s.logger.Debugf("initiated udp flow %s -> %s", key, remoteAddr)
 
+	readerDone := make(chan struct{})
 	defer func() {
 		stream.Close()
+		// The reply reader ends once the stream is closed; wait for it so no
+		// goroutine of this flow outlives the worker (a restart joins us).
+		<-readerDone
 		mu.Lock()
 		if active[key] == f {
 			delete(active, key)
@@ -156,7 +177,6 @@ func (s *WsMuxTransport) serveUDPFlow(listener *net.UDPConn, remoteAddr, key str
 	port := listener.LocalAddr().(*net.UDPAddr).Port
 
 	// Stream -> UDP client (replies coming back from the local service).
-	readerDone := make(chan struct{})
 	go func() {
 		defer close(readerDone)
 		rbuf := make([]byte, 64*1024)
@@ -184,7 +204,7 @@ func (s *WsMuxTransport) serveUDPFlow(listener *net.UDPConn, remoteAddr, key str
 
 	for {
 		select {
-		case <-s.ctx.Done():
+		case <-g.ctx.Done():
 			return
 		case <-readerDone:
 			return
@@ -209,7 +229,7 @@ func (s *WsMuxTransport) serveUDPFlow(listener *net.UDPConn, remoteAddr, key str
 // openUDPStream opens one smux stream on a live pool session and tags it as a
 // UDP flow carrying remoteAddr. If the pool has not warmed up yet it asks for a
 // session and retries briefly rather than dropping the flow outright.
-func (s *WsMuxTransport) openUDPStream(remoteAddr string) (net.Conn, error) {
+func (s *WsMuxTransport) openUDPStream(ctx context.Context, remoteAddr string) (net.Conn, error) {
 	const maxAttempts = 50 // ~5s total with the 100ms backoff below
 
 	var lastErr error
@@ -232,8 +252,8 @@ func (s *WsMuxTransport) openUDPStream(remoteAddr string) (net.Conn, error) {
 		}
 
 		select {
-		case <-s.ctx.Done():
-			return nil, s.ctx.Err()
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

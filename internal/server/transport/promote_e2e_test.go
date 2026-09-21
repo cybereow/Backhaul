@@ -17,7 +17,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestWSMuxPromotionE2E(t *testing.T) {
+// TestWSMuxStripedTransferE2E transfers 2MB each way over a flow that is striped
+// from its first byte: StripeFactor 2 with no StripePorts filter, so shouldStripe
+// is true and the promotion path is never taken. Promotion itself is covered by
+// TestWSMuxPromotionE2E in wsmux_promotion_test.go.
+func TestWSMuxStripedTransferE2E(t *testing.T) {
 	logger := logrus.New()
 	logger.SetLevel(logrus.DebugLevel)
 

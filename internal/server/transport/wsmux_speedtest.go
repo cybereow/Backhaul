@@ -2,7 +2,9 @@ package transport
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"sync"
@@ -40,6 +42,12 @@ type perCDNSpeed struct {
 	RTTms    float64 `json:"rtt_ms,omitempty"`
 	DownMbps float64 `json:"down_mbps,omitempty"`
 	UpMbps   float64 `json:"up_mbps,omitempty"`
+}
+
+// phaseReport is one path's measurement returned by runPhase.
+type phaseReport struct {
+	bytes   int64
+	elapsed time.Duration // receiver-measured data-window elapsed
 }
 
 // handleSpeedtestRequest runs a live throughput test over the pool and returns
@@ -170,12 +178,56 @@ func (s *WsMuxTransport) speedtestOnce(session *smux.Session, mode byte, seconds
 	return utils.SpeedtestSink(stream)
 }
 
+// validatePhaseReports checks receiver-reported measurements for sanity.
+// Returns an error for negative bytes, invalid elapsed (positive bytes but
+// non-positive elapsed, which would produce Inf/NaN Mbps), or byte-sum overflow.
+func validatePhaseReports(reports []phaseReport) error {
+	var sum int64
+	for i, r := range reports {
+		if r.bytes < 0 {
+			return fmt.Errorf("path %d reported negative bytes %d", i, r.bytes)
+		}
+		if r.bytes > 0 && r.elapsed <= 0 {
+			return fmt.Errorf("path %d reported %d bytes but non-positive elapsed %v", i, r.bytes, r.elapsed)
+		}
+		// Overflow-safe sum: check before adding.
+		if r.bytes > 0 && sum > math.MaxInt64-r.bytes {
+			return errors.New("byte sum overflow across paths")
+		}
+		sum += r.bytes
+	}
+	return nil
+}
+
+// calcPhaseRates fills per-path Mbps and returns the aggregate Mbps using the
+// provided phase wall duration for the denominator.
+// Per-path rate = bytes / receiver-elapsed (data-window goodput).
+// Aggregate rate = sum(bytes) / phaseWall (effective whole-phase throughput,
+// which includes setup and drain overhead and is intentionally different from
+// per-path data-window rate).
+//
+// ponytail: pure arithmetic; exported for testability without network calls.
+func calcPhaseRates(reports []phaseReport, phaseWall time.Duration, perMbps []float64) float64 {
+	var sum int64
+	for i, r := range reports {
+		perMbps[i] = utils.SpeedtestMbps(r.bytes, r.elapsed)
+		sum += r.bytes
+	}
+	return utils.SpeedtestMbps(sum, phaseWall)
+}
+
 // runSpeedtestAll measures the whole connection's throughput: it runs the test
 // on the best session of every distinct CDN in parallel and sums the
 // receiver-measured bytes over the test window. Because the runs are concurrent
 // they contend for any shared bottleneck (e.g. one origin uplink behind several
 // CDNs), so the aggregate honestly reflects what the pool can move at once
 // rather than an inflated sum of isolated runs.
+//
+// Per-path rates are computed from receiver-measured elapsed (data-window
+// goodput). Aggregate rates are computed from a local monotonic phase wall
+// clock that spans from just before launching concurrent operations to after
+// all return, including setup and report/drain overhead. These are intentionally
+// different measurements and should be expected to differ.
 func (s *WsMuxTransport) runSpeedtestAll(avail []*pooledSession, dir string, seconds int, dur time.Duration) speedtestResult {
 	res := speedtestResult{Direction: dir, Seconds: seconds, Scope: "all"}
 	targets := bestPerCDN(avail, legScore)
@@ -189,56 +241,60 @@ func (s *WsMuxTransport) runSpeedtestAll(avail []*pooledSession, dir string, sec
 	}
 
 	// runPhase runs one direction on every target concurrently and returns each
-	// target's receiver-measured byte count (index-aligned with targets).
-	runPhase := func(mode byte) ([]int64, error) {
-		bytes := make([]int64, len(targets))
+	// target's receiver-measured byte count and elapsed duration (index-aligned
+	// with targets). The phase wall time is also returned.
+	runPhase := func(mode byte) ([]phaseReport, time.Duration, error) {
+		reports := make([]phaseReport, len(targets))
 		errs := make([]error, len(targets))
 		var wg sync.WaitGroup
+		phaseStart := time.Now() // local monotonic clock: spans all concurrent ops
 		for i, ps := range targets {
 			wg.Add(1)
 			go func(i int, ps *pooledSession) {
 				defer wg.Done()
-				b, _, err := s.speedtestOnce(ps.session, mode, seconds, dur)
-				bytes[i] = b
+				b, el, err := s.speedtestOnce(ps.session, mode, seconds, dur)
+				reports[i] = phaseReport{bytes: b, elapsed: el}
 				errs[i] = err
 			}(i, ps)
 		}
 		wg.Wait()
+		phaseWall := time.Since(phaseStart) // includes launch overhead and drain time
 		for i, err := range errs {
 			if err != nil {
-				return bytes, fmt.Errorf("cdn %s: %w", targets[i].cdn, err)
+				return reports, phaseWall, fmt.Errorf("cdn %s: %w", targets[i].cdn, err)
 			}
 		}
-		return bytes, nil
+		if err := validatePhaseReports(reports); err != nil {
+			return reports, phaseWall, err
+		}
+		return reports, phaseWall, nil
 	}
 
-	// Aggregate throughput is the summed bytes over the common test window, so
-	// concurrent runs that share a bottleneck don't add up beyond it.
+	// Upload and download have separate phase clocks. Requested seconds is the
+	// workload duration, never the rate denominator.
 	if dir == "down" || dir == "both" {
-		b, err := runPhase(utils.SpeedtestDownload)
+		reports, phaseWall, err := runPhase(utils.SpeedtestDownload)
 		if err != nil {
 			res.Error = "download: " + err.Error()
 			return res
 		}
-		var sum int64
-		for i, x := range b {
-			per[i].DownMbps = utils.SpeedtestMbps(x, dur)
-			sum += x
+		perMbps := make([]float64, len(targets))
+		res.TotalDownMbps = calcPhaseRates(reports, phaseWall, perMbps)
+		for i := range targets {
+			per[i].DownMbps = perMbps[i]
 		}
-		res.TotalDownMbps = utils.SpeedtestMbps(sum, dur)
 	}
 	if dir == "up" || dir == "both" {
-		b, err := runPhase(utils.SpeedtestUpload)
+		reports, phaseWall, err := runPhase(utils.SpeedtestUpload)
 		if err != nil {
 			res.Error = "upload: " + err.Error()
 			return res
 		}
-		var sum int64
-		for i, x := range b {
-			per[i].UpMbps = utils.SpeedtestMbps(x, dur)
-			sum += x
+		perMbps := make([]float64, len(targets))
+		res.TotalUpMbps = calcPhaseRates(reports, phaseWall, perMbps)
+		for i := range targets {
+			per[i].UpMbps = perMbps[i]
 		}
-		res.TotalUpMbps = utils.SpeedtestMbps(sum, dur)
 	}
 
 	res.PerCDN = per

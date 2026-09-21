@@ -8,6 +8,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
@@ -118,14 +121,15 @@ func (c *WebSocketConn) NextReader() (int, io.Reader, error) {
 			return int(hdr.OpCode), nil, io.EOF
 		}
 		if hdr.OpCode == ws.OpPing {
-			c.writeMu.Lock()
-			err = wsutil.WriteMessage(c.Conn, c.state, ws.OpPong, nil)
-			c.writeMu.Unlock()
+			// RFC 6455 §5.5.3: Pong MUST echo the application data from the Ping.
+			// Read payload before acquiring the write lock (control frames ≤ 125 B).
+			payload, err := io.ReadAll(c.reader)
 			if err != nil {
 				return 0, nil, err
 			}
-			// Drain the ping payload
-			_, err = io.Copy(io.Discard, c.reader)
+			c.writeMu.Lock()
+			err = wsutil.WriteMessage(c.Conn, c.state, ws.OpPong, payload)
+			c.writeMu.Unlock()
 			if err != nil {
 				return 0, nil, err
 			}
@@ -147,3 +151,137 @@ func (c *WebSocketConn) NextReader() (int, io.Reader, error) {
 func (c *WebSocketConn) NetConn() net.Conn {
 	return c.Conn
 }
+
+// MuxSubprotocol is the Sec-WebSocket-Protocol token that negotiates standards
+// framed mux legs (see WebSocketStream). It is an HTTP-handshake header only:
+// control-channel frames and smux's MuxVersion are unaffected.
+const MuxSubprotocol = "backhaul-mux-v1"
+
+// OffersMuxSubprotocol reports whether an upgrade request offers MuxSubprotocol.
+// Anything else in the header - another token, a garbled value - counts as
+// absent; there is no sniffing of post-upgrade bytes.
+func OffersMuxSubprotocol(h http.Header) bool {
+	for _, v := range h.Values("Sec-WebSocket-Protocol") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.TrimSpace(tok) == MuxSubprotocol {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ErrUnexpectedDataFrame is returned by WebSocketStream.Read for a text data
+// frame: a mux leg carries binary messages only.
+var ErrUnexpectedDataFrame = errors.New("websocket mux stream: unexpected non-binary data frame")
+
+// streamCloseTimeout bounds the best-effort Close frame WebSocketStream sends.
+const streamCloseTimeout = time.Second
+
+// WebSocketStream presents a WebSocketConn as a plain byte stream (net.Conn) whose
+// wire form is RFC 6455 binary messages, so smux can run on it while every byte
+// on the wire is a valid WebSocket frame (which is what a CDN that reassembles
+// messages needs). Each Write is one binary message; Read concatenates message
+// payloads across whatever buffer sizes and frame boundaries the caller uses,
+// never buffering a whole message. Bytes buffered at upgrade time are preserved
+// by NewWebSocketConn, which the stream is built on.
+//
+// Read is not goroutine safe (smux has a single reader); Write, Close and the
+// deadline setters are.
+type WebSocketStream struct {
+	c         *WebSocketConn
+	inMsg     bool  // a data message is being read out of c.reader
+	rerr      error // sticky read error
+	closeOnce sync.Once
+}
+
+// streamReadBuffer is the read-ahead of a stream. Unbuffered, every frame costs
+// separate socket reads for its 2-14 header bytes on top of the payload reads
+// smux already makes for its own 8-byte headers, which measurably slows bulk
+// transfer; buffering brings the syscall count back to the raw-leg level.
+const streamReadBuffer = 32 * 1024
+
+// Stream returns the byte-stream view of c. c must not be used for
+// ReadMessage/NextReader afterwards: the stream reads ahead of the frames it
+// hands out.
+func (c *WebSocketConn) Stream() *WebSocketStream {
+	// c.reader's source already yields any bytes buffered at upgrade time first.
+	c.reader.Source = bufio.NewReaderSize(c.reader.Source, streamReadBuffer)
+	return &WebSocketStream{c: c}
+}
+
+func (s *WebSocketStream) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if s.rerr != nil {
+		return 0, s.rerr
+	}
+	for {
+		if !s.inMsg {
+			// NextReader answers Ping (echoing its payload), drops Pong and
+			// reports Close as io.EOF; only data frames come back.
+			op, _, err := s.c.NextReader()
+			if err != nil {
+				if op == int(ws.OpClose) {
+					s.sendClose()
+				}
+				s.rerr = err
+				return 0, err
+			}
+			if op != BinaryMessage {
+				s.rerr = ErrUnexpectedDataFrame
+				return 0, s.rerr
+			}
+			s.inMsg = true
+		}
+		n, err := s.c.reader.Read(p)
+		if err == io.EOF {
+			// End of this message. An empty message is not the end of the
+			// stream: go on to the next one.
+			s.inMsg, err = false, nil
+		}
+		if err != nil {
+			s.rerr = err
+			return n, err
+		}
+		if n > 0 {
+			return n, nil
+		}
+	}
+}
+
+func (s *WebSocketStream) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if err := s.c.WriteMessage(BinaryMessage, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// sendClose sends a normal-closure Close frame once, best effort: it is skipped
+// when a writer holds the write side (a stuck write must not make Close hang)
+// and bounded by a short write deadline otherwise.
+func (s *WebSocketStream) sendClose() {
+	s.closeOnce.Do(func() {
+		if !s.c.writeMu.TryLock() {
+			return
+		}
+		defer s.c.writeMu.Unlock()
+		_ = s.c.SetWriteDeadline(time.Now().Add(streamCloseTimeout))
+		_ = wsutil.WriteMessage(s.c.Conn, s.c.state, ws.OpClose, ws.NewCloseFrameBody(ws.StatusNormalClosure, ""))
+	})
+}
+
+func (s *WebSocketStream) Close() error {
+	s.sendClose()
+	return s.c.Close()
+}
+
+func (s *WebSocketStream) LocalAddr() net.Addr                { return s.c.LocalAddr() }
+func (s *WebSocketStream) RemoteAddr() net.Addr               { return s.c.RemoteAddr() }
+func (s *WebSocketStream) SetDeadline(t time.Time) error      { return s.c.SetDeadline(t) }
+func (s *WebSocketStream) SetReadDeadline(t time.Time) error  { return s.c.SetReadDeadline(t) }
+func (s *WebSocketStream) SetWriteDeadline(t time.Time) error { return s.c.SetWriteDeadline(t) }

@@ -36,7 +36,10 @@ import (
 	"github.com/xtaci/smux"
 )
 
-func TestWsMuxPlainFramingE2E(t *testing.T) {
+// TestShouldStripePlainMode verifies the shouldStripe predicate for a plain
+// (non-striped) connection. Actual framing and promotion regressions belong
+// with the transport repair plans, not here.
+func TestShouldStripePlainMode(t *testing.T) {
 	logger := logrus.New()
 	logger.SetLevel(logrus.FatalLevel)
 

@@ -1,6 +1,9 @@
 package cmd
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/musix/backhaul/config"
@@ -103,4 +106,119 @@ func TestApplyDefaultsStreamBuffer(t *testing.T) {
 			t.Errorf("server mux_streambuffer = %d, want %d", cfg.Server.MaxStreamBuffer, 1024*1024)
 		}
 	})
+}
+
+// TestLoadConfigMuxWSFraming: mux_ws_framing is on when the key is omitted and an
+// explicit false is honored, in both roles, through the real config loader (the
+// omitted-versus-false distinction only exists at TOML decode time).
+func TestLoadConfigMuxWSFraming(t *testing.T) {
+	load := func(t *testing.T, toml string) *config.Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadConfig(path)
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		applyDefaults(cfg) // defaulting must not undo it
+		return cfg
+	}
+
+	for _, tc := range []struct {
+		name                 string
+		toml                 string
+		wantServer, wantClnt bool
+	}{
+		{"omitted in both", "[server]\ntransport = \"wsmux\"\n[client]\ntransport = \"wsmux\"\n", true, true},
+		{"explicit false in both", "[server]\nmux_ws_framing = false\n[client]\nmux_ws_framing = false\n", false, false},
+		{"explicit true in both", "[server]\nmux_ws_framing = true\n[client]\nmux_ws_framing = true\n", true, true},
+		{"false only on the server", "[server]\nmux_ws_framing = false\n[client]\ntransport = \"wsmux\"\n", false, true},
+		{"false only on the client", "[server]\ntransport = \"wsmux\"\n[client]\nmux_ws_framing = false\n", true, false},
+		{"empty config", "", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := load(t, tc.toml)
+			if cfg.Server.MuxWSFraming != tc.wantServer {
+				t.Errorf("server mux_ws_framing = %v, want %v", cfg.Server.MuxWSFraming, tc.wantServer)
+			}
+			if cfg.Client.MuxWSFraming != tc.wantClnt {
+				t.Errorf("client mux_ws_framing = %v, want %v", cfg.Client.MuxWSFraming, tc.wantClnt)
+			}
+		})
+	}
+
+	// Other transports ignore the key: it loads without complaint and only the
+	// wsmux/wssmux wiring reads it.
+	cfg := load(t, "[server]\ntransport = \"tcp\"\nbind_addr = \"0.0.0.0:1\"\nmux_ws_framing = false\n")
+	if cfg.Server.Transport != config.TCP || cfg.Server.MuxWSFraming {
+		t.Fatalf("transport = %q, mux_ws_framing = %v", cfg.Server.Transport, cfg.Server.MuxWSFraming)
+	}
+}
+
+// TestLoadConfigMuxHalfClose: mux_half_close is server-only and off unless the
+// operator turns it on (opt-in: it makes the server reject old clients), through
+// the real loader and applyDefaults.
+func TestLoadConfigMuxHalfClose(t *testing.T) {
+	load := func(t *testing.T, toml string) *config.Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "config.toml")
+		if err := os.WriteFile(path, []byte(toml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := loadConfig(path)
+		if err != nil {
+			t.Fatalf("loadConfig: %v", err)
+		}
+		applyDefaults(cfg)
+		return cfg
+	}
+	if cfg := load(t, ""); cfg.Server.MuxHalfClose {
+		t.Fatal("mux_half_close defaulted to true")
+	}
+	if cfg := load(t, "[server]\ntransport = \"wsmux\"\n"); cfg.Server.MuxHalfClose {
+		t.Fatal("an omitted mux_half_close defaulted to true")
+	}
+	if cfg := load(t, "[server]\nmux_half_close = true\n"); !cfg.Server.MuxHalfClose {
+		t.Fatal("an explicit mux_half_close = true was lost")
+	}
+	if cfg := load(t, "[server]\nmux_half_close = false\n"); cfg.Server.MuxHalfClose {
+		t.Fatal("an explicit mux_half_close = false was lost")
+	}
+}
+
+// TestValidateHalfClose: the startup check behind the Fatalf in Run.
+func TestValidateHalfClose(t *testing.T) {
+	server := func(tr config.TransportType, ver int, on bool) *config.Config {
+		cfg := &config.Config{}
+		cfg.Server.Transport = tr
+		cfg.Server.MuxVersion = ver
+		cfg.Server.MuxHalfClose = on
+		return cfg
+	}
+	for _, tc := range []struct {
+		name    string
+		cfg     *config.Config
+		kind    string
+		wantErr string // substring, "" = ok
+	}{
+		{"off is always fine", server(config.TCP, 1, false), "server", ""},
+		{"wsmux v2", server(config.WSMUX, 2, true), "server", ""},
+		{"wssmux v2", server(config.WSSMUX, 2, true), "server", ""},
+		{"wsmux v1", server(config.WSMUX, 1, true), "server", "mux_version"},
+		{"tcpmux", server(config.TCPMUX, 2, true), "server", "wsmux/wssmux"},
+		{"plain ws", server(config.WS, 2, true), "server", "wsmux/wssmux"},
+		{"a client config never triggers it", server(config.TCP, 1, true), "client", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateHalfClose(tc.cfg, tc.kind)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("error = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
+	}
 }

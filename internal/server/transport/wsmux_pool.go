@@ -14,9 +14,15 @@ import (
 // scores it on: the CDN it arrived over (so a flow can be spread across distinct
 // CDNs) and an EWMA round-trip estimate maintained by probeSessionRTT.
 type pooledSession struct {
-	session *smux.Session
-	cdn     string       // CDN identity: the remote IP the pool connection arrived from
-	rtt     atomic.Int64 // EWMA round-trip in nanoseconds; 0 until the first probe lands
+	session   *smux.Session
+	halfClose bool         // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
+	cdn       string       // CDN identity: the remote IP the pool connection arrived from
+	rtt       atomic.Int64 // EWMA round-trip in nanoseconds; 0 until the first probe lands
+
+	// pendingOpens counts plain-leg OpenStreams that have picked this session but
+	// not yet returned (see openPlainLegPS). It is guarded by
+	// WsMuxTransport.plainSelectMu, never read or written without it.
+	pendingOpens int
 }
 
 // Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;
@@ -48,8 +54,8 @@ const (
 
 // registerSession adds a pool session to the live registry and returns its
 // wrapper so the caller can start probing it. unregisterSession removes it.
-func (s *WsMuxTransport) registerSession(session *smux.Session) *pooledSession {
-	ps := &pooledSession{session: session, cdn: cdnKey(session.RemoteAddr())}
+func (s *WsMuxTransport) registerSession(session *smux.Session, halfClose bool) *pooledSession {
+	ps := &pooledSession{session: session, halfClose: halfClose, cdn: cdnKey(session.RemoteAddr())}
 	s.sessionsMu.Lock()
 	s.sessions = append(s.sessions, ps)
 	s.sessionsMu.Unlock()
@@ -58,13 +64,19 @@ func (s *WsMuxTransport) registerSession(session *smux.Session) *pooledSession {
 
 func (s *WsMuxTransport) unregisterSession(session *smux.Session) {
 	s.sessionsMu.Lock()
+	s.unregisterLocked(session)
+	s.sessionsMu.Unlock()
+}
+
+// unregisterLocked is unregisterSession for a caller that holds sessionsMu, so
+// rotation can validate its successor and remove the old session in one step.
+func (s *WsMuxTransport) unregisterLocked(session *smux.Session) {
 	for i, ps := range s.sessions {
 		if ps.session == session {
 			s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
 			break
 		}
 	}
-	s.sessionsMu.Unlock()
 }
 
 // liveSessionCount reports how many registered pool sessions are still open.
@@ -220,43 +232,107 @@ func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
 // pulled independently from the shared local channel, so flows spread across
 // connections and their throughput summed.
 //
-// plainSelectMu serializes the score-pick-open sequence, so each flow's
-// OpenStream raises its session's score before the next flow scores: legScore
-// then steers successive flows onto different (still fast) CDNs. RTT is probed
-// on this path too (see handleLoop), so the spread favours the low-latency CDNs
-// and leaves the slow tail unused rather than round-robining blindly onto it.
+// Placement is a reservation, not a held lock. Under plainSelectMu each opener
+// scores the live sessions, picks the best and reserves it (pendingOpens++), so
+// the next opener already sees that load; the lock is released BEFORE
+// OpenStream, which can block on a stalled connection's SYN write, and the
+// reservation is dropped under the lock when OpenStream returns either way. One
+// stalled session therefore delays only the openers that picked it, and later
+// flows are placed on the healthy sessions (the stalled one scores worse for
+// every reservation it holds). RTT is probed on this path too (see handleLoop),
+// so the spread favours the low-latency CDNs and leaves the slow tail unused
+// rather than round-robining blindly onto it.
+//
+// Narrow overcount: smux registers the stream in NumStreams just before
+// OpenStream returns, so for that instant the opener counts twice (stream +
+// reservation). That only makes its session look slightly busier for a moment -
+// conservative and self-correcting - and is not tracked more precisely.
+//
+// Lock order: plainSelectMu, then sessionsMu (only for the registry snapshot).
+// Nothing takes them the other way round; register/unregister take sessionsMu
+// alone.
 func (s *WsMuxTransport) openPlainLeg() (*smux.Stream, error) {
+	stream, _, err := s.openPlainLegPS()
+	return stream, err
+}
+
+// openPlainLegPS is openPlainLeg that also says which pool session carries the
+// stream, so the dispatcher can see what that session negotiated.
+//
+// A session that closes (or is rotated out) after it was picked makes OpenStream
+// fail; it is then excluded and the flow re-scored over the rest, so no
+// candidate is tried twice. A stream that arrives late is returned to the
+// caller like any other (the setup attempt closes it if it has expired), and a
+// session that started draining after the pick is not re-admitted: eligibility
+// is only ever decided at selection, from the live registry.
+func (s *WsMuxTransport) openPlainLegPS() (*smux.Stream, *pooledSession, error) {
+	tried := make(map[*pooledSession]bool)
+	for {
+		ps, live := s.reservePlainLeg(tried)
+		if ps == nil {
+			if live == 0 {
+				return nil, nil, fmt.Errorf("no live pool session available for a plain leg")
+			}
+			return nil, nil, fmt.Errorf("all %d pool session(s) failed to open a plain leg", live)
+		}
+
+		stream, err := ps.session.OpenStream() // may block: no lock held
+		s.releasePlainLeg(ps)
+		if err == nil {
+			return stream, ps, nil
+		}
+		s.logger.Tracef("plain leg: OpenStream on a pool session failed, trying the next: %v", err)
+		tried[ps] = true
+	}
+}
+
+// reservePlainLeg picks the best-scoring live session not in tried and reserves
+// it. It returns nil (and how many live sessions it saw) when none is left.
+func (s *WsMuxTransport) reservePlainLeg(tried map[*pooledSession]bool) (*pooledSession, int) {
 	s.plainSelectMu.Lock()
 	defer s.plainSelectMu.Unlock()
 
 	s.sessionsMu.Lock()
 	avail := make([]*pooledSession, 0, len(s.sessions))
+	live := 0
 	for _, ps := range s.sessions {
-		if ps.session != nil && !ps.session.IsClosed() {
+		if ps.session == nil || ps.session.IsClosed() {
+			continue
+		}
+		live++
+		if !tried[ps] {
 			avail = append(avail, ps)
 		}
 	}
 	s.sessionsMu.Unlock()
 
 	if len(avail) == 0 {
-		return nil, fmt.Errorf("no live pool session available for a plain leg")
+		return nil, live
 	}
-
-	// Best score first; try the next on an OpenStream failure. Holding
-	// plainSelectMu across OpenStream is what makes the placement spread: the
-	// chosen session's NumStreams is up by one before the next flow scores.
-	sort.SliceStable(avail, func(i, j int) bool {
-		return legScore(avail[i]) < legScore(avail[j])
-	})
-	for _, ps := range avail {
-		stream, err := ps.session.OpenStream()
-		if err != nil {
-			s.logger.Tracef("plain leg: OpenStream on a pool session failed, trying the next: %v", err)
-			continue
+	// First lowest score wins, so equal scores keep registry order (as the old
+	// stable sort did).
+	best, bestScore := avail[0], placementScore(avail[0])
+	for _, ps := range avail[1:] {
+		if sc := placementScore(ps); sc < bestScore {
+			best, bestScore = ps, sc
 		}
-		return stream, nil
 	}
-	return nil, fmt.Errorf("all %d pool session(s) failed to open a plain leg", len(avail))
+	best.pendingOpens++
+	return best, live
+}
+
+func (s *WsMuxTransport) releasePlainLeg(ps *pooledSession) {
+	s.plainSelectMu.Lock()
+	ps.pendingOpens--
+	s.plainSelectMu.Unlock()
+}
+
+// placementScore is legScore plus the plain opens already reserved on the
+// session. Callers hold plainSelectMu. The striped path keeps using legScore
+// (it never reserves); a new placement mode that shares sessions with plain
+// flows must add pendingOpens too, or it can burst onto one session.
+func placementScore(ps *pooledSession) float64 {
+	return legScoreValue(ps.session.NumStreams()+ps.pendingOpens, ps.rtt.Load())
 }
 
 // bestPerCDN returns the best-scoring session for each distinct CDN, so an

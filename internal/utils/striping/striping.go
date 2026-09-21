@@ -125,8 +125,110 @@ type legSched struct {
 	inResent bool
 }
 
+// reassemblyBudgetBytes is the per-connection ceiling on memory retained for
+// reassembly: raw/decoded payload waiting in the reorder buffer, payload held in
+// the hand-off channel, and (FEC) incomplete shards. Exceeding it closes the flow
+// with a descriptive error instead of growing without bound or blocking every
+// leg (which could keep the one missing sequence from ever arriving). With the
+// 16KiB DefaultChunkSize even a 256-shard FEC row (4MiB) fits.
+// ponytail: fixed initial ceiling; make it configurable if real traffic needs a
+// deeper reorder window.
+const reassemblyBudgetBytes = 32 << 20
+
+// retainedEntryOverhead is charged per retained chunk/row on top of its payload,
+// so zero-length or tiny entries cannot fill a map for free.
+const retainedEntryOverhead = 64
+
+// reassemblyBudget is a lock-free byte counter for retained reassembly memory.
+// limit is set before any I/O (New, or a test before it touches the legs).
+type reassemblyBudget struct {
+	limit int64
+	used  int64 // atomic
+	peak  int64 // atomic
+}
+
+// reserve charges n bytes, reporting false (and charging nothing) if that would
+// exceed limit. Callers reserve before retaining and release exactly what they
+// reserved.
+func (b *reassemblyBudget) reserve(n int64) bool {
+	if n > b.limit {
+		return false
+	}
+	v := atomic.AddInt64(&b.used, n)
+	if v > b.limit {
+		atomic.AddInt64(&b.used, -n)
+		return false
+	}
+	for {
+		p := atomic.LoadInt64(&b.peak)
+		if v <= p || atomic.CompareAndSwapInt64(&b.peak, p, v) {
+			return true
+		}
+	}
+}
+
+func (b *reassemblyBudget) release(n int64) { atomic.AddInt64(&b.used, -n) }
+
+func (b *reassemblyBudget) err(need int64) error {
+	return fmt.Errorf("striping: reassembly budget exceeded (%d bytes retained + %d needed > %d limit): an earlier sequence has not arrived or the reader is too far behind",
+		atomic.LoadInt64(&b.used), need, b.limit)
+}
+
+// depth sizes a hand-off channel so a full channel holds at most a quarter of
+// the budget (at least one slot), never more than max.
+func (b *reassemblyBudget) depth(max int, per int64) int {
+	if d := b.limit / 4 / per; d < int64(max) {
+		max = int(d)
+	}
+	if max < 1 {
+		max = 1
+	}
+	return max
+}
+
+// gapState remembers when the gap at one expected sequence was first observed,
+// so later arrivals of other sequences cannot renew its deadline. Guarded by
+// the owning conn's rmu.
+type gapState struct {
+	seq   uint32
+	start time.Time // zero: no gap observed
+}
+
+// Callers clear the state while merely idle (nothing provably missing), and
+// begin a gap - stamped with the first-evidence time, so a following gap that
+// was already observable does not get a fresh full timeout - whenever the
+// expected sequence has no recorded gap yet.
+func (g *gapState) clear()                         { g.start = time.Time{} }
+func (g *gapState) fresh(next uint32) bool         { return g.start.IsZero() || g.seq != next }
+func (g *gapState) begin(next uint32, t time.Time) { g.seq, g.start = next, t }
+
+// armTimer (re)arms *t to fire after d, stopping and draining it first so no
+// stale tick survives, and returns its channel. d < 0 leaves it stopped and
+// returns nil, which blocks forever in a select (idle: no timer).
+func armTimer(t **time.Timer, d time.Duration) <-chan time.Time {
+	if *t == nil {
+		if d < 0 {
+			return nil
+		}
+		*t = time.NewTimer(d)
+		return (*t).C
+	}
+	if !(*t).Stop() {
+		select {
+		case <-(*t).C:
+		default:
+		}
+	}
+	if d < 0 {
+		return nil
+	}
+	(*t).Reset(d)
+	return (*t).C
+}
+
 type chunk struct {
 	seq  uint32
+	at   time.Time // when Read filed it in pending (out-of-order arrival)
 	data []byte
 	// base is the full-size backing buffer that data slices into, borrowed from
 	// the Conn's readPool by readLeg. Read returns it to the pool once the
@@ -186,9 +288,14 @@ type Conn struct {
 	// readPool once readBuf drains to empty, so the next inbound chunk can reuse
 	// it. Guarded by rmu, like the rest of the reassembly state.
 	readBufBase *[]byte
-	// readTimer is the reusable stall timer for Read's blocking loop, created
-	// lazily on first use and re-armed with Reset on every turn instead of a
-	// fresh time.NewTimer per turn. Guarded by rmu (Read holds it for its whole
+	readCost    int64 // budget charge of the chunk behind readBuf
+	// budget bounds everything retained for reassembly (see reassemblyBudgetBytes).
+	budget reassemblyBudget
+	// gap is the absolute deadline state of the gap Read is waiting on.
+	gap gapState
+	// readTimer is the reusable gap timer for Read's blocking loop, created
+	// lazily and re-armed via armTimer. It only runs while a gap is proven; an
+	// idle connection has no timer. Guarded by rmu (Read holds it for its whole
 	// duration), so one timer serves every Read call and every loop turn.
 	readTimer *time.Timer
 	// readPool recycles chunkSize payload buffers on the read/reassembly path,
@@ -239,9 +346,10 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		// fast legs run further ahead of a slow one (their chunks buffer here and
 		// in the reorder map instead of back-pressuring), which is what turns a
 		// heterogeneous set of legs into their summed throughput rather than the
-		// slowest leg's rate. The reorder buffer (pending) is unbounded, so this
-		// only bounds how far ahead a leg races before its readLeg parks.
-		chunkCh:     make(chan chunk, len(legs)*8),
+		// slowest leg's rate. The reorder buffer (pending) is bounded by the
+		// reassembly budget; the channel depth only bounds how far ahead a leg
+		// races before its readLeg parks.
+		budget:      reassemblyBudget{limit: reassemblyBudgetBytes},
 		errCh:       make(chan error, len(legs)),
 		writeQueue:  make(chan writeJob, len(legs)*8),
 		resendQueue: make(chan writeJob, max(len(legs)*2, 1)),
@@ -252,6 +360,7 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		closed:      make(chan struct{}),
 		sched:       make([]legSched, len(legs)),
 	}
+	c.chunkCh = make(chan chunk, c.budget.depth(len(legs)*8, c.chunkCost(true)))
 	c.chunkPool.New = func() any {
 		b := make([]byte, chunkSize)
 		return &b
@@ -303,6 +412,16 @@ func (c *Conn) readLeg(leg net.Conn) {
 			return
 		}
 
+		// Reserve before retaining: from here until Read consumes or drops the
+		// chunk, its payload counts against the reassembly budget. Failing loudly
+		// beats blocking - a parked leg could be the one carrying the missing
+		// sequence.
+		cost := c.chunkCost(length > 0)
+		if !c.budget.reserve(cost) {
+			c.fail(c.budget.err(cost))
+			return
+		}
+
 		// Borrow a payload buffer from readPool instead of allocating one per
 		// chunk. A zero-length chunk carries no payload, so it borrows nothing.
 		ch := chunk{seq: seq}
@@ -314,6 +433,12 @@ func (c *Conn) readLeg(leg net.Conn) {
 				// Never delivered: recycle immediately so a mid-chunk read error
 				// doesn't drop the buffer out of the pool.
 				c.readPool.Put(bufp)
+				c.budget.release(cost)
+				// The header promised length bytes, so EOF with none of them
+				// is truncation (ReadFull returns bare io.EOF only then).
+				if err == io.EOF {
+					err = io.ErrUnexpectedEOF
+				}
 				c.fail(err)
 				return
 			}
@@ -324,9 +449,7 @@ func (c *Conn) readLeg(leg net.Conn) {
 		case <-c.closed:
 			// The chunk never reached Read, so nothing else will return its
 			// buffer - hand it back here instead of leaking it from the pool.
-			if ch.base != nil {
-				c.readPool.Put(ch.base)
-			}
+			c.recycle(ch)
 			return
 		}
 	}
@@ -717,6 +840,11 @@ func (c *Conn) writeChunk(leg net.Conn, frame []byte, job writeJob) bool {
 // a write-side failure (a leg's write deadline expiring) has to be visible to
 // the next Write call even if nothing ever calls Read on this Conn.
 func (c *Conn) fail(err error) {
+	// No caller signals a normal end through fail (a clean leg finish goes via
+	// legDone), so a bare io.EOF here would surface as a silent clean EOF.
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
 	c.setPermErr(err)
 	select {
 	case c.errCh <- err:
@@ -784,6 +912,16 @@ func (c *Conn) Write(p []byte) (int, error) {
 			// buffer - hand it back here instead of leaking it from the pool.
 			c.chunkPool.Put(bufp)
 			return total, c.currentErr()
+		case <-c.flush:
+			// CloseWrite closes flush only on write-side shutdown, after which
+			// the write workers exit and nothing drains writeQueue; without
+			// this a Write blocked on a full queue holds wmu forever and
+			// deadlocks CloseWrite's sendEndMarkers.
+			c.chunkPool.Put(bufp)
+			if err := c.getPermErr(); err != nil {
+				return total, err
+			}
+			return total, net.ErrClosed
 		}
 	}
 	return total, nil
@@ -805,16 +943,28 @@ func (c *Conn) stash(ch chunk) {
 	} else if _, dup := c.pending[ch.seq]; dup {
 		c.recycle(ch)
 	} else {
+		ch.at = time.Now()
 		c.pending[ch.seq] = ch
 	}
 }
 
-// recycle returns a dropped chunk's pooled backing buffer to readPool. A
-// zero-length chunk borrows none.
+// chunkCost is the budget charge for one retained chunk: its pooled payload
+// buffer (full chunkSize, whatever the wire length) plus fixed entry overhead.
+func (c *Conn) chunkCost(hasPayload bool) int64 {
+	n := int64(retainedEntryOverhead)
+	if hasPayload {
+		n += int64(c.chunkSize)
+	}
+	return n
+}
+
+// recycle returns a dropped chunk's pooled backing buffer to readPool and
+// releases its budget charge. A zero-length chunk borrows no buffer.
 func (c *Conn) recycle(ch chunk) {
 	if ch.base != nil {
 		c.readPool.Put(ch.base)
 	}
+	c.budget.release(c.chunkCost(ch.base != nil))
 }
 
 // setReadBuf installs ch as the current read buffer and remembers its pooled
@@ -825,6 +975,10 @@ func (c *Conn) recycle(ch chunk) {
 func (c *Conn) setReadBuf(ch chunk) {
 	c.readBuf = ch.data
 	c.readBufBase = ch.base
+	c.readCost = c.chunkCost(ch.base != nil)
+	if len(ch.data) == 0 {
+		c.releaseReadBuf() // nothing to consume: Read never drains an empty buffer
+	}
 }
 
 // releaseReadBuf returns the fully-consumed read buffer's pooled backing buffer
@@ -835,6 +989,34 @@ func (c *Conn) releaseReadBuf() {
 		c.readPool.Put(c.readBufBase)
 		c.readBufBase = nil
 	}
+	c.budget.release(c.readCost)
+	c.readCost = 0
+}
+
+// earliestPending is the first-evidence time for a new gap: the oldest
+// out-of-order chunk Read is holding, or now if the evidence is only an END
+// marker. Caller holds rmu.
+func (c *Conn) earliestPending() time.Time {
+	t := time.Now()
+	for _, ch := range c.pending {
+		if ch.at.Before(t) {
+			t = ch.at
+		}
+	}
+	return t
+}
+
+// dropReassembly gives back everything Read still retains once the stream has
+// ended for good (EOF or a terminal error), so charges and pooled buffers are
+// not stranded. Caller holds rmu.
+func (c *Conn) dropReassembly() {
+	c.drainAvailable()
+	for seq, ch := range c.pending {
+		c.recycle(ch)
+		delete(c.pending, seq)
+	}
+	c.readBuf = nil
+	c.releaseReadBuf()
 }
 
 // drainAvailable moves everything currently sitting in chunkCh into the
@@ -859,6 +1041,7 @@ func (c *Conn) drainAvailable() {
 				c.recycle(ch)
 				continue
 			}
+			ch.at = time.Now()
 			c.pending[ch.seq] = ch
 		default:
 			return
@@ -868,13 +1051,25 @@ func (c *Conn) drainAvailable() {
 
 // Read reassembles chunks arriving out of order across legs into the
 // original in-order byte stream. It reports a clean io.EOF only once every
-// leg has ended and nothing is left stranded; a gap when the legs end, or a
-// missing sequence number that never arrives within stallTimeout, is an
-// error (io.ErrUnexpectedEOF / stall) - like a dropped connection, since
-// there's no retransmission.
-func (c *Conn) Read(p []byte) (int, error) {
+// announced chunk has been delivered. An idle connection (nothing missing, so
+// nothing to wait out) blocks without any timer, like a quiet TCP flow. A
+// proven gap - a later sequence arrived, or the END marker announced more than
+// has been delivered - must be filled within stallTimeout of when it was first
+// observed; later arrivals do not renew that deadline. Otherwise Read fails
+// loudly (like a dropped connection, since there's no retransmission).
+func (c *Conn) Read(p []byte) (n int, err error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
+	// Once Read reports EOF or a terminal error nothing retained can ever be
+	// delivered: release it.
+	defer func() {
+		if err != nil {
+			c.dropReassembly()
+		}
+	}()
 
 	if len(c.readBuf) == 0 {
 		// A completed stream reports EOF even if a leg later errored - every
@@ -914,37 +1109,31 @@ func (c *Conn) Read(p []byte) (int, error) {
 		// Only arm the totalKnown case while the END marker hasn't been seen.
 		// totalKnown is closed (never reopened) once the marker arrives, so
 		// leaving it in the select would make it win every iteration - a busy
-		// spin that pegs a core and starves the stallTimeout timer whenever the
-		// marker arrives on a fast leg before a chunk still in flight on a slow
-		// one. A nil channel never selects, so afterwards we fall through to the
-		// real work (chunkCh / legsDone / errCh / timer).
+		// spin that pegs a core and starves the gap timer whenever the marker
+		// arrives on a fast leg before a chunk still in flight on a slow one. A
+		// nil channel never selects, so afterwards we fall through to the real
+		// work (chunkCh / legsDone / errCh / timer).
 		var totalKnown <-chan struct{}
 		if atomic.LoadInt32(&c.haveTotal) == 0 {
 			totalKnown = c.totalKnown
 		}
 
-		// Arm the reusable stall timer for this turn. Created once and re-armed
-		// with Reset on every subsequent turn (and every subsequent Read call),
-		// instead of allocating a fresh time.NewTimer per turn on the reassembly
-		// hot path. Under striping, chunks routinely arrive out of order, so a
-		// Read blocked on sequence N wakes once per earlier-arriving chunk and
-		// loops again still waiting - each of those turns previously allocated
-		// (and leaked to the GC) a new 20s timer. Stop-then-drain-then-Reset
-		// re-arms without leaving a stale tick behind (the drain covers a timer
-		// that fired between the previous select and this Stop), giving every
-		// select the same full stallTimeout budget the per-turn timer did.
-		if c.readTimer == nil {
-			c.readTimer = time.NewTimer(c.stallTimeout)
+		// Time the wait only if data is provably missing: a later sequence is
+		// held, or END announced more than we've delivered. The deadline is
+		// absolute from when the gap was first observed, so a stream of
+		// out-of-order arrivals cannot postpone it.
+		proven := len(c.pending) > 0 ||
+			(atomic.LoadInt32(&c.haveTotal) == 1 && c.nextSeq < atomic.LoadUint32(&c.total))
+		wait := time.Duration(-1)
+		if !proven {
+			c.gap.clear()
 		} else {
-			if !c.readTimer.Stop() {
-				select {
-				case <-c.readTimer.C:
-				default:
-				}
+			if c.gap.fresh(c.nextSeq) {
+				c.gap.begin(c.nextSeq, c.earliestPending())
 			}
-			c.readTimer.Reset(c.stallTimeout)
+			wait = max(c.stallTimeout-time.Since(c.gap.start), 0)
 		}
-		timer := c.readTimer
+		timerC := armTimer(&c.readTimer, wait)
 
 		select {
 		case ch := <-c.chunkCh:
@@ -980,7 +1169,31 @@ func (c *Conn) Read(p []byte) (int, error) {
 				}
 			}
 
-		case <-timer.C:
+		case <-c.closed:
+			// Closed locally (or torn down by a failure whose error was already
+			// consumed): a Read blocked on an idle connection must not hang.
+			c.drainAvailable()
+			if len(c.readBuf) == 0 && !c.complete() {
+				if _, ok := c.pending[c.nextSeq]; !ok {
+					if err := c.getPermErr(); err != nil {
+						return 0, err
+					}
+					select {
+					case <-c.legsDone:
+						return 0, io.ErrUnexpectedEOF
+					default:
+						return 0, net.ErrClosed
+					}
+				}
+			}
+
+		case <-timerC:
+			// The chunk we're waiting on may have landed in chunkCh in the same
+			// instant; only a still-missing sequence is a stall.
+			c.drainAvailable()
+			if _, ok := c.pending[c.nextSeq]; ok {
+				continue
+			}
 			stallErr := fmt.Errorf("striping: stalled waiting for sequence %d for %s", c.nextSeq, c.stallTimeout)
 			c.setPermErr(stallErr)
 			c.teardown()
@@ -988,7 +1201,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 	}
 
-	n := copy(p, c.readBuf)
+	n = copy(p, c.readBuf)
 	c.readBuf = c.readBuf[n:]
 	// Once the chunk's bytes are fully copied out to the caller, its pooled
 	// backing buffer is free to be reused by the next inbound chunk.

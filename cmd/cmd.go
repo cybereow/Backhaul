@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/client"
@@ -29,6 +30,22 @@ func detectConfigType(cfg *config.Config) string {
 	default:
 		return ""
 	}
+}
+
+// validateHalfClose rejects mux_half_close on anything that cannot carry it: it
+// is a server-only key, meaningful only on wsmux/wssmux, and its FlowPlainHC
+// flow kind is only read on mux_version >= 2. Call after applyDefaults.
+func validateHalfClose(cfg *config.Config, configType string) error {
+	if configType != "server" || !cfg.Server.MuxHalfClose {
+		return nil
+	}
+	if t := cfg.Server.Transport; t != config.WSMUX && t != config.WSSMUX {
+		return fmt.Errorf("server 'mux_half_close' is only supported on the wsmux/wssmux transports (transport is %q)", t)
+	}
+	if cfg.Server.MuxVersion < 2 {
+		return fmt.Errorf("server 'mux_half_close' requires 'mux_version' >= 2 (the half-close flow kind is only read on mux_version 2)")
+	}
+	return nil
 }
 
 func Run(configPath string, ctx context.Context) {
@@ -75,6 +92,10 @@ func Run(configPath string, ctx context.Context) {
 		if cfg.Client.StripeFactor+cfg.Client.StripeParity > 256 {
 			logger.Fatalf("client 'mux_stripe' + 'mux_stripe_parity' must be <= 256")
 		}
+	}
+
+	if err := validateHalfClose(cfg, configType); err != nil {
+		logger.Fatalf("%v", err)
 	}
 
 	// Determine whether to run as a server or client
@@ -124,6 +145,15 @@ func loadConfig(configPath string) (*config.Config, error) {
 	// configuration, default it to true to prevent unintentional MITM.
 	if !meta.IsDefined("client", "tls_verify") {
 		cfg.Client.TLSVerify = true
+	}
+
+	// Standards-framed wsmux/wssmux legs are on unless the operator turned them
+	// off: an omitted key is true, an explicit false is honored (legacy raw).
+	if !meta.IsDefined("server", "mux_ws_framing") {
+		cfg.Server.MuxWSFraming = true
+	}
+	if !meta.IsDefined("client", "mux_ws_framing") {
+		cfg.Client.MuxWSFraming = true
 	}
 
 	return &cfg, nil

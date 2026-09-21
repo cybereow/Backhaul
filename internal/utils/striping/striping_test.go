@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"runtime"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -490,5 +494,641 @@ func TestStripedCleanCloseStillEOF(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatalf("clean close lost data: got %d bytes, want %d", len(got), len(payload))
+	}
+}
+
+// ---- Plan 004: idle vs proven gaps, and the reassembly budget ----
+
+// stripeFrame is one plain-striping wire frame: seq(4) length(4) payload.
+func stripeFrame(seq uint32, payload string) []byte {
+	b := make([]byte, headerSize, headerSize+len(payload))
+	binary.BigEndian.PutUint32(b[0:4], seq)
+	binary.BigEndian.PutUint32(b[4:8], uint32(len(payload)))
+	return append(b, payload...)
+}
+
+// TestStripedTruncatedPayloadIsLoud: a leg that closes cleanly right after a
+// chunk header (before any of the announced payload) is truncation, not a clean
+// end of stream.
+func TestStripedTruncatedPayloadIsLoud(t *testing.T) {
+	legs, peers := pipePair(2)
+	s := New(legs, 16)
+	s.stallTimeout = 2 * time.Second // before any I/O
+	defer s.Close()
+	drainPeers(peers)
+	ev := readEvents(s)
+
+	header := stripeFrame(0, "")
+	binary.BigEndian.PutUint32(header[4:8], 8) // announce 8 payload bytes, send none
+	for _, p := range peers {
+		go func(p net.Conn) {
+			p.Write(header)
+			p.Close()
+		}(p)
+	}
+	expectErr(t, ev, "", 3*time.Second)
+}
+
+// TestStripedWriteUnblocksOnCloseWrite: a Write blocked on a full writeQueue must
+// fail once CloseWrite has begun (the write workers stop draining the queue), not
+// hold wmu forever and deadlock CloseWrite's END marker. The single leg is gated,
+// so the worker stays blocked in its first send and the queue stays full until
+// the test releases it: without the flush case in Write's enqueue select the
+// Write below cannot return.
+func TestStripedWriteUnblocksOnCloseWrite(t *testing.T) {
+	legs, peers := pipePair(1)
+	gate := make(chan struct{})
+	s := New([]net.Conn{&faultLeg{Conn: legs[0], gate: gate}}, 16)
+	drainPeers(peers)
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	closeWriteDone := make(chan struct{})
+	defer func() {
+		release()
+		// teardown (not Close): if the fix regresses, Close would block behind the
+		// stuck CloseWrite; closing the Conn is also what unsticks that Write.
+		s.teardown()
+		peers[0].Close()
+		select {
+		case <-closeWriteDone:
+		case <-time.After(5 * time.Second):
+			t.Error("CloseWrite did not finish after teardown")
+		}
+	}()
+
+	writeRes := make(chan error, 1)
+	go func() {
+		_, err := s.Write(make([]byte, 100*16)) // far more chunks than the queue holds
+		writeRes <- err
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for len(s.writeQueue) < cap(s.writeQueue) { // worker is stuck on the gate: queue fills
+		if time.Now().After(deadline) {
+			t.Fatal("writeQueue never filled")
+		}
+		runtime.Gosched()
+	}
+	go func() {
+		s.CloseWrite()
+		close(closeWriteDone)
+	}()
+	for {
+		select {
+		case <-s.flush:
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("CloseWrite never began")
+			}
+			runtime.Gosched()
+			continue
+		}
+		break
+	}
+
+	select {
+	case err := <-writeRes:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Write after CloseWrite began = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Write still blocked on a full queue after CloseWrite began")
+	}
+}
+
+// stripeEnd is the END marker announcing total data chunks.
+func stripeEnd(total uint32) []byte {
+	b := make([]byte, headerSize)
+	binary.BigEndian.PutUint32(b[0:4], total)
+	binary.BigEndian.PutUint32(b[4:8], endMarkerLen)
+	return b
+}
+
+// drainPeers gives every raw leg exactly one reader that discards whatever the
+// conn under test writes (END markers on Close), so Close never blocks on an
+// unread pipe. Writers to a leg (the test) are separate from this reader.
+func drainPeers(peers []net.Conn) {
+	for _, p := range peers {
+		go io.Copy(io.Discard, p)
+	}
+}
+
+type readEvent struct {
+	data string
+	err  error
+	at   time.Time
+}
+
+// readEvents runs one reader goroutine over r and reports every Read result
+// until the first error. The goroutine ends when r is closed by the test.
+func readEvents(r io.Reader) <-chan readEvent {
+	ch := make(chan readEvent, 4096)
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Read(buf)
+			ch <- readEvent{string(buf[:n]), err, time.Now()}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// expectData waits for the next Read result to be exactly want.
+func expectData(t *testing.T, ev <-chan readEvent, want string) {
+	t.Helper()
+	select {
+	case e := <-ev:
+		if e.err != nil || e.data != want {
+			t.Fatalf("Read = %q, %v; want %q, nil", e.data, e.err, want)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("no data %q within 3s", want)
+	}
+}
+
+// expectQuiet fails if Read returns anything (data or an error) within d.
+func expectQuiet(t *testing.T, ev <-chan readEvent, d time.Duration, why string) {
+	t.Helper()
+	select {
+	case e := <-ev:
+		t.Fatalf("%s: Read returned %q, %v; it must keep waiting", why, e.data, e.err)
+	case <-time.After(d):
+	}
+}
+
+// expectErr waits for a non-EOF Read error containing substr and returns when
+// it was observed. within bounds how long the test waits.
+func expectErr(t *testing.T, ev <-chan readEvent, substr string, within time.Duration) time.Time {
+	t.Helper()
+	deadline := time.After(within)
+	for {
+		select {
+		case e := <-ev:
+			if e.err == nil {
+				continue // data before the failure
+			}
+			if e.err == io.EOF || !strings.Contains(e.err.Error(), substr) {
+				t.Fatalf("Read error = %v; want a non-EOF error containing %q", e.err, substr)
+			}
+			return e.at
+		case <-deadline:
+			t.Fatalf("no %q error within %s", substr, within)
+		}
+	}
+}
+
+// TestStripedIdle: a connection with nothing missing is idle, not stalled -
+// like a quiet TCP flow it must never be timed out by Read itself.
+func TestStripedIdle(t *testing.T) {
+	const stall = 100 * time.Millisecond
+
+	newServer := func(t *testing.T) (*Conn, []net.Conn) {
+		legs, peers := pipePair(2)
+		s := New(legs, 16)
+		s.stallTimeout = stall // before any I/O
+		drainPeers(peers)
+		t.Cleanup(func() { s.Close(); peers[0].Close(); peers[1].Close() })
+		return s, peers
+	}
+
+	t.Run("initial", func(t *testing.T) {
+		s, peers := newServer(t)
+		ev := readEvents(s)
+		expectQuiet(t, ev, 5*stall, "healthy initial idle")
+		peers[0].Write(stripeFrame(0, "hello"))
+		expectData(t, ev, "hello")
+	})
+
+	t.Run("afterDeliveredData", func(t *testing.T) {
+		s, peers := newServer(t)
+		ev := readEvents(s)
+		peers[0].Write(stripeFrame(0, "hello"))
+		expectData(t, ev, "hello")
+		expectQuiet(t, ev, 5*stall, "idle after delivered data")
+		peers[1].Write(stripeFrame(1, "world"))
+		expectData(t, ev, "world")
+	})
+
+	t.Run("silentReverseDirection", func(t *testing.T) {
+		legs, peers := pipePair(2)
+		a, b := New(legs, 64), New(peers, 64)
+		a.stallTimeout, b.stallTimeout = stall, stall
+		defer a.Close()
+		defer b.Close()
+		aRead := readEvents(a) // reverse direction: b writes nothing for a while
+		bRead := readEvents(b)
+
+		for i := 0; i < 8; i++ { // forward traffic outlasts several stall timeouts
+			if _, err := a.Write([]byte("ping")); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			time.Sleep(stall / 2)
+		}
+		got := ""
+		for len(got) < 32 {
+			select {
+			case e := <-bRead:
+				if e.err != nil {
+					t.Fatalf("forward read: %v", e.err)
+				}
+				got += e.data
+			case <-time.After(3 * time.Second):
+				t.Fatalf("forward data incomplete: %q", got)
+			}
+		}
+		expectQuiet(t, aRead, 10*time.Millisecond, "silent reverse direction during forward traffic")
+		b.Write([]byte("pong"))
+		expectData(t, aRead, "pong")
+	})
+
+	t.Run("zeroLengthRead", func(t *testing.T) {
+		s, _ := newServer(t)
+		done := make(chan struct{})
+		go func() {
+			if n, err := s.Read(nil); n != 0 || err != nil {
+				t.Errorf("Read(nil) = %d, %v", n, err)
+			}
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("zero-length Read blocked")
+		}
+	})
+
+	t.Run("closeUnblocksIdleRead", func(t *testing.T) {
+		s, _ := newServer(t)
+		ev := readEvents(s)
+		expectQuiet(t, ev, 2*stall, "idle")
+		s.Close()
+		expectErr(t, ev, "", 3*time.Second)
+	})
+}
+
+// TestStripedGapDeadline: a proven gap has an absolute lifetime from when it
+// was first observed; later arrivals must not renew it.
+func TestStripedGapDeadline(t *testing.T) {
+	newServer := func(t *testing.T, stall time.Duration) (*Conn, []net.Conn) {
+		legs, peers := pipePair(2)
+		s := New(legs, 16)
+		s.stallTimeout = stall // before any I/O
+		drainPeers(peers)
+		t.Cleanup(func() { s.Close(); peers[0].Close(); peers[1].Close() })
+		return s, peers
+	}
+
+	t.Run("endBeforeMissingData", func(t *testing.T) {
+		const stall = 200 * time.Millisecond
+		s, peers := newServer(t, stall)
+		ev := readEvents(s)
+		peers[0].Write(stripeFrame(0, "aa"))
+		expectData(t, ev, "aa")
+		start := time.Now()
+		peers[0].Write(stripeEnd(2)) // chunk 1 announced, never sent
+		at := expectErr(t, ev, "stalled", 3*time.Second)
+		if d := at.Sub(start); d < stall-10*time.Millisecond {
+			t.Fatalf("gap failed after %s, before its %s deadline", d, stall)
+		}
+	})
+
+	t.Run("gapClockStartsAtEvidenceNotIdle", func(t *testing.T) {
+		const stall = 100 * time.Millisecond
+		s, peers := newServer(t, stall)
+		ev := readEvents(s)
+		expectQuiet(t, ev, 4*stall, "idle before END")
+		start := time.Now()
+		peers[0].Write(stripeEnd(1))
+		at := expectErr(t, ev, "stalled", 3*time.Second)
+		if d := at.Sub(start); d < stall-10*time.Millisecond {
+			t.Fatalf("idle time counted toward the gap: failed %s after END, want >= %s", d, stall)
+		}
+	})
+
+	t.Run("laterSequencesDoNotRenew", func(t *testing.T) {
+		const stall = 300 * time.Millisecond
+		s, peers := newServer(t, stall)
+		ev := readEvents(s)
+		start := time.Now()
+		peers[0].Write(stripeFrame(1, "x")) // sequence 0 is now provably missing
+		go func() {
+			for seq := uint32(2); seq < 60; seq++ { // sustained later sequences
+				time.Sleep(30 * time.Millisecond)
+				if _, err := peers[1].Write(stripeFrame(seq, "x")); err != nil {
+					return
+				}
+			}
+		}()
+		at := expectErr(t, ev, "stalled", 3*time.Second)
+		d := at.Sub(start)
+		if d < stall-10*time.Millisecond || d > 2*stall {
+			t.Fatalf("known gap failed after %s; want about %s, not postponed by later arrivals", d, stall)
+		}
+	})
+
+	t.Run("followingGapNotGivenFreshTimeout", func(t *testing.T) {
+		const stall = 400 * time.Millisecond
+		s, peers := newServer(t, stall)
+		ev := readEvents(s)
+		start := time.Now()
+		peers[0].Write(stripeFrame(3, "d")) // 0, 1, 2 missing; gap first observed now
+		time.Sleep(stall * 5 / 8)
+		peers[0].Write(stripeFrame(0, "a"))
+		peers[0].Write(stripeFrame(1, "b")) // gap at 2 was already observable
+		expectData(t, ev, "a")
+		expectData(t, ev, "b")
+		at := expectErr(t, ev, "stalled", 3*time.Second)
+		d := at.Sub(start)
+		if d < stall-10*time.Millisecond || d > stall+stall/4 {
+			t.Fatalf("following gap failed after %s; want about %s from first observation, not a fresh %s", d, stall, stall)
+		}
+	})
+}
+
+// TestStripedReassemblyBudget: retained reassembly memory is bounded; overflow
+// fails the flow loudly and promptly, and every charge is released exactly.
+func TestStripedReassemblyBudget(t *testing.T) {
+	const chunk = 16
+	payload := strings.Repeat("p", chunk)
+
+	newServer := func(t *testing.T, limit int64) (*Conn, []net.Conn) {
+		legs, peers := pipePair(2)
+		s := New(legs, chunk)
+		s.budget.limit = limit // before any I/O
+		drainPeers(peers)
+		t.Cleanup(func() { s.Close(); peers[0].Close(); peers[1].Close() })
+		return s, peers
+	}
+	cost := int64(retainedEntryOverhead + chunk)
+
+	t.Run("gapPlusSustainedLaterChunksOverflows", func(t *testing.T) {
+		s, peers := newServer(t, 5*cost)
+		ev := readEvents(s)
+		go func() {
+			for seq := uint32(1); seq < 200; seq++ { // 0 never arrives
+				if _, err := peers[0].Write(stripeFrame(seq, payload)); err != nil {
+					return
+				}
+			}
+		}()
+		expectErr(t, ev, "reassembly budget", 2*time.Second) // default stall is 20s: this is the budget
+		if peak := atomic.LoadInt64(&s.budget.peak); peak > 5*cost {
+			t.Fatalf("peak retained %d exceeded the %d budget", peak, 5*cost)
+		}
+	})
+
+	t.Run("singleChunkOverBudgetRejectedPromptly", func(t *testing.T) {
+		s, peers := newServer(t, cost-1)
+		ev := readEvents(s)
+		go peers[0].Write(stripeFrame(0, payload))
+		expectErr(t, ev, "reassembly budget", 2*time.Second)
+	})
+
+	t.Run("outOfOrderWithinBudgetReleasesExactly", func(t *testing.T) {
+		s, peers := newServer(t, 8*cost)
+		ev := readEvents(s)
+		for _, seq := range []uint32{3, 2, 1, 0} {
+			peers[0].Write(stripeFrame(seq, payload))
+		}
+		got := ""
+		for len(got) < 4*chunk {
+			select {
+			case e := <-ev:
+				if e.err != nil {
+					t.Fatalf("read: %v", e.err)
+				}
+				got += e.data
+			case <-time.After(3 * time.Second):
+				t.Fatalf("only %d/%d bytes", len(got), 4*chunk)
+			}
+		}
+		if used := atomic.LoadInt64(&s.budget.used); used != 0 {
+			t.Fatalf("retained bytes after full delivery = %d, want 0", used)
+		}
+		if peak := atomic.LoadInt64(&s.budget.peak); peak != 4*cost {
+			t.Fatalf("peak retained = %d, want exactly %d (three waiting chunks plus the arriving one)", peak, 4*cost)
+		}
+	})
+}
+
+// ---- Plan 023: lossless-or-loud non-FEC leg failure ----
+
+var errInjectedLeg = errors.New("injected leg failure")
+
+// faultLeg wraps one raw leg. wfault (per Write frame) and rfault (per Read
+// call) inject failures. endSeen records that this leg has delivered an END frame.
+type faultLeg struct {
+	net.Conn
+	wfault  func(nth int, p []byte) (drop, fail bool)
+	rfault  func(nth int, endSeen bool) bool
+	// gate, when non-nil, holds every Read and Write until it is closed, so a
+	// test can finish configuring a Conn that New already started (stallTimeout
+	// is a plain field) with a happens-before edge to its leg goroutines.
+	gate    chan struct{}
+	mu      sync.Mutex
+	nw, nr  int
+	endSeen bool
+}
+
+func (f *faultLeg) Write(p []byte) (int, error) {
+	if f.gate != nil {
+		<-f.gate
+	}
+	f.mu.Lock()
+	nth := f.nw
+	f.nw++
+	f.mu.Unlock()
+	if f.wfault != nil {
+		drop, fail := f.wfault(nth, p)
+		if fail {
+			f.Conn.Close()
+			return 0, errInjectedLeg
+		}
+		if drop {
+			return len(p), nil // silently lost in flight
+		}
+	}
+	return f.Conn.Write(p)
+}
+
+func (f *faultLeg) Read(p []byte) (int, error) {
+	if f.gate != nil {
+		<-f.gate
+	}
+	f.mu.Lock()
+	nth, endSeen := f.nr, f.endSeen
+	f.nr++
+	f.mu.Unlock()
+	if f.rfault != nil && f.rfault(nth, endSeen) {
+		f.Conn.Close()
+		return 0, errInjectedLeg
+	}
+	n, err := f.Conn.Read(p)
+	if err == nil && isEndFrame(p[:n]) {
+		f.mu.Lock()
+		f.endSeen = true
+		f.mu.Unlock()
+	}
+	return n, err
+}
+
+func isEndFrame(p []byte) bool {
+	return len(p) == headerSize && binary.BigEndian.Uint32(p[4:8]) == endMarkerLen
+}
+
+// stripeWorkers counts live plain-striping worker goroutines (readLeg, writeLeg,
+// rerouteWatchdog) in this process.
+func stripeWorkers() int {
+	buf := make([]byte, 1<<20)
+	st := string(buf[:runtime.Stack(buf, true)])
+	n := 0
+	for _, name := range []string{"(*Conn).readLeg", "(*Conn).writeLeg", "(*Conn).rerouteWatchdog"} {
+		n += strings.Count(st, name)
+	}
+	return n
+}
+
+// TestStripedLegFailureContract: whatever happens to a raw leg, a non-FEC striped
+// flow either delivers the exact ordered payload and a clean EOF, or fails with
+// an explicit non-EOF error whose partial output is an exact prefix. It never
+// reports clean success with missing, duplicated or corrupted bytes. There is no
+// retransmission, so surviving a failure is allowed but not required; cases that
+// deterministically lose data (mustFail) must be loud.
+func TestStripedLegFailureContract(t *testing.T) {
+	const chunk = 512
+	payload := make([]byte, 39*chunk+100) // 40 chunks, the last one short
+	for i := range payload {
+		payload[i] = byte(i % 251) // never 0xFF, so no payload can look like an END header
+	}
+	dropSeq := func(want uint32) func(leg int) func(int, []byte) (bool, bool) {
+		return func(int) func(int, []byte) (bool, bool) {
+			return func(_ int, p []byte) (bool, bool) {
+				return len(p) >= headerSize && !isEndFrame(p) && binary.BigEndian.Uint32(p[0:4]) == want, false
+			}
+		}
+	}
+
+	cases := []struct {
+		name     string
+		send     func(leg int) func(nth int, p []byte) (drop, fail bool)
+		recv     func(leg int) func(nth int, endSeen bool) bool
+		mustFail bool
+	}{
+		{name: "legDeadBeforeData", send: func(leg int) func(int, []byte) (bool, bool) {
+			return func(nth int, _ []byte) (bool, bool) { return false, leg == 0 && nth == 0 }
+		}},
+		{name: "legDiesMidData", send: func(leg int) func(int, []byte) (bool, bool) {
+			return func(nth int, _ []byte) (bool, bool) { return false, leg == 0 && nth == 3 }
+		}},
+		{name: "legDiesAtEnd", send: func(leg int) func(int, []byte) (bool, bool) {
+			return func(_ int, p []byte) (bool, bool) { return false, leg == 0 && isEndFrame(p) }
+		}},
+		{name: "legSilentlyDropsFromMidData", send: func(leg int) func(int, []byte) (bool, bool) {
+			return func(nth int, _ []byte) (bool, bool) { return leg == 0 && nth >= 3, false }
+		}},
+		{name: "readFailsBeforeData", recv: func(leg int) func(int, bool) bool {
+			return func(nth int, _ bool) bool { return leg == 0 && nth == 0 }
+		}},
+		{name: "readFailsMidData", recv: func(leg int) func(int, bool) bool {
+			return func(nth int, _ bool) bool { return leg == 1 && nth == 6 }
+		}},
+		{name: "readFailsAfterEnd", recv: func(leg int) func(int, bool) bool {
+			return func(_ int, endSeen bool) bool { return leg == 0 && endSeen }
+		}},
+		{name: "midChunkLostEverywhere", send: dropSeq(7), mustFail: true},
+		{name: "tailChunkLostEverywhere", send: dropSeq(39), mustFail: true},
+		{name: "endLostEverywhere", send: func(int) func(int, []byte) (bool, bool) {
+			return func(_ int, p []byte) (bool, bool) { return isEndFrame(p), false }
+		}, mustFail: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const nLegs = 3
+			a, b := pipePair(nLegs)
+			baseline := stripeWorkers()
+			gate := make(chan struct{}) // closed once both Conns are configured
+			sl, rl := make([]net.Conn, nLegs), make([]net.Conn, nLegs)
+			for i := 0; i < nLegs; i++ {
+				s, r := &faultLeg{Conn: a[i], gate: gate}, &faultLeg{Conn: b[i], gate: gate}
+				if tc.send != nil {
+					s.wfault = tc.send(i)
+				}
+				if tc.recv != nil {
+					r.rfault = tc.recv(i)
+				}
+				sl[i], rl[i] = s, r
+			}
+			sender, receiver := New(sl, chunk), New(rl, chunk)
+			// Before any I/O: bound both directions well under the test timeout.
+			sender.stallTimeout = 2 * time.Second
+			receiver.stallTimeout = 300 * time.Millisecond
+			close(gate) // leg I/O (and so every reader of stallTimeout) starts only now
+
+			writeErr := make(chan error, 1)
+			go func() {
+				_, err := sender.Write(payload)
+				sender.Close() // flush, END if the write side is still healthy, teardown
+				writeErr <- err
+			}()
+
+			type result struct {
+				got []byte
+				err error
+			}
+			readRes := make(chan result, 1)
+			go func() {
+				got, err := io.ReadAll(receiver)
+				readRes <- result{got, err}
+			}()
+
+			var res result
+			select {
+			case res = <-readRes:
+			case <-time.After(5 * time.Second):
+				sender.Close()
+				receiver.Close()
+				t.Fatal("receiver did not finish (neither exact EOF nor explicit error) within 5s")
+			}
+			receiver.Close()
+
+			switch {
+			case res.err == nil:
+				if tc.mustFail {
+					t.Fatalf("data was lost deterministically but Read reported a clean EOF (%d/%d bytes)", len(res.got), len(payload))
+				}
+				if !bytes.Equal(res.got, payload) {
+					t.Fatalf("clean EOF without the exact payload: got %d bytes, want %d", len(res.got), len(payload))
+				}
+			case errors.Is(res.err, io.EOF):
+				t.Fatalf("Read surfaced io.EOF as an error: %v", res.err)
+			default:
+				if !bytes.HasPrefix(payload, res.got) {
+					t.Fatalf("failed read (%v) returned %d bytes that are not an exact prefix of the payload", res.err, len(res.got))
+				}
+				t.Logf("explicit failure after %d/%d exact bytes: %v", len(res.got), len(payload), res.err)
+			}
+
+			select {
+			case err := <-writeErr:
+				t.Logf("writer result: %v", err) // an error is acceptable; hanging is not
+			case <-time.After(5 * time.Second):
+				t.Fatal("writer did not finish within 5s")
+			}
+
+			// Every reader, writer and watchdog goroutine of both Conns must be gone
+			// once both are closed (polled against a bounded deadline).
+			deadline := time.Now().Add(3 * time.Second)
+			for stripeWorkers() > baseline {
+				if time.Now().After(deadline) {
+					t.Fatalf("striping workers still running after Close: %d, baseline %d", stripeWorkers(), baseline)
+				}
+				runtime.Gosched()
+				time.Sleep(time.Millisecond)
+			}
+		})
 	}
 }

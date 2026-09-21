@@ -249,9 +249,9 @@ type WsMuxTransport struct {
 	admittedSessions int32
 	// rotatePoll is how often a rotation waiting for its replacement re-checks
 	// the registry; 0 = rotatePollEvery. A field so tests need not wait seconds.
-	rotatePoll time.Duration
-	stripedFlows     int32 // in-flight striped flows, bounded by the pool's stream budget
-	plainFlows       int32
+	rotatePoll   time.Duration
+	stripedFlows int32 // in-flight striped flows, bounded by the pool's stream budget
+	plainFlows   int32
 
 	// sessions is a live registry of pool sessions the striped dispatcher (and
 	// the single-leg UDP path) picks legs from. Each entry carries the CDN it

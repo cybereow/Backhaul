@@ -98,7 +98,7 @@ type wsRequestSeen struct{ host, sni, alpn string }
 type tlsFixture struct {
 	addr  string // 127.0.0.1:port
 	port  string
-	sniCh chan string         // SNI of every ClientHello
+	sniCh chan string        // SNI of every ClientHello
 	reqCh chan wsRequestSeen // HTTP Host / SNI / ALPN of every upgrade request
 }
 

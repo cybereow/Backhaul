@@ -118,33 +118,24 @@ func TestStripedLegStall(t *testing.T) {
 	const legs = 3
 	clientLegs, serverLegs := pipePair(legs)
 
+	// Leg 0's peer goes silent instead of being read by a second goroutine:
+	// every raw leg has exactly one reader (the receiving Conn's own readLeg),
+	// so nothing competes with it for bytes. silentLeg simply never consumes,
+	// which is what makes the client's writeLeg(0) block until its deadline -
+	// a leg that accepted the TCP connection and then stopped (no RST, no FIN,
+	// nothing). Legs 1 and 2 are drained normally by the server Conn below.
+	silent := make(chan struct{})
+	serverLegs[0] = &silentLeg{Conn: serverLegs[0], released: silent}
+
 	client := New(clientLegs, 4096)
 	server := New(serverLegs, 4096)
 	client.stallTimeout = 200 * time.Millisecond
 	server.stallTimeout = 200 * time.Millisecond
 	defer client.Close()
 	defer server.Close()
-
-	// Drain legs 1 and 2 normally; leg 0's peer is never read from, so any
-	// write the client's writeLeg(0) attempts blocks until its deadline -
-	// simulating a leg that accepted the TCP connection but then went
-	// silent (no RST, no FIN, nothing).
-	go func() {
-		buf := make([]byte, 4096+headerSize)
-		for {
-			if _, err := io.ReadFull(serverLegs[1], buf); err != nil {
-				return
-			}
-		}
-	}()
-	go func() {
-		buf := make([]byte, 4096+headerSize)
-		for {
-			if _, err := io.ReadFull(serverLegs[2], buf); err != nil {
-				return
-			}
-		}
-	}()
+	// Registered last so it runs first: the Closes above must not wait on a
+	// reader still parked inside silentLeg.Read.
+	defer close(silent)
 
 	readErrCh := make(chan error, 1)
 	go func() {
@@ -183,6 +174,21 @@ func TestStripedLegStall(t *testing.T) {
 	if _, err := client.Write([]byte("more data")); err == nil {
 		t.Fatal("expected client.Write to fail after the connection was torn down")
 	}
+}
+
+// silentLeg is a raw leg whose peer accepted the connection and then went
+// quiet: it never consumes anything, so a write on the other end of the pipe
+// blocks until its deadline. Read parks until the test releases it, which
+// keeps the leg's single reader owned by the Conn under test instead of
+// racing a second goroutine for the same bytes.
+type silentLeg struct {
+	net.Conn
+	released <-chan struct{}
+}
+
+func (l *silentLeg) Read([]byte) (int, error) {
+	<-l.released
+	return 0, io.EOF
 }
 
 // TestReadDoesNotBusySpinWhenEndArrivesEarly is the regression test for the
@@ -922,8 +928,8 @@ var errInjectedLeg = errors.New("injected leg failure")
 // call) inject failures. endSeen records that this leg has delivered an END frame.
 type faultLeg struct {
 	net.Conn
-	wfault  func(nth int, p []byte) (drop, fail bool)
-	rfault  func(nth int, endSeen bool) bool
+	wfault func(nth int, p []byte) (drop, fail bool)
+	rfault func(nth int, endSeen bool) bool
 	// gate, when non-nil, holds every Read and Write until it is closed, so a
 	// test can finish configuring a Conn that New already started (stallTimeout
 	// is a plain field) with a happens-before edge to its leg goroutines.

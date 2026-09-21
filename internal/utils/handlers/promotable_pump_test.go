@@ -364,8 +364,8 @@ func TestPromotablePumpTransitionByteExact(t *testing.T) {
 			// Conservation: the old tunnel carried exactly the frozen prefix, the
 			// new one the rest, and the transition was real.
 			for _, c := range []struct {
-				name     string
-				old, nw  *probeConn
+				name      string
+				old, nw   *probeConn
 				wantTotal int
 			}{{"A->B", A.old, nA, len(up)}, {"B->A", B.old, nB, len(dn)}} {
 				o, n := int(c.old.written.Load()), int(c.nw.written.Load())

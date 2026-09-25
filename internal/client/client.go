@@ -85,12 +85,12 @@ func (c *Client) Start() {
 			ConnPoolSize:   c.config.ConnectionPool,
 			Token:          c.config.Token,
 			Sniffer:        c.config.Sniffer,
-			WebPort:       c.config.WebPort,
-			SnifferLog:    c.config.SnifferLog,
+			WebPort:        c.config.WebPort,
+			SnifferLog:     c.config.SnifferLog,
 			AggressivePool: c.config.AggressivePool,
 			MSS:            c.config.MSS,
-			SO_RCVBUF:     c.config.SO_RCVBUF,
-			SO_SNDBUF:     c.config.SO_SNDBUF,
+			SO_RCVBUF:      c.config.SO_RCVBUF,
+			SO_SNDBUF:      c.config.SO_SNDBUF,
 		}
 		dnsClient := transport.NewDNSClient(c.ctx, dnsConfig, c.logger)
 		go dnsClient.Start()

@@ -88,7 +88,7 @@ func (l *DNSListener) handleDNSRequest(w dns.ResponseWriter, r *dns.Msg) {
 			// Note: l.domain may have multiple parts.
 			domainPartsCount := len(strings.Split(l.domain, "."))
 
-			if len(parts) >= domainPartsCount + 3 { // +3 for data, connID, and empty string at end (due to trailing dot)
+			if len(parts) >= domainPartsCount+3 { // +3 for data, connID, and empty string at end (due to trailing dot)
 				connIDIndex := len(parts) - domainPartsCount - 2
 				dataIndex := connIDIndex - 1
 

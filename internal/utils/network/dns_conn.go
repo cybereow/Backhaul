@@ -150,7 +150,7 @@ func (c *DNSConn) Write(b []byte) (n int, err error) {
 	// Max domain length is 255. Domain is <base32>.<connID>.<domain>
 	// Max label length is 63.
 
-	maxBase32Len := 63 // One label max
+	maxBase32Len := 63                  // One label max
 	maxRawLen := (maxBase32Len * 5) / 8 // approx 39 bytes
 
 	written := 0

@@ -11,6 +11,8 @@ const (
 	WSMUX  TransportType = "wsmux"
 	WSSMUX TransportType = "wssmux"
 	UDP    TransportType = "udp"
+	DNS    TransportType = "dns"
+	DNSMUX TransportType = "dnsmux"
 )
 
 // ServerConfig represents the configuration for the server.
@@ -57,6 +59,8 @@ type ServerConfig struct {
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
 	MaxConnAge           int           `toml:"max_conn_age"` // seconds. Retire a pool connection once it reaches this age, draining the streams still running on it first, so a CDN/LB max-age reset never lands on a connection we are still using. 0 (default) disables rotation - the right value depends on the CDN in front of the server, so it must be set deliberately.
+	DNSDomain            string        `toml:"dns_domain"`
+	DNSServer            string        `toml:"dns_server"`
 }
 
 // ClientConfig represents the configuration for the client.
@@ -94,6 +98,8 @@ type ClientConfig struct {
 	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: see the server option; must match it. Enabled by default; a server that does not confirm backhaul-mux-v1 is a hard error, never a silent fallback to raw. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	TLSVerify            bool          `toml:"tls_verify"` // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
+	DNSDomain            string        `toml:"dns_domain"`
+	DNSServer            string        `toml:"dns_server"`
 }
 
 // Config represents the complete configuration, including both server and client settings.

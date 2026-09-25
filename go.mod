@@ -7,6 +7,7 @@ require (
 	github.com/gobwas/ws v1.4.0
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/libp2p/go-openssl v0.1.0
+	github.com/miekg/dns v1.1.62
 	github.com/refraction-networking/utls v1.8.2
 	github.com/shirou/gopsutil/v4 v4.24.8
 	github.com/sirupsen/logrus v1.9.3
@@ -33,5 +34,9 @@ require (
 	github.com/tklauser/numcpus v0.8.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
+	golang.org/x/mod v0.18.0 // indirect
+	golang.org/x/net v0.49.0 // indirect
+	golang.org/x/sync v0.7.0 // indirect
+	golang.org/x/tools v0.22.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

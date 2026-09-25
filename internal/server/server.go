@@ -64,6 +64,29 @@ func (s *Server) Start() {
 		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)
 		go tcpServer.Start()
 
+	case config.DNS:
+		dnsConfig := &transport.DnsConfig{
+			BindAddr:      s.config.BindAddr,
+			DNSDomain:     s.config.DNSDomain,
+			Nodelay:       s.config.Nodelay,
+			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:     time.Duration(s.config.Heartbeat) * time.Second,
+			Token:         s.config.Token,
+			ChannelSize:   s.config.ChannelSize,
+			Ports:         s.config.Ports,
+			Sniffer:       s.config.Sniffer,
+			WebPort:       s.config.WebPort,
+			SnifferLog:    s.config.SnifferLog,
+			AcceptUDP:     s.config.AcceptUDP,
+			MSS:           s.config.MSS,
+			SO_RCVBUF:     s.config.SO_RCVBUF,
+			SO_SNDBUF:     s.config.SO_SNDBUF,
+			ProxyProtocol: s.config.ProxyProtocol,
+		}
+
+		dnsServer := transport.NewDNSServer(s.ctx, dnsConfig, s.logger)
+		go dnsServer.Start()
+
 	case config.TCPMUX:
 		tcpMuxConfig := &transport.TcpMuxConfig{
 			BindAddr:         s.config.BindAddr,
@@ -155,6 +178,42 @@ func (s *Server) Start() {
 			MaxConnAge:           time.Duration(s.config.MaxConnAge) * time.Second,
 			WSFraming:            s.config.MuxWSFraming,
 			HalfClose:            s.config.MuxHalfClose,
+		}
+
+		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
+		go wsMuxServer.Start()
+
+	case config.DNSMUX:
+		// Re-using WSMuxServer but theoretically we'd construct DnsMuxConfig similar to WsMuxConfig
+		// Let's implement DNSMUX as just WsMuxConfig with DNS transport mode
+		wsMuxConfig := &transport.WsMuxConfig{
+			BindAddr:             s.config.BindAddr,
+			Nodelay:              s.config.Nodelay,
+			KeepAlive:            time.Duration(s.config.Keepalive) * time.Second,
+			Heartbeat:            time.Duration(s.config.Heartbeat) * time.Second,
+			Token:                s.config.Token,
+			ChannelSize:          s.config.ChannelSize,
+			Ports:                s.config.Ports,
+			MuxCon:               s.config.MuxCon,
+			AcceptUDP:            s.config.AcceptUDP,
+			UDPBuffer:            s.config.UDPBuffer,
+			Speedtest:            s.config.Speedtest,
+			MuxVersion:           s.config.MuxVersion,
+			MaxFrameSize:         s.config.MaxFrameSize,
+			MaxReceiveBuffer:     s.config.MaxReceiveBuffer,
+			MaxStreamBuffer:      s.config.MaxStreamBuffer,
+			MuxKeepaliveDisabled: s.config.MuxKeepaliveDisabled,
+			StripeFactor:         s.config.StripeFactor,
+			StripeParity:         s.config.StripeParity,
+			StripePorts:          s.config.StripePorts,
+			PromoteBytes:         s.config.PromoteBytes,
+			SO_RCVBUF:            s.config.SO_RCVBUF,
+			SO_SNDBUF:            s.config.SO_SNDBUF,
+			Sniffer:              s.config.Sniffer,
+			WebPort:              s.config.WebPort,
+			SnifferLog:           s.config.SnifferLog,
+			Mode:                 s.config.Transport,
+			ProxyProtocol:        s.config.ProxyProtocol,
 		}
 
 		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)

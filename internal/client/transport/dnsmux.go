@@ -195,8 +195,10 @@ func (c *DnsMuxTransport) runTunnel() {
 		return
 	}
 	defer session.Close()
-	c.config.TunnelStatus = "Connected (DNSMUX)"
+	// Count first, then publish: a teardown on another tunnel must never see a
+	// transient zero after we have reported Connected.
 	c.live.Add(1)
+	c.config.TunnelStatus = "Connected (DNSMUX)"
 	c.logger.Info("dnsmux: tunnel established")
 	defer func() {
 		// With a pool, only the last live tunnel going away means disconnected.

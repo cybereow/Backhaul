@@ -516,3 +516,39 @@ func TestTunnelLeak(t *testing.T) {
 	cancel()
 	time.Sleep(100 * time.Millisecond)
 }
+
+func TestWriteAfterCloseFails(t *testing.T) {
+	srv := NewServer("tunnel.example.com", "secret", newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: "tunnel.example.com", Key: "secret",
+		Profiles: []sel.Profile{{Resolver: addr, RRType: 16, Transport: "udp", Cap: 700}},
+		Timeout:  2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli.Close()
+	if n, err := cli.Write([]byte("late")); err == nil || n != 0 {
+		t.Fatalf("Write after Close = (%d, %v), want (0, error)", n, err)
+	}
+}
+
+func TestServerCloseStopsListener(t *testing.T) {
+	srv := NewServer("tunnel.example.com", "secret", newTestLogger())
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(context.Background(), "127.0.0.1:0") }()
+	time.Sleep(300 * time.Millisecond) // let the listeners come up
+	srv.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve still running after Close")
+	}
+}

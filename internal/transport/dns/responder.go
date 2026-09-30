@@ -114,8 +114,13 @@ func (r *Responder) handle(w dns.ResponseWriter, req *dns.Msg) {
 
 	// Respect the resolver's advertised UDP buffer; miekg truncates+sets TC if
 	// the message overflows, which is itself a useful signal to the prober.
+	size := 512 // classic UDP limit without EDNS
 	if opt := req.IsEdns0(); opt != nil {
+		size = int(opt.UDPSize())
 		m.SetEdns0(opt.UDPSize(), false)
+	}
+	if !inTCP {
+		m.Truncate(size) // sets TC and drops answers that do not fit; TCP stays intact
 	}
 	if err := w.WriteMsg(m); err != nil {
 		r.logger.Tracef("write reply to %s: %v", w.RemoteAddr(), err)

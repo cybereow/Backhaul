@@ -441,6 +441,13 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 		if c.err != nil {
 			return written, c.err
 		}
+		// Never enqueue on a closed carrier: a FIN may already be on its way and
+		// bytes accepted after it would be reported as written but never sent.
+		select {
+		case <-c.closed:
+			return written, io.ErrClosedPipe
+		default:
+		}
 
 		n := c.ep.Write(b)
 		b = b[n:]

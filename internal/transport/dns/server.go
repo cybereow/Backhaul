@@ -60,6 +60,16 @@ func (s *Server) SetRel(cfg rel.Config) { s.relCfg = cfg }
 
 // Serve runs the DNS listener (UDP+TCP) until ctx ends.
 func (s *Server) Serve(ctx context.Context, addr string) error {
+	// Close must stop the listener too, not only Accept and the GC loop.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-s.done:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
 	return s.responder.Serve(ctx, addr)
 }
 
@@ -116,6 +126,12 @@ func (s *Server) handle(sid uint32, flags byte, in []byte, maxResp int) ([]byte,
 	}
 	now := time.Now()
 	s.responder.logger.Tracef("dns session %08x: flags=%d seq=%d ack=%d wnd=%d data=%d maxResp=%d", sid, flags, pk.Seq, pk.Ack, pk.Wnd, len(pk.Data), maxResp)
+
+	select {
+	case <-s.done:
+		return nil, FlagRST // closed: create nothing new
+	default:
+	}
 
 	s.mu.Lock()
 	ss := s.sessions[sid]

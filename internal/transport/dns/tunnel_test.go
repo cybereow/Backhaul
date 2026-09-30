@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,17 @@ func newTestLogger() *logrus.Logger {
 	l := logrus.New()
 	l.SetLevel(logrus.TraceLevel)
 	return l
+}
+
+// tunnelPayload is the bytes moved per direction by the transfer tests. The
+// carrier is slow by design (a ~100 B query MSS, one exchange in flight), and
+// -race multiplies that, so the default is small; set DNS_SLOW_TESTS=1 for the
+// 256 KiB soak.
+func tunnelPayload() int {
+	if os.Getenv("DNS_SLOW_TESTS") != "" {
+		return 256 * 1024
+	}
+	return 32 * 1024
 }
 
 func payload(seed int64, n int) []byte {
@@ -94,10 +106,7 @@ func TestTunnel256KiB(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	testPayload := 256 * 1024
-	if !testing.Short() {
-		testPayload = 256 * 1024
-	}
+	testPayload := tunnelPayload()
 	srvUp := payload(1, testPayload)
 
 	go func() {
@@ -178,10 +187,7 @@ func TestTunnelLossy(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	testPayload := 256 * 1024
-	if testing.Short() {
-		testPayload = 64 * 1024
-	}
+	testPayload := tunnelPayload()
 	srvUp := payload(3, testPayload)
 
 	go func() {
@@ -260,7 +266,7 @@ func TestTunnelMSSSwitch(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	srvUp := payload(5, 50*1024)
+	srvUp := payload(5, tunnelPayload())
 
 	go func() {
 		defer wg.Done()

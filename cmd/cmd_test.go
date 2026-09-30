@@ -169,3 +169,28 @@ func TestValidateStripeConfigAcceptsAppliedDefaults(t *testing.T) {
 		t.Errorf("normalized client stripe config rejected: %v", err)
 	}
 }
+
+func TestValidateDNSMux(t *testing.T) {
+	srv := &config.Config{Server: config.ServerConfig{Transport: config.DNSMUX}}
+	if validateDNSMux(srv, "server") == nil {
+		t.Error("server without dns_domain accepted")
+	}
+	srv.Server.DNSDomain = "t.example.com"
+	if err := validateDNSMux(srv, "server"); err != nil {
+		t.Errorf("valid server rejected: %v", err)
+	}
+
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
+	if validateDNSMux(cli, "client") == nil {
+		t.Error("client without dns_resolvers accepted")
+	}
+	cli.Client.DNSResolvers = []string{"1.1.1.1"}
+	if err := validateDNSMux(cli, "client"); err != nil {
+		t.Errorf("valid client rejected: %v", err)
+	}
+
+	other := &config.Config{Server: config.ServerConfig{Transport: config.TCP}}
+	if err := validateDNSMux(other, "server"); err != nil {
+		t.Errorf("non-dnsmux transport affected: %v", err)
+	}
+}

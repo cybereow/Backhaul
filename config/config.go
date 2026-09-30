@@ -11,6 +11,7 @@ const (
 	WSMUX  TransportType = "wsmux"
 	WSSMUX TransportType = "wssmux"
 	UDP    TransportType = "udp"
+	DNSMUX TransportType = "dnsmux"
 )
 
 // ServerConfig represents the configuration for the server.
@@ -56,6 +57,9 @@ type ServerConfig struct {
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
+	DNSDomain            string        `toml:"dns_domain"`   // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
+	DNSKey               string        `toml:"dns_key"`      // dnsmux: shared secret for the per-query MAC; falls back to token
+	DNSListen            string        `toml:"dns_listen"`   // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
 	MaxConnAge           int           `toml:"max_conn_age"` // seconds. Retire a pool connection once it reaches this age, draining the streams still running on it first, so a CDN/LB max-age reset never lands on a connection we are still using. 0 (default) disables rotation - the right value depends on the CDN in front of the server, so it must be set deliberately.
 }
 
@@ -93,7 +97,12 @@ type ClientConfig struct {
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: see the server option; must match it. Enabled by default; a server that does not confirm backhaul-mux-v1 is a hard error, never a silent fallback to raw. Ignored by other transports.
 	Path                 string        `toml:"path"`
-	TLSVerify            bool          `toml:"tls_verify"` // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
+	DNSDomain            string        `toml:"dns_domain"`
+	DNSKey               string        `toml:"dns_key"`
+	DNSResolvers         []string      `toml:"dns_resolvers"`    // dnsmux: recursive resolvers to query (never the authoritative server directly)
+	DNSRecordTypes       []string      `toml:"dns_record_types"` // dnsmux: limit the RR types tried (default all); the best one is auto-selected
+	DNSTimeoutMS         int           `toml:"dns_timeout_ms"`   // dnsmux: per-query timeout (default 2000)
+	TLSVerify            bool          `toml:"tls_verify"`       // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
 }
 
 // ProbeConfig configures the DNS reachability/capacity prober (Phase 1 of the

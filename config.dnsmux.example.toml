@@ -1,0 +1,30 @@
+# dnsmux: tunnel over DNS queries through recursive resolvers.
+#
+# Prerequisites: a domain you control with an NS delegation of the tunnel
+# sub-domain (dns_domain) to the SERVER host, UDP+TCP port 53 reachable there
+# and free (on Ubuntu: stop/disable systemd-resolved's stub listener).
+# The CLIENT never contacts the server directly, only the listed resolvers.
+# Throughput is low by design (about 100 bytes per query upstream); this
+# transport is for networks where nothing else gets through.
+
+# ---- server (the box the NS record points to) ----
+[server]
+transport = "dnsmux"
+token = "change-me"            # shared token, same on both sides
+dns_domain = "ttt.example.com" # sub-zone delegated to this host
+dns_listen = "0.0.0.0:53"      # authoritative responder (UDP+TCP)
+# dns_key = ""                 # per-query MAC secret; defaults to token
+ports = ["8080=127.0.0.1:80"]  # local listener = target the CLIENT dials
+log_level = "info"
+
+# ---- client ----
+# [client]
+# transport = "dnsmux"
+# token = "change-me"
+# dns_domain = "ttt.example.com"
+# dns_resolvers = ["178.22.122.100", "185.51.200.2"]  # recursive resolvers to query
+# dns_record_types = []        # empty = try all (TXT, NULL, A, AAAA, CNAME, MX, SRV, PTR); the best is auto-selected
+# dns_timeout_ms = 2000        # per-query timeout
+# connection_pool = 1          # parallel tunnel connections
+# retry_interval = 3
+# log_level = "info"

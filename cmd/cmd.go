@@ -67,6 +67,25 @@ func validateStripeConfig(role string, factor, parity int) error {
 	return nil
 }
 
+// validateDNSMux checks the keys the dnsmux transport cannot run without. It
+// does nothing for any other transport.
+func validateDNSMux(cfg *config.Config, configType string) error {
+	switch {
+	case configType == "server" && cfg.Server.Transport == config.DNSMUX:
+		if cfg.Server.DNSDomain == "" {
+			return fmt.Errorf("server 'dns_domain' is required for the dnsmux transport")
+		}
+	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
+		if cfg.Client.DNSDomain == "" {
+			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")
+		}
+		if len(cfg.Client.DNSResolvers) == 0 {
+			return fmt.Errorf("client 'dns_resolvers' is required for the dnsmux transport (the recursive resolvers to query)")
+		}
+	}
+	return nil
+}
+
 // validateHalfClose rejects mux_half_close on anything that cannot carry it: it
 // is a server-only key, meaningful only on wsmux/wssmux, and its FlowPlainHC
 // flow kind is only read on mux_version >= 2. Call after applyDefaults.
@@ -124,6 +143,9 @@ func Run(configPath string, ctx context.Context) {
 	}
 
 	if err := validateHalfClose(cfg, configType); err != nil {
+		logger.Fatalf("%v", err)
+	}
+	if err := validateDNSMux(cfg, configType); err != nil {
 		logger.Fatalf("%v", err)
 	}
 

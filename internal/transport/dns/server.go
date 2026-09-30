@@ -13,9 +13,12 @@ import (
 )
 
 const (
-	sessionIdle  = 60 * time.Second
-	gcInterval   = 10 * time.Second
-	acceptQueue  = 64
+	sessionIdle = 60 * time.Second
+	gcInterval  = 10 * time.Second
+	acceptQueue = 64
+	// maxSegment is the largest server->client rel segment (data bytes): base32
+	// of it plus a 255-byte question still fits a 1232-byte EDNS response.
+	maxSegment   = 400
 	errClosedStr = "dnsx: server closed"
 )
 
@@ -180,7 +183,14 @@ func (ss *serverSession) exchange(now time.Time, flags byte, pk rel.Packet, maxR
 		ss.remoteFIN = true
 	}
 	// The client picks the RR type per query, so the response budget varies.
+	// The reply echoes the query's QNAME in its question section, so a segment
+	// that fits an empty poll can overflow the client's EDNS size when the query
+	// carried data - and a retransmission can never be shrunk, so it would fail
+	// forever. Cap every segment to what fits even beside a maximum-size QNAME.
 	if mss := maxResp - rel.HeaderLen; mss > 0 {
+		if mss > maxSegment {
+			mss = maxSegment
+		}
 		ss.ep.SetMSS(mss)
 	}
 	out := ss.ep.Next(now)

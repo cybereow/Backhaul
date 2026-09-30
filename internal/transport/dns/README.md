@@ -58,3 +58,24 @@ distinguished from `resolver_replied` (reached a resolver, no usable payload bac
 `key` is a shared secret used only to derive a per-query HMAC, so the token never
 appears on the wire and only a matching peer's response is accepted. It must match
 on both sides. It is not (yet) encryption of the payload — that is a later phase.
+
+
+## Carrier and `dnsmux` transport
+
+On top of the prober/responder there is a reliable, ordered byte stream
+(`Dial` / `Server.Accept`, both `net.Conn`) that the `dnsmux` transport wraps in
+smux exactly like `tcpmux`. See `config.dnsmux.example.toml`.
+
+- **Session frame** (inside the existing query/response `Data`): query
+  `sid(4) | flags(1) | rel.Packet`, response `flags(1) | rel.Packet`. Flags:
+  `SYN` (first exchange, creates the session), `FIN` (sender closed its half),
+  `RST` (unknown/expired sid: the client's Read/Write return an error).
+- **Pull model**: the server can only answer queries, so the client polls, fast
+  while data is pending or in flight, backing off to ~500 ms when idle.
+- **Profiles**: the record type is never fixed; `sel` picks resolver, RR type
+  and UDP/TCP from live measurements (`DefaultProfiles` builds the candidates).
+- **Limits**: client->server segments are QNAME-limited (~100 B); server->client
+  segments are capped at 400 B so a reply always fits the EDNS size even beside a
+  maximum-size question (retransmissions cannot be shrunk).
+- Transfer tests default to 32 KiB per direction (the carrier is slow, `-race`
+  slower); `DNS_SLOW_TESTS=1` runs the 256 KiB soak.

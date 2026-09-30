@@ -204,7 +204,7 @@ func (c *clientConn) exchange() {
 	defer cancel()
 
 	t0 := time.Now()
-	respData, _, _, rttMs, stage, err := Exchange(ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, false, respSize, qDataFunc, to)
+	respData, _, _, rttMs, stage, err := Exchange(ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
 
 	now = time.Now()
 	c.mu.Lock()

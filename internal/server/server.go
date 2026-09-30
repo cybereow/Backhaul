@@ -90,6 +90,22 @@ func (s *Server) Start() {
 		tcpMuxServer := transport.NewTcpMuxServer(s.ctx, tcpMuxConfig, s.logger)
 		go tcpMuxServer.Start()
 
+	case config.DNSMUX:
+		dnsMuxConfig := &transport.DNSMuxConfig{
+			TcpMuxConfig: transport.TcpMuxConfig{
+				Token: s.config.Token, ChannelSize: s.config.ChannelSize,
+				Ports: s.config.Ports, MuxCon: s.config.MuxCon,
+				MuxVersion: s.config.MuxVersion, MaxFrameSize: s.config.MaxFrameSize,
+				MaxReceiveBuffer: s.config.MaxReceiveBuffer, MaxStreamBuffer: s.config.MaxStreamBuffer,
+				Heartbeat: time.Duration(s.config.Heartbeat) * time.Second,
+				Sniffer:   s.config.Sniffer, WebPort: s.config.WebPort,
+				SnifferLog: s.config.SnifferLog, ProxyProtocol: s.config.ProxyProtocol,
+			},
+			Domain: s.config.DNSDomain, Key: s.config.DNSKey, Listen: s.config.DNSListen,
+		}
+		dnsMuxServer := transport.NewDNSMuxServer(s.ctx, dnsMuxConfig, s.logger)
+		go dnsMuxServer.Start()
+
 	case config.WS, config.WSS:
 		wsConfig := &transport.WsConfig{
 			BindAddr:      s.config.BindAddr,

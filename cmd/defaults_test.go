@@ -61,6 +61,20 @@ func TestDeriveStreamBuffer(t *testing.T) {
 	}
 }
 
+func TestDNSMuxDefaults(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{Token: "server-token"},
+		Client: config.ClientConfig{Token: "client-token"},
+	}
+	applyDefaults(cfg)
+	if cfg.Server.DNSListen != "0.0.0.0:53" || cfg.Server.DNSKey != "server-token" {
+		t.Fatalf("server DNS defaults = listen %q key %q", cfg.Server.DNSListen, cfg.Server.DNSKey)
+	}
+	if cfg.Client.DNSKey != "client-token" || cfg.Client.DNSTimeoutMS != 2000 {
+		t.Fatalf("client DNS defaults = key %q timeout %d", cfg.Client.DNSKey, cfg.Client.DNSTimeoutMS)
+	}
+}
+
 func TestApplyDefaultsStripe(t *testing.T) {
 	tests := []struct {
 		name          string

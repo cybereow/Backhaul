@@ -133,7 +133,7 @@ func (c *clientConn) loop() {
 			c.mu.Unlock()
 
 			if recent || pending > 0 || inflight > 0 || peerWnd == 0 {
-				timer.Reset(1 * time.Microsecond)
+				timer.Reset(pollFast)
 			} else {
 				timer.Reset(pollIdle)
 			}

@@ -1,7 +1,17 @@
 # DNS transport — Phase 1: reachability & capacity prober
 
-This is **not the tunnel yet**. It is a standalone diagnostic that answers the one
-question the whole DNS-transport design rests on:
+## Backhaul `dnsmux` transport
+
+Set `transport = "dnsmux"` to run ordinary smux port forwarding over the
+reliable DNS `net.Conn`. The authoritative side requires `dns_domain` and uses
+`dns_listen` (default `0.0.0.0:53`); the outside client requires the same domain
+and one or more explicit `dns_resolvers`. An omitted `dns_record_types` enables
+every built-in codec over both UDP and TCP. `dns_key` authenticates the carrier
+and falls back to the normal `token`; the token handshake still runs inside the
+tunnel. See `config.dnsmux.example.toml` for a complete example.
+
+The `-probe` mode described below is a standalone diagnostic that answers the
+question the DNS transport rests on:
 
 > Does a query actually reach the inside responder, **and** does a response
 > carrying real bytes come back — through a recursive resolver, in *your* network?

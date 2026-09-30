@@ -32,11 +32,25 @@ const ( // Default values
 	defaultMuxCon      = 8
 	defaultMuxStripe   = 1    // 1 disables striping - one flow, one connection
 	defaultUDPBuffer   = 2048 // datagrams queued per UDP flow before dropping (wsmux/wssmux)
+	defaultDNSListen   = "0.0.0.0:53"
+	defaultDNSTimeout  = 2000
 )
 
 func applyDefaults(cfg *config.Config) {
 	// Token is intentionally not defaulted - see cmd.Run, which requires the
 	// active side to configure one explicitly.
+	if cfg.Server.DNSListen == "" {
+		cfg.Server.DNSListen = defaultDNSListen
+	}
+	if cfg.Server.DNSKey == "" {
+		cfg.Server.DNSKey = cfg.Server.Token
+	}
+	if cfg.Client.DNSKey == "" {
+		cfg.Client.DNSKey = cfg.Client.Token
+	}
+	if cfg.Client.DNSTimeoutMS <= 0 {
+		cfg.Client.DNSTimeoutMS = defaultDNSTimeout
+	}
 
 	// Nodelay default is false if not valid value found
 

@@ -6,6 +6,7 @@ type TransportType string
 const (
 	TCP    TransportType = "tcp"
 	TCPMUX TransportType = "tcpmux"
+	DNSMUX TransportType = "dnsmux"
 	WS     TransportType = "ws"
 	WSS    TransportType = "wss"
 	WSMUX  TransportType = "wsmux"
@@ -18,6 +19,9 @@ type ServerConfig struct {
 	BindAddr             string        `toml:"bind_addr"`
 	Transport            TransportType `toml:"transport"`
 	Token                string        `toml:"token"`
+	DNSDomain            string        `toml:"dns_domain"`
+	DNSKey               string        `toml:"dns_key"`
+	DNSListen            string        `toml:"dns_listen"`
 	Nodelay              bool          `toml:"nodelay"`
 	Keepalive            int           `toml:"keepalive_period"`
 	ChannelSize          int           `toml:"channel_size"`
@@ -66,6 +70,11 @@ type ClientConfig struct {
 	EdgeIPs              []string      `toml:"edge_ips"`     // optional: edge IP to dial per remote_addrs entry (aligned by index); empty entries dial the domain directly.
 	Transport            TransportType `toml:"transport"`
 	Token                string        `toml:"token"`
+	DNSDomain            string        `toml:"dns_domain"`
+	DNSKey               string        `toml:"dns_key"`
+	DNSResolvers         []string      `toml:"dns_resolvers"`
+	DNSRecordTypes       []string      `toml:"dns_record_types"`
+	DNSTimeoutMS         int           `toml:"dns_timeout_ms"`
 	ConnectionPool       int           `toml:"connection_pool"`
 	RetryInterval        int           `toml:"retry_interval"`
 	Nodelay              bool          `toml:"nodelay"`

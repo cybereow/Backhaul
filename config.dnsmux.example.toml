@@ -1,0 +1,28 @@
+# DNSMUX carries smux sessions in authenticated DNS queries and answers.
+# Use one role per process; split these sections into separate config files.
+[server]
+transport = "dnsmux"
+token = "replace-with-a-long-random-auth-token"
+dns_domain = "tunnel.example.com"
+# Optional; falls back to token when omitted.
+dns_key = "replace-with-a-distinct-dns-carrier-key"
+# UDP and TCP; port 53 normally needs root or CAP_NET_BIND_SERVICE.
+dns_listen = "0.0.0.0:53"
+ports = ["8080=127.0.0.1:80"]
+mux_version = 1
+mux_framesize = 1024
+
+[client]
+transport = "dnsmux"
+token = "replace-with-a-long-random-auth-token"
+dns_domain = "tunnel.example.com"
+dns_key = "replace-with-a-distinct-dns-carrier-key"
+# Explicit recursive resolvers are required.
+dns_resolvers = ["1.1.1.1:53", "8.8.8.8:53"]
+# Optional; omission enables every codec over both UDP and TCP.
+dns_record_types = ["TXT", "NULL", "A", "AAAA", "CNAME", "MX", "SRV", "PTR"]
+dns_timeout_ms = 2000
+connection_pool = 2
+retry_interval = 3
+mux_version = 1
+mux_framesize = 1024

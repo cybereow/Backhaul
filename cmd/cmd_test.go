@@ -45,6 +45,32 @@ func TestDetectConfigType(t *testing.T) {
 	}
 }
 
+func TestValidateDNSConfig(t *testing.T) {
+	tests := []struct {
+		name string
+		kind string
+		cfg  config.Config
+		want string
+	}{
+		{name: "server valid", kind: "server", cfg: config.Config{Server: config.ServerConfig{Transport: config.DNSMUX, DNSDomain: "t.example", DNSListen: "127.0.0.1:53"}}},
+		{name: "server domain required", kind: "server", cfg: config.Config{Server: config.ServerConfig{Transport: config.DNSMUX, DNSListen: "127.0.0.1:53"}}, want: "dns_domain"},
+		{name: "client valid defaults all records", kind: "client", cfg: config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example", DNSResolvers: []string{"127.0.0.1:53"}}}},
+		{name: "client resolvers required", kind: "client", cfg: config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example"}}, want: "dns_resolvers"},
+		{name: "client record type rejected", kind: "client", cfg: config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example", DNSResolvers: []string{"127.0.0.1:53"}, DNSRecordTypes: []string{"bogus"}}}, want: "unsupported"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDNSConfig(&tc.cfg, tc.kind)
+			if tc.want == "" && err != nil {
+				t.Fatalf("validateDNSConfig: %v", err)
+			}
+			if tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("validateDNSConfig error = %v, want substring %q", err, tc.want)
+			}
+		})
+	}
+}
+
 // TestLoadConfigTLSVerify verifies the secure-by-default behaviour of the
 // TOML loader: omitting tls_verify must produce true (secure default),
 // explicit true stays true, explicit false stays false. The metadata key is

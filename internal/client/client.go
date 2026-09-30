@@ -10,6 +10,7 @@ import (
 	"github.com/musix/backhaul/config"
 
 	"github.com/musix/backhaul/internal/client/transport"
+	dnsx "github.com/musix/backhaul/internal/transport/dns"
 
 	"net/http"
 	_ "net/http/pprof"
@@ -97,6 +98,30 @@ func (c *Client) Start() {
 		}
 		tcpMuxClient := transport.NewMuxClient(c.ctx, tcpMuxConfig, c.logger)
 		go tcpMuxClient.Start()
+
+	case config.DNSMUX:
+		dnsMuxConfig := &transport.DNSMuxConfig{
+			TcpMuxConfig: transport.TcpMuxConfig{
+				RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
+				DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,
+				ConnPoolSize:     c.config.ConnectionPool,
+				Token:            c.config.Token,
+				MuxVersion:       c.config.MuxVersion,
+				MaxFrameSize:     c.config.MaxFrameSize,
+				MaxReceiveBuffer: c.config.MaxReceiveBuffer,
+				MaxStreamBuffer:  c.config.MaxStreamBuffer,
+				Sniffer:          c.config.Sniffer,
+				WebPort:          c.config.WebPort,
+				SnifferLog:       c.config.SnifferLog,
+				KeepAlive:        time.Duration(c.config.Keepalive) * time.Second,
+			},
+			Domain:   c.config.DNSDomain,
+			Key:      c.config.DNSKey,
+			Profiles: dnsx.DefaultProfiles(c.config.DNSResolvers, c.config.DNSRecordTypes),
+			Timeout:  time.Duration(c.config.DNSTimeoutMS) * time.Millisecond,
+		}
+		dnsMuxClient := transport.NewDNSMuxClient(c.ctx, dnsMuxConfig, c.logger)
+		go dnsMuxClient.Start()
 
 	case config.WS, config.WSS:
 		WsConfig := &transport.WsConfig{

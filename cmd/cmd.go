@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/client"
@@ -23,6 +24,10 @@ var (
 // still valid.
 func detectConfigType(cfg *config.Config) string {
 	switch {
+	case cfg.Server.Transport == config.DNSMUX:
+		return "server"
+	case cfg.Client.Transport == config.DNSMUX:
+		return "client"
 	case cfg.Server.BindAddr != "":
 		return "server"
 	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
@@ -30,6 +35,41 @@ func detectConfigType(cfg *config.Config) string {
 	default:
 		return ""
 	}
+}
+
+func validateDNSConfig(cfg *config.Config, configType string) error {
+	validRecordTypes := map[string]bool{
+		"TXT": true, "NULL": true, "A": true, "AAAA": true,
+		"CNAME": true, "MX": true, "SRV": true, "PTR": true,
+	}
+	switch configType {
+	case "server":
+		if cfg.Server.Transport != config.DNSMUX {
+			return nil
+		}
+		if cfg.Server.DNSDomain == "" {
+			return fmt.Errorf("server 'dns_domain' is required for dnsmux")
+		}
+		if cfg.Server.DNSListen == "" {
+			return fmt.Errorf("server 'dns_listen' is required for dnsmux")
+		}
+	case "client":
+		if cfg.Client.Transport != config.DNSMUX {
+			return nil
+		}
+		if cfg.Client.DNSDomain == "" {
+			return fmt.Errorf("client 'dns_domain' is required for dnsmux")
+		}
+		if len(cfg.Client.DNSResolvers) == 0 {
+			return fmt.Errorf("client 'dns_resolvers' is required for dnsmux")
+		}
+		for _, recordType := range cfg.Client.DNSRecordTypes {
+			if !validRecordTypes[strings.ToUpper(strings.TrimSpace(recordType))] {
+				return fmt.Errorf("client 'dns_record_types' contains unsupported type %q", recordType)
+			}
+		}
+	}
+	return nil
 }
 
 // maxStripeTotal is the largest number of legs one striped flow may have. The
@@ -124,6 +164,9 @@ func Run(configPath string, ctx context.Context) {
 	}
 
 	if err := validateHalfClose(cfg, configType); err != nil {
+		logger.Fatalf("%v", err)
+	}
+	if err := validateDNSConfig(cfg, configType); err != nil {
 		logger.Fatalf("%v", err)
 	}
 

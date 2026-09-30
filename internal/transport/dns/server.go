@@ -51,6 +51,10 @@ func NewServer(domain, key string, logger *logrus.Logger) *Server {
 	return s
 }
 
+// SetRelConfig overrides reliability timings for subsequently accepted
+// sessions. Zero fields retain rel's defaults.
+func (s *Server) SetRelConfig(cfg rel.Config) { s.relCfg = cfg }
+
 // Serve runs the DNS listener (UDP+TCP) until ctx ends.
 func (s *Server) Serve(ctx context.Context, addr string) error {
 	return s.responder.Serve(ctx, addr)

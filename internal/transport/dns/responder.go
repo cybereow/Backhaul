@@ -2,6 +2,7 @@ package dnsx
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"strings"
@@ -37,6 +38,10 @@ type Responder struct {
 	domain string
 	key    []byte
 	logger *logrus.Logger
+
+	// Handler is an optional hook for the tunnel session.
+	// If nil, the responder echoes patternBytes (diagnostic mode).
+	Handler func(sid uint32, flags byte, in []byte, maxResp int) (out []byte, outFlags byte)
 }
 
 func NewResponder(domain, key string, logger *logrus.Logger) *Responder {
@@ -149,11 +154,29 @@ func (r *Responder) answer(q dns.Question, inTCP bool) ([]dns.RR, error) {
 		respLen = 0
 	}
 
+	var respData []byte
+	if r.Handler != nil && len(qy.Data) >= sessionFrame {
+		sid := binary.BigEndian.Uint32(qy.Data[0:])
+		flags := qy.Data[4]
+
+		maxResp := respLen - 1 // reserve 1 byte for flags
+		if maxResp < 0 {
+			maxResp = 0
+		}
+
+		out, outFlags := r.Handler(sid, flags, qy.Data[sessionFrame:], maxResp)
+		respData = make([]byte, 1+len(out))
+		respData[0] = outFlags
+		copy(respData[1:], out)
+	} else {
+		respData = patternBytes(qy.Nonce, respLen)
+	}
+
 	resp := response{
 		Nonce: qy.Nonce,
 		QSeen: uint16(len(qy.Data)),
 		InTCP: inTCP,
-		Data:  patternBytes(qy.Nonce, respLen),
+		Data:  respData,
 	}
 	return c.answer(q.Name, resp.marshal(r.key))
 }

@@ -133,6 +133,14 @@ func New(cfg Config) *Endpoint {
 	}
 }
 
+// SetMSS changes the max data bytes per segment. Affects only newly cut segments;
+// in-flight segments keep their size.
+func (e *Endpoint) SetMSS(n int) {
+	if n > 0 {
+		e.cfg.MSS = n
+	}
+}
+
 // after reports a > b in modular uint32 sequence space.
 func after(a, b uint32) bool { return int32(a-b) > 0 }
 
@@ -159,6 +167,11 @@ func (e *Endpoint) Read(p []byte) int {
 // Pending is the bytes written but not yet acked by the peer.
 func (e *Endpoint) Pending() int {
 	return len(e.sndBuf) + e.inflightBytes()
+}
+
+// PeerWnd returns the peer's last advertised receive window.
+func (e *Endpoint) PeerWnd() int {
+	return e.peerWnd
 }
 
 func (e *Endpoint) inflightBytes() int {

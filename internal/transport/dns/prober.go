@@ -302,68 +302,26 @@ func percentiles(rtts []int64) (min, p50, p90 int64) {
 
 func (p *Prober) probe(ctx context.Context, resolver string, rrType uint16, transport string, edns bool, respSize int) attempt {
 	res := attempt{stage: StageUnknown}
-
-	nonce := randNonce()
 	qLen := p.effectiveQLen()
 
-	q := query{
-		RRType:  rrType,
-		RespLen: uint16(respSize),
-		Nonce:   nonce,
-		Data:    patternBytes(nonce^querySalt, qLen),
+	var reqNonce uint64
+	qDataFunc := func(nonce uint64) []byte {
+		reqNonce = nonce
+		return patternBytes(nonce^querySalt, qLen)
 	}
-	name := encodeName(q.marshal(p.key))
-	if name != "" {
-		name += "."
-	}
-	name += p.domain
 
-	msg := new(dns.Msg)
-	msg.SetQuestion(name, rrType)
-	msg.RecursionDesired = true
-	client := &dns.Client{Net: transport, Timeout: p.timeout}
-	if edns {
-		msg.SetEdns0(1232, false)
-		client.UDPSize = 1232 // size the read buffer too, or a large UDP answer is dropped
-	}
-	reply, rtt, err := client.ExchangeContext(ctx, msg, resolver)
-	res.rttMs = rtt.Milliseconds()
+	respData, qSeen, insideTCP, rttMs, stage, err := Exchange(ctx, p.domain, p.key, resolver, rrType, transport, edns, respSize, qDataFunc, p.timeout)
+	res.rttMs = rttMs
+	res.stage = stage
 	if err != nil {
-		res.stage = StageUnknown
 		res.err = err.Error()
 		return res
 	}
 
-	// Got a DNS reply of some kind → the resolver is reachable and accepted the
-	// query. Whether it reached our responder is a separate question.
-	res.stage = StageResolver
-	if reply.Rcode != dns.RcodeSuccess {
-		res.err = fmt.Sprintf("rcode=%s", dns.RcodeToString[reply.Rcode])
-		return res
-	}
-
-	c := codecByType(p.domain, rrType)
-	blob, err := c.extract(name, reply.Answer)
-	if err != nil {
-		res.err = "no usable answer payload: " + err.Error()
-		return res
-	}
-	resp, err := parseResponse(p.key, blob)
-	if err != nil || resp.Nonce != nonce {
-		res.stage = StageBadPeer
-		if err != nil {
-			res.err = err.Error()
-		} else {
-			res.err = "nonce mismatch (cached or foreign answer)"
-		}
-		return res
-	}
-
-	res.stage = StageOK
-	res.qBytes = int(resp.QSeen)
-	res.insideTCP = resp.InTCP
-	want := patternBytes(nonce, len(resp.Data))
-	res.respBytes = matchingPrefix(resp.Data, want)
+	res.qBytes = int(qSeen)
+	res.insideTCP = insideTCP
+	want := patternBytes(reqNonce, len(respData))
+	res.respBytes = matchingPrefix(respData, want)
 	if res.respBytes != len(want) {
 		res.err = fmt.Sprintf("response corrupted after %d/%d bytes", res.respBytes, len(want))
 	}
@@ -376,4 +334,61 @@ func matchingPrefix(a, b []byte) int {
 		n++
 	}
 	return n
+}
+
+// Exchange attempts a single query and response through the given resolver.
+func Exchange(ctx context.Context, domain string, key []byte, resolver string, rrType uint16, transport string, edns bool, respSize int, qDataFunc func(uint64) []byte, timeout time.Duration) (respData []byte, qSeen uint16, insideTCP bool, rttMs int64, stage Stage, err error) {
+	nonce := randNonce()
+
+	q := query{
+		RRType:  rrType,
+		RespLen: uint16(respSize),
+		Nonce:   nonce,
+		Data:    qDataFunc(nonce),
+	}
+
+	name := encodeName(q.marshal(key))
+	if name != "" {
+		name += "."
+	}
+	name += dns.Fqdn(domain)
+
+	msg := new(dns.Msg)
+	msg.SetQuestion(name, rrType)
+	msg.RecursionDesired = true
+	client := &dns.Client{Net: transport, Timeout: timeout}
+	if edns {
+		msg.SetEdns0(1232, false)
+		client.UDPSize = 1232
+	}
+	reply, rtt, netErr := client.ExchangeContext(ctx, msg, resolver)
+	rttMs = rtt.Milliseconds()
+	if netErr != nil {
+		return nil, 0, false, rttMs, StageUnknown, netErr
+	}
+
+	if reply.Rcode != dns.RcodeSuccess {
+		return nil, 0, false, rttMs, StageResolver, fmt.Errorf("rcode=%s", dns.RcodeToString[reply.Rcode])
+	}
+
+	c := codecByType(domain, rrType)
+	if c == nil {
+		return nil, 0, false, rttMs, StageResolver, fmt.Errorf("no codec for type %s", dns.TypeToString[rrType])
+	}
+
+	blob, extErr := c.extract(name, reply.Answer)
+	if extErr != nil {
+		return nil, 0, false, rttMs, StageResolver, fmt.Errorf("no usable answer payload: %w", extErr)
+	}
+
+	resp, prsErr := parseResponse(key, blob)
+	if prsErr != nil || resp.Nonce != nonce {
+		errMsg := "nonce mismatch (cached or foreign answer)"
+		if prsErr != nil {
+			errMsg = prsErr.Error()
+		}
+		return nil, 0, false, rttMs, StageBadPeer, fmt.Errorf("%s", errMsg)
+	}
+
+	return resp.Data, resp.QSeen, resp.InTCP, rttMs, StageOK, nil
 }

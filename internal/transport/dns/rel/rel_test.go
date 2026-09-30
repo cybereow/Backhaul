@@ -193,6 +193,27 @@ func check(t *testing.T, name string, r result, up, down []byte, cli, srv *Endpo
 
 // --- tests ------------------------------------------------------------------
 
+func TestSetMSS(t *testing.T) {
+	e := New(Config{MSS: 100})
+	e.Write(make([]byte, 300))
+
+	// First packet should be capped at original MSS 100
+	p1 := e.Next(time.Now())
+	if len(p1.Data) != 100 {
+		t.Fatalf("expected 100 bytes, got %d", len(p1.Data))
+	}
+
+	// Let the peer ack the first segment so it has window room
+	e.Recv(time.Now(), Packet{Wnd: 1000, Ack: e.sndNxt})
+
+	// Changing MSS to 50 should affect new packets
+	e.SetMSS(50)
+	p2 := e.Next(time.Now())
+	if len(p2.Data) != 50 {
+		t.Fatalf("expected 50 bytes, got %d", len(p2.Data))
+	}
+}
+
 func TestPacketRoundTrip(t *testing.T) {
 	in := Packet{Seq: 0xfffffff0, Ack: 7, Wnd: 1234, Data: []byte("hello")}
 	out, err := Unmarshal(in.Marshal())

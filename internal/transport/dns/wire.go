@@ -25,6 +25,11 @@ const (
 	macLen    = 16 // truncated HMAC-SHA256
 
 	maxLabel = 63 // RFC 1035 label octet limit
+
+	sessionFrame = 5 // 4 bytes sid + 1 byte flags
+	FlagFIN      = 1 << 0
+	FlagRST      = 1 << 1
+	FlagSYN      = 1 << 2 // first exchange(s) of a session, until the first reply arrives
 )
 
 var (

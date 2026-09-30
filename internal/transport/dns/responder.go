@@ -201,7 +201,7 @@ func (r *Responder) answer(q dns.Question, inTCP bool, udpSz int) ([]dns.RR, err
 	}
 
 	var respData []byte
-	if r.Handler != nil && len(qy.Data) >= sessionFrame {
+	if r.Handler != nil && len(qy.Data) >= sessionFrame && qy.Data[4]&FlagProbe == 0 {
 		sid := binary.BigEndian.Uint32(qy.Data[0:])
 		flags := qy.Data[4]
 

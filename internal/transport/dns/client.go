@@ -36,6 +36,8 @@ type DialParams struct {
 	// workers raise throughput roughly linearly until the resolvers push back;
 	// extra workers only run while there is data to move.
 	Workers int
+	// NoAutotune skips the capacity measurement of the best profiles (tests).
+	NoAutotune bool
 	// NoHedge turns off hedging: an exchange that has not answered after a few
 	// typical round trips otherwise starts one extra exchange (up to Workers
 	// extra in flight) so a resolver that occasionally stalls ~2s does not stall
@@ -112,7 +114,12 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 		c.mu.Unlock()
 	}()
 
+	c.allProfiles = p.Profiles
+	c.baseMSS = mss
 	c.warmup(p.Profiles)
+	if !p.NoAutotune {
+		c.autotune(c.ctx, p.Sel, maxQ)
+	}
 	c.exchange()
 	if c.err != nil {
 		c.cancel()
@@ -132,9 +139,10 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 }
 
 const (
-	warmSamples     = 4  // samples per profile before first use (>= sel MinWeight, == FailStreak)
-	warmConcurrency = 48 // profiles probed in parallel (spread over resolvers, see interleave)
-	warmFailStop    = 2  // consecutive failures after which the rest count as failed without waiting
+	warmSamples     = 4   // samples per profile before first use (>= sel MinWeight, == FailStreak)
+	warmConcurrency = 48  // profiles probed in parallel (spread over resolvers, see interleave)
+	livenessReply   = 100 // reply bytes requested by warm-up probes
+	warmFailStop    = 2   // consecutive failures after which the rest count as failed without waiting
 )
 
 // warmup measures every profile in parallel with throwaway probe queries (1 byte
@@ -152,7 +160,10 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 		go func(p sel.Profile) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			respSize := carrierRespSize(p.Cap)
+			// Liveness only: a small reply. What the profile really carries is measured
+			// afterwards by autotune; asking for the nominal maximum here would declare
+			// a path dead that simply cannot carry big replies.
+			respSize := livenessReply
 			fails := 0
 			for i := 0; i < warmSamples; i++ {
 				if c.ctx.Err() != nil {
@@ -261,10 +272,13 @@ type clientConn struct {
 	logf        func(string, ...any)
 	stats       map[sel.Profile]*profStat
 	pool        *connPool
-	hedge       bool          // hedging enabled
-	maxHedge    int32         // cap on extra in-flight exchanges
-	hedges      atomic.Int32  // extra exchanges currently in flight
-	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
+	allProfiles []sel.Profile        // every candidate profile (autotune ranks these)
+	caps        map[profKey]profCaps // measured per-profile capacities (nil: use nominal)
+	baseMSS     int                  // client segment size for profiles without measured caps
+	hedge       bool                 // hedging enabled
+	maxHedge    int32                // cap on extra in-flight exchanges
+	hedges      atomic.Int32         // extra exchanges currently in flight
+	srtt        time.Duration        // smoothed RTT of answered exchanges (capped), sets the hedge delay
 	nextLog     time.Time
 	lastOK      time.Time // last successful exchange (outage detection)
 	outage      time.Duration
@@ -317,6 +331,13 @@ func (c *clientConn) exchange() {
 	prof := c.mgr.Pick(now)
 
 	respSize := carrierRespSize(prof.Cap)
+	segMSS := c.baseMSS
+	if pc, ok := c.caps[keyOf(prof)]; ok {
+		// What this path was measured to carry: cut the upstream segment to its
+		// query size and ask for the reply size it carried intact.
+		respSize, segMSS = pc.down, pc.upMSS()
+	}
+	c.ep.SetMSS(segMSS)
 
 	pk := c.ep.Next(now)
 	isFIN := false // we'll set this if the connection is closed and we have no more pending data

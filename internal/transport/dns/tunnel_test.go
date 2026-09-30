@@ -213,7 +213,7 @@ func TestTunnelLossy(t *testing.T) {
 		Domain:   domain,
 		Key:      key,
 		Profiles: profiles,
-		Timeout:  5 * time.Second,
+		Timeout:  600 * time.Millisecond, // a lost query must not park the only worker for long
 		Rel:      rel.Config{MinRTO: 20 * time.Millisecond, MaxRTO: 1 * time.Second},
 	})
 	if err != nil {
@@ -724,7 +724,7 @@ func TestDataBlackholeEndsTheCarrier(t *testing.T) {
 	defer ds.Shutdown()
 
 	cli, err := Dial(context.Background(), DialParams{
-		Domain: domain, Key: key, Timeout: 400 * time.Millisecond, OutageLimit: 3 * time.Second,
+		Domain: domain, Key: key, Timeout: 400 * time.Millisecond, OutageLimit: 3 * time.Second, NoAutotune: true,
 		Profiles: []sel.Profile{{Resolver: pc.LocalAddr().String(), RRType: 16, Transport: "udp", Cap: 700}},
 	})
 	if err != nil {
@@ -746,4 +746,87 @@ func TestDataBlackholeEndsTheCarrier(t *testing.T) {
 	case <-time.After(20 * time.Second):
 		t.Fatal("carrier still alive although data never gets through")
 	}
+}
+
+// The path is never assumed: a resolver that drops long names and big replies is
+// measured, and the tunnel adapts its segment and reply sizes to it instead of
+// stalling forever on the defaults.
+func TestAutotuneAdaptsToAConstrainedPath(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limited := &sizeLimitConn{PacketConn: pc, maxReply: 420}
+	ds := &dns.Server{PacketConn: limited, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) == 1 && len(req.Question[0].Name) > 110 { // long (data-bearing) QNAMEs are dropped
+			return
+		}
+		srv.responder.handle(w, req)
+	})}
+	go func() { _ = ds.ActivateAndServe() }()
+	defer ds.Shutdown()
+
+	go func() {
+		conn, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Timeout: 500 * time.Millisecond,
+		Profiles: []sel.Profile{{Resolver: pc.LocalAddr().String(), RRType: 16, Transport: "udp", Cap: 700}},
+		Rel:      rel.Config{MinRTO: 200 * time.Millisecond, MaxRTO: time.Second},
+		Logf:     t.Logf,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	caps := cli.(*clientConn).caps
+	if len(caps) != 1 {
+		t.Fatalf("no capacities measured: %v", caps)
+	}
+	for _, pcaps := range caps {
+		if pcaps.up >= maxQueryData(dns.Fqdn(domain)) {
+			t.Errorf("upstream cap %d not below the full query size: the long names were dropped", pcaps.up)
+		}
+		if pcaps.down > 420 {
+			t.Errorf("downstream cap %d above what the path passes (420)", pcaps.down)
+		}
+	}
+
+	data := payload(21, 3*1024)
+	go func() { _, _ = cli.Write(data) }()
+	got := make([]byte, len(data))
+	done := make(chan error, 1)
+	go func() { _, err := io.ReadFull(cli, got); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil || !bytes.Equal(got, data) {
+			t.Fatalf("echo failed: %v", err)
+		}
+	case <-time.After(40 * time.Second):
+		t.Fatal("transfer stalled on the constrained path: sizes were not adapted")
+	}
+}
+
+// sizeLimitConn drops replies larger than maxReply bytes (a path that cannot
+// carry big DNS messages).
+type sizeLimitConn struct {
+	net.PacketConn
+	maxReply int
+}
+
+func (c *sizeLimitConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if len(p) > c.maxReply {
+		return len(p), nil
+	}
+	return c.PacketConn.WriteTo(p, addr)
 }

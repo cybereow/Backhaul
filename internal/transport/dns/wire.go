@@ -30,6 +30,7 @@ const (
 	FlagFIN      = 1 << 0
 	FlagRST      = 1 << 1
 	FlagSYN      = 1 << 2 // first exchange(s) of a session, until the first reply arrives
+	FlagProbe    = 1 << 7 // capacity probe: answered in diagnostic mode (QSeen + pattern reply), never a session
 )
 
 var (

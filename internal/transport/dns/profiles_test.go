@@ -21,3 +21,15 @@ func TestDefaultProfiles(t *testing.T) {
 		t.Fatalf("got %d profiles, want 4: %v", len(some), some)
 	}
 }
+
+func TestEmptyRecordTypesMeansEveryCodec(t *testing.T) {
+	codes := RecordTypeCodes("t.example.com", nil)
+	if len(codes) != len(registry("t.example.com")) {
+		t.Fatalf("empty list gave %d types, want all %d codecs", len(codes), len(registry("t.example.com")))
+	}
+	o := DiscoverOpts{Domain: "t.example.com"}
+	o.defaults()
+	if len(o.RRTypes) != len(codes) {
+		t.Fatalf("discovery default covers %d types, profiles cover %d", len(o.RRTypes), len(codes))
+	}
+}

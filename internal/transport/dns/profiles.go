@@ -42,13 +42,16 @@ func DefaultProfiles(domain string, resolvers, recordTypes []string) []sel.Profi
 	return out
 }
 
-// RecordTypeCodes maps record type names (empty: TXT, MX, AAAA, A) to their DNS
-// type codes, skipping unknown names.
+// RecordTypeCodes maps record type names (empty: every built-in codec, the same
+// set DefaultProfiles uses) to their DNS type codes, skipping unknown names.
 func RecordTypeCodes(domain string, names []string) []uint16 {
-	if len(names) == 0 {
-		names = []string{"TXT", "MX", "AAAA", "A"}
-	}
 	var out []uint16
+	if len(names) == 0 {
+		for _, c := range registry(domain) {
+			out = append(out, c.qtype())
+		}
+		return out
+	}
 	for _, n := range names {
 		if c := codecByName(domain, strings.TrimSpace(n)); c != nil {
 			out = append(out, c.qtype())

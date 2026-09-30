@@ -702,3 +702,48 @@ func TestReceiveActivityIsAWindow(t *testing.T) {
 		t.Fatal("stale activity still counted")
 	}
 }
+
+// A middlebox that answers the short empty polls but drops the longer
+// data-carrying queries must not keep the tunnel "alive": every poll replies OK,
+// yet no data gets through.
+func TestDataBlackholeEndsTheCarrier(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) == 1 && len(req.Question[0].Name) > 130 { // data-bearing QNAMEs are long
+			return
+		}
+		srv.responder.handle(w, req)
+	})}
+	go func() { _ = ds.ActivateAndServe() }()
+	defer ds.Shutdown()
+
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Timeout: 400 * time.Millisecond, OutageLimit: 3 * time.Second,
+		Profiles: []sel.Profile{{Resolver: pc.LocalAddr().String(), RRType: 16, Transport: "udp", Cap: 700}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	go func() { _, _ = cli.Write(payload(5, 4096)) }()
+	done := make(chan error, 1)
+	go func() {
+		_, err := cli.Read(make([]byte, 1))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read returned without error although no data can get through")
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("carrier still alive although data never gets through")
+	}
+}

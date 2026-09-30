@@ -257,6 +257,7 @@ type clientConn struct {
 	remoteAddr net.Addr
 
 	lastRX      time.Time // when data (or an advancing ACK) last arrived
+	progressAt  time.Time // last time the stream moved (or had nothing to move): outage detection
 	logf        func(string, ...any)
 	stats       map[sel.Profile]*profStat
 	pool        *connPool
@@ -382,6 +383,9 @@ func (c *clientConn) exchange() {
 	c.mu.Lock()
 	if stage == StageOK {
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
+		if !c.established {
+			c.progressAt = now
+		}
 		c.established = true
 		c.lastOK = now
 		// Track typical (not stalled) round trips: cap so a 2s stall cannot push
@@ -417,6 +421,10 @@ func (c *clientConn) exchange() {
 					// activity; the cumulative ACK alone is nonzero forever.
 					if len(p.Data) > 0 || c.ep.Pending() < pendingBefore {
 						c.lastRX = now
+						c.progressAt = now
+					}
+					if c.ep.Pending() == 0 {
+						c.progressAt = now // nothing waiting: idle is healthy
 					}
 					c.notifyAll()
 				}
@@ -432,10 +440,21 @@ func (c *clientConn) exchange() {
 	// Every resolver/profile has been failing for outageLimit: the tunnel is dead
 	// for practical purposes. End it so the owner can reconnect and re-discover
 	// resolvers instead of queueing streams onto it.
-	if stage != StageOK && c.established && now.Sub(c.lastOK) > c.outage && c.err == nil {
-		c.err = fmt.Errorf("dnsx: no resolver answered for %v", c.outage)
-		c.cancel()
-		c.notifyAll()
+	// A valid reply is not enough: a middlebox that answers short empty polls but
+	// drops the longer data-carrying queries keeps every poll "OK" while the data
+	// never gets through. So the stream must also make progress while data waits.
+	if c.established && c.err == nil {
+		dead := stage != StageOK && now.Sub(c.lastOK) > c.outage
+		stuck := c.ep.Pending() > 0 && now.Sub(c.progressAt) > c.outage
+		if dead || stuck {
+			why := "no resolver answered"
+			if !dead {
+				why = "no data got through"
+			}
+			c.err = fmt.Errorf("dnsx: %s for %v", why, c.outage)
+			c.cancel()
+			c.notifyAll()
+		}
 	}
 
 	c.mu.Unlock()
@@ -577,6 +596,9 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 		default:
 		}
 
+		if c.ep.Pending() == 0 {
+			c.progressAt = time.Now() // the stuck clock starts when data starts waiting
+		}
 		n := c.ep.Write(b)
 		b = b[n:]
 		written += n

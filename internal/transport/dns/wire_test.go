@@ -208,3 +208,18 @@ func TestForeignKeyRejected(t *testing.T) {
 		t.Fatalf("wrong key must not complete a round-trip: %+v", results)
 	}
 }
+
+// A requested response size is never shortened by the wire encoding.
+func TestRespLenIsNotFloored(t *testing.T) {
+	key := []byte("k")
+	for _, want := range []uint16{1, 7, 8, 100, 664, 1000} {
+		q := query{RespLen: want, Nonce: 1, Data: []byte("x")}
+		got, err := parseQuery(key, q.marshal(key))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.RespLen < want || got.RespLen >= want+8 {
+			t.Errorf("RespLen %d came back as %d, want [%d,%d)", want, got.RespLen, want, want+8)
+		}
+	}
+}

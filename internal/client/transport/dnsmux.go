@@ -60,6 +60,7 @@ type DnsMuxTransport struct {
 	usageMonitor *web.Usage
 	wg           sync.WaitGroup
 	live         atomic.Int32 // tunnels currently established
+	disc         discoveryShare
 }
 
 func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *logrus.Logger) *DnsMuxTransport {
@@ -165,27 +166,35 @@ func (c *DnsMuxTransport) runTunnel(refresh bool) {
 	resolvers := dnsx.ExpandResolvers(c.config.Resolvers)
 	if dnsx.IsAuto(c.config.Resolvers) || len(c.config.ResolverCIDRs) > 0 {
 		// Discovery: measure every candidate and keep the best few, whatever the
-		// list came from (built-in, configured, or a CIDR sweep).
-		cands := resolvers
-		if len(c.config.ResolverCIDRs) > 0 {
-			extra, err := dnsx.ExpandCIDRs(c.config.ResolverCIDRs, 4096)
-			if err != nil {
-				c.logger.Errorf("dnsmux: dns_resolver_cidrs: %v", err)
-				return
+		// list came from (built-in, configured, or a CIDR sweep). One sweep serves
+		// every tunnel of the pool (see discoveryShare).
+		var err error
+		resolvers, err = c.disc.get(refresh, func(refresh bool) ([]string, error) {
+			cands := resolvers
+			if len(c.config.ResolverCIDRs) > 0 {
+				extra, err := dnsx.ExpandCIDRs(c.config.ResolverCIDRs, 4096)
+				if err != nil {
+					return nil, fmt.Errorf("dns_resolver_cidrs: %w", err)
+				}
+				cands = append(cands, extra...)
 			}
-			cands = append(cands, extra...)
-		}
-		ranked := dnsx.DiscoverResolvers(c.ctx, cands, dnsx.DiscoverOpts{
-			Domain: c.config.Domain, Key: c.config.Key, CachePath: c.config.ResolverCache, Refresh: refresh, Logf: c.logger.Infof,
-			RRTypes: dnsx.RecordTypeCodes(c.config.Domain, c.config.RecordTypes),
+			ranked := dnsx.DiscoverResolvers(c.ctx, cands, dnsx.DiscoverOpts{
+				Domain: c.config.Domain, Key: c.config.Key, CachePath: c.config.ResolverCache, Refresh: refresh, Logf: c.logger.Infof,
+				RRTypes: dnsx.RecordTypeCodes(c.config.Domain, c.config.RecordTypes),
+			})
+			out := make([]string, 0, len(ranked))
+			for _, r := range ranked {
+				out = append(out, r.Resolver)
+			}
+			return out, nil
 		})
-		if len(ranked) == 0 {
-			c.logger.Error("dnsmux: no candidate resolver reached the server; will retry")
+		if err != nil {
+			c.logger.Errorf("dnsmux: %v", err)
 			return
 		}
-		resolvers = resolvers[:0:0]
-		for _, r := range ranked {
-			resolvers = append(resolvers, r.Resolver)
+		if len(resolvers) == 0 {
+			c.logger.Error("dnsmux: no candidate resolver reached the server; will retry")
+			return
 		}
 	}
 	profiles := dnsx.DefaultProfiles(c.config.Domain, resolvers, c.config.RecordTypes)
@@ -278,4 +287,37 @@ func (c *DnsMuxTransport) localDialer(stream *smux.Stream, remoteAddr string) {
 		return
 	}
 	handlers.TCPConnectionHandler(c.ctx, false, stream, local, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+}
+
+// refreshMinAge: a second request to re-run discovery within this long of the
+// last sweep reuses its result, so a pool whose tunnels all fail together does
+// not start one sweep per tunnel.
+const refreshMinAge = 20 * time.Second
+
+// discoveryShare makes all tunnel loops of a transport share one discovery: the
+// sweep is serialized, and loops that arrive while (or shortly after) it ran use
+// its result instead of launching their own throttled-in-isolation sweeps.
+type discoveryShare struct {
+	mu     sync.Mutex
+	result []string
+	at     time.Time
+}
+
+// get returns the shared resolver set, running run when there is none yet, or
+// when refresh is requested and the last sweep is older than refreshMinAge. An
+// empty result is not remembered (the next caller retries).
+func (d *discoveryShare) get(refresh bool, run func(refresh bool) ([]string, error)) ([]string, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.result) > 0 && (!refresh || time.Since(d.at) < refreshMinAge) {
+		return append([]string(nil), d.result...), nil
+	}
+	res, err := run(refresh)
+	if err != nil {
+		return nil, err
+	}
+	if len(res) > 0 {
+		d.result, d.at = res, time.Now()
+	}
+	return append([]string(nil), res...), nil
 }

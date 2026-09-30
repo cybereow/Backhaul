@@ -29,7 +29,7 @@ type ResolverScore struct {
 // DiscoverOpts tunes DiscoverResolvers. Zero values take the defaults noted.
 type DiscoverOpts struct {
 	Domain, Key string
-	RRTypes     []uint16      // record types a resolver may carry (default TXT, MX, AAAA, A): a candidate is kept if ANY works
+	RRTypes     []uint16      // record types a resolver may carry (default: all codecs): a candidate is kept if ANY works
 	Timeout     time.Duration // per probe (1.5s)
 	Conc        int           // DNS probes in flight, counted per probe (64)
 	QPS         int           // DNS probes started per second, counted per probe, so a big candidate list is not a flood (150)
@@ -50,7 +50,7 @@ func (o *DiscoverOpts) defaults() {
 		o.Timeout = 1500 * time.Millisecond
 	}
 	if len(o.RRTypes) == 0 {
-		o.RRTypes = []uint16{dns.TypeTXT, dns.TypeMX, dns.TypeAAAA, dns.TypeA}
+		o.RRTypes = RecordTypeCodes(o.Domain, nil) // all codecs, as DefaultProfiles does
 	}
 	if o.Conc <= 0 {
 		o.Conc = 64

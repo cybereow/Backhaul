@@ -97,7 +97,8 @@ func hdr(name string, t uint16) dns.RR_Header {
 // it from the DNS question), data length is implicit, the nonce is 48 bits (it
 // only has to defeat caching and pair a reply with its query) and the MAC is a
 // truncated 80 bits. respLen is how many payload bytes to send back, in units of
-// 8 (rounded down, so the reply never exceeds what the asker sized for).
+// 8 rounded up (so a request is never silently shortened; the responder still
+// caps every reply at the codec's and the UDP budget's limits).
 type query struct {
 	RespLen uint16
 	Nonce   uint64 // low 48 bits are sent
@@ -127,7 +128,7 @@ func getNonce(b []byte) uint64 {
 func (q query) marshal(key []byte) []byte {
 	body := make([]byte, queryHdr+len(q.Data))
 	body[0] = magicQuery
-	body[1] = byte(min(int(q.RespLen)/8, 255))
+	body[1] = byte(min((int(q.RespLen)+7)/8, 255))
 	putNonce(body[2:], q.Nonce)
 	copy(body[queryHdr:], q.Data)
 	return append(body, macSum(key, body)...)

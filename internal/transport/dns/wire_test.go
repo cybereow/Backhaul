@@ -72,7 +72,7 @@ func TestFragReorder(t *testing.T) {
 // TestQNameRoundTrip: the query envelope survives base32 QNAME encode/decode.
 func TestQNameRoundTrip(t *testing.T) {
 	key := []byte(testKey)
-	q := query{RRType: dns.TypeNULL, RespLen: 120, Nonce: 0xdeadbeefcafef00d, Data: patternBytes(1, 40)}
+	q := query{RespLen: 120, Nonce: 0xdeadbeefcafe, Data: patternBytes(1, 40)}
 	name := encodeName(q.marshal(key)) + "." + dns.Fqdn(testDomain)
 
 	raw, err := decodeName(name, testDomain)
@@ -83,7 +83,7 @@ func TestQNameRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.RRType != q.RRType || got.RespLen != q.RespLen || got.Nonce != q.Nonce || string(got.Data) != string(q.Data) {
+	if got.RespLen != q.RespLen || got.Nonce != q.Nonce || string(got.Data) != string(q.Data) {
 		t.Fatalf("query round-trip mismatch: %+v vs %+v", got, q)
 	}
 }
@@ -92,7 +92,7 @@ func TestQNameRoundTrip(t *testing.T) {
 // responder must ignore foreign/garbage names, and the prober must reject
 // responses that are not from its peer.
 func TestMACRejectsWrongKey(t *testing.T) {
-	q := query{RRType: dns.TypeA, RespLen: 10, Nonce: 42, Data: []byte("hi")}
+	q := query{RespLen: 16, Nonce: 42, Data: []byte("hi")}
 	raw := q.marshal([]byte("key-one"))
 	if _, err := parseQuery([]byte("key-two"), raw); err != errMAC {
 		t.Fatalf("expected errMAC, got %v", err)
@@ -119,7 +119,7 @@ func TestEndToEnd(t *testing.T) {
 		Resolvers:   []string{addr},
 		RRTypes:     []uint16{dns.TypeTXT, dns.TypeNULL, dns.TypeA, dns.TypeAAAA, dns.TypeCNAME, dns.TypeMX, dns.TypeSRV, dns.TypePTR},
 		QueryBudget: 40,
-		RespSizes:   []int{60},
+		RespSizes:   []int{64},
 		EDNSModes:   []bool{true}, // advertise a buffer so large UDP answers aren't dropped on loopback
 		Timeout:     2 * time.Second,
 		Concurrency: 4,
@@ -139,8 +139,8 @@ func TestEndToEnd(t *testing.T) {
 		if r.QBytesThrough != 40 {
 			t.Errorf("%s: q bytes %d, want 40", r.RRType, r.QBytesThrough)
 		}
-		if r.RespBytesThrough != 60 {
-			t.Errorf("%s: resp bytes %d, want 60", r.RRType, r.RespBytesThrough)
+		if r.RespBytesThrough != 64 {
+			t.Errorf("%s: resp bytes %d, want 64", r.RRType, r.RespBytesThrough)
 		}
 	}
 }

@@ -105,7 +105,7 @@ type ClientConfig struct {
 	DNSResolverCIDRs     []string      `toml:"dns_resolver_cidrs"` // dnsmux: extra candidate resolvers as CIDRs/IPs to test at startup (rate-limited, max 4096 addresses)
 	DNSResolverCache     string        `toml:"dns_resolver_cache"` // dnsmux: file caching the discovered best resolvers (reused for 30 minutes)
 	DNSNoHedge           bool          `toml:"dns_no_hedge"`       // dnsmux: disable hedging (extra exchange when one stalls)
-	DNSWorkers           int           `toml:"dns_workers"`        // dnsmux: DNS queries in flight per tunnel connection (default 8)
+	DNSWorkers           int           `toml:"dns_workers"`        // dnsmux: DNS queries in flight per tunnel connection (default 16)
 	TLSVerify            bool          `toml:"tls_verify"`         // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
 }
 

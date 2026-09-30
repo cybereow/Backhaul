@@ -31,7 +31,7 @@ type DnsMuxConfig struct {
 	ResolverCIDRs    []string      // extra candidates to discover (CIDRs or IPs)
 	ResolverCache    string        // discovery result cache file
 	Timeout          time.Duration // per DNS query (default 2s)
-	Workers          int           // DNS queries in flight per tunnel conn (default 8)
+	Workers          int           // DNS queries in flight per tunnel conn (default 16)
 	NoHedge          bool          // disable hedging
 	Token            string
 	RetryInterval    time.Duration
@@ -89,7 +89,7 @@ func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 		config.RetryInterval = 3 * time.Second
 	}
 	if config.Workers <= 0 {
-		config.Workers = 8
+		config.Workers = 16
 	}
 	if config.ConnPoolSize <= 0 {
 		config.ConnPoolSize = 1

@@ -155,7 +155,7 @@ func maxQueryData(domain string) int {
 func randNonce() uint64 {
 	var b [8]byte
 	_, _ = rand.Read(b[:])
-	return binary.BigEndian.Uint64(b[:])
+	return binary.BigEndian.Uint64(b[:]) & nonceMask // only 48 bits go on the wire
 }
 
 // profileKey identifies one probe profile; Run repeats each key p.repeat times.
@@ -358,7 +358,6 @@ func exchangeVia(pool *connPool, ctx context.Context, domain string, key []byte,
 	nonce := randNonce()
 
 	q := query{
-		RRType:  rrType,
 		RespLen: uint16(respSize),
 		Nonce:   nonce,
 		Data:    qDataFunc(nonce),

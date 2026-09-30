@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	magicByte = 0xB4 // marks a backhaul-dns payload
-	protoVer  = 1
-	macLen    = 16 // truncated HMAC-SHA256
+	magicQuery = 0xB6 // marks a backhaul-dns v2 query
+	magicResp  = 0xB4 // v2 reply; the low bit carries inTCP
+	macLen     = 10   // truncated HMAC-SHA256 (80 bits)
 
 	maxLabel = 63 // RFC 1035 label octet limit
 
@@ -90,26 +90,45 @@ func hdr(name string, t uint16) dns.RR_Header {
 
 // query is the outside->inside payload carried in the QNAME.
 //
-//	magic(1) ver(1) rrtype(2) respLen(2) nonce(8) dataLen(2) data mac(16)
+//	magic(1) respLen/8(1) nonce(6) data mac(10)
 //
-// rrtype/respLen tell the responder which RR family to answer with and how many
-// payload bytes to send back, so a single responder serves every probe profile.
+// Every byte here is paid for out of the ~140 that fit in a QNAME, so the header
+// is as small as it can be: the record type is not carried (the responder reads
+// it from the DNS question), data length is implicit, the nonce is 48 bits (it
+// only has to defeat caching and pair a reply with its query) and the MAC is a
+// truncated 80 bits. respLen is how many payload bytes to send back, in units of
+// 8 (rounded down, so the reply never exceeds what the asker sized for).
 type query struct {
-	RRType  uint16
 	RespLen uint16
-	Nonce   uint64
+	Nonce   uint64 // low 48 bits are sent
 	Data    []byte
 }
 
-const queryHdr = 16 // magic+ver+rrtype+respLen+nonce+dataLen
+const (
+	queryHdr   = 8 // magic + respLen/8 + nonce(6)
+	nonceBytes = 6
+	nonceMask  = 1<<(8*nonceBytes) - 1
+)
+
+func putNonce(b []byte, n uint64) {
+	for i := 0; i < nonceBytes; i++ {
+		b[i] = byte(n >> (8 * (nonceBytes - 1 - i)))
+	}
+}
+
+func getNonce(b []byte) uint64 {
+	var n uint64
+	for i := 0; i < nonceBytes; i++ {
+		n = n<<8 | uint64(b[i])
+	}
+	return n
+}
 
 func (q query) marshal(key []byte) []byte {
 	body := make([]byte, queryHdr+len(q.Data))
-	body[0], body[1] = magicByte, protoVer
-	binary.BigEndian.PutUint16(body[2:], q.RRType)
-	binary.BigEndian.PutUint16(body[4:], q.RespLen)
-	binary.BigEndian.PutUint64(body[6:], q.Nonce)
-	binary.BigEndian.PutUint16(body[14:], uint16(len(q.Data)))
+	body[0] = magicQuery
+	body[1] = byte(min(int(q.RespLen)/8, 255))
+	putNonce(body[2:], q.Nonce)
 	copy(body[queryHdr:], q.Data)
 	return append(body, macSum(key, body)...)
 }
@@ -118,34 +137,30 @@ func parseQuery(key, raw []byte) (query, error) {
 	if len(raw) < queryHdr+macLen {
 		return query{}, errShort
 	}
-	if raw[0] != magicByte || raw[1] != protoVer {
+	if raw[0] != magicQuery {
 		return query{}, errMagic
 	}
 	body, mac := raw[:len(raw)-macLen], raw[len(raw)-macLen:]
 	if !hmac.Equal(mac, macSum(key, body)) {
 		return query{}, errMAC
 	}
-	dlen := int(binary.BigEndian.Uint16(body[14:]))
-	if queryHdr+dlen != len(body) {
-		return query{}, errShort
-	}
 	return query{
-		RRType:  binary.BigEndian.Uint16(body[2:]),
-		RespLen: binary.BigEndian.Uint16(body[4:]),
-		Nonce:   binary.BigEndian.Uint64(body[6:]),
+		RespLen: uint16(body[1]) * 8,
+		Nonce:   getNonce(body[2:]),
 		Data:    append([]byte(nil), body[queryHdr:]...),
 	}, nil
 }
 
 // response is the inside->outside payload carried in the answer RDATA.
 //
-//	magic(1) ver(1) nonce(8) qSeen(2) inTCP(1) dataLen(2) data mac(16)
+//	magic|inTCP(1) nonce(6) qSeen(2) data mac(10)
 //
 // nonce echoes the query nonce (anti-cache + peer proof); qSeen is how many
 // query-data bytes the responder actually received, so the prober learns the
 // surviving capacity of the QNAME direction independently of the reply. inTCP
-// is the transport the responder saw from the recursive resolver (1=TCP), which
-// recovers the otherwise-invisible resolver->inside hop for the report.
+// (the low bit of the first byte) is the transport the responder saw from the
+// recursive resolver, which recovers the otherwise-invisible resolver->inside
+// hop for the report.
 type response struct {
 	Nonce uint64
 	QSeen uint16
@@ -153,17 +168,16 @@ type response struct {
 	Data  []byte
 }
 
-const respHdr = 15 // magic+ver+nonce+qSeen+inTCP+dataLen
+const respHdr = 9 // magic|inTCP + nonce(6) + qSeen(2)
 
 func (r response) marshal(key []byte) []byte {
 	body := make([]byte, respHdr+len(r.Data))
-	body[0], body[1] = magicByte, protoVer
-	binary.BigEndian.PutUint64(body[2:], r.Nonce)
-	binary.BigEndian.PutUint16(body[10:], r.QSeen)
+	body[0] = magicResp
 	if r.InTCP {
-		body[12] = 1
+		body[0] |= 1
 	}
-	binary.BigEndian.PutUint16(body[13:], uint16(len(r.Data)))
+	putNonce(body[1:], r.Nonce)
+	binary.BigEndian.PutUint16(body[7:], r.QSeen)
 	copy(body[respHdr:], r.Data)
 	return append(body, macSum(key, body)...)
 }
@@ -172,21 +186,17 @@ func parseResponse(key, raw []byte) (response, error) {
 	if len(raw) < respHdr+macLen {
 		return response{}, errShort
 	}
-	if raw[0] != magicByte || raw[1] != protoVer {
+	if raw[0]&0xFE != magicResp {
 		return response{}, errMagic
 	}
 	body, mac := raw[:len(raw)-macLen], raw[len(raw)-macLen:]
 	if !hmac.Equal(mac, macSum(key, body)) {
 		return response{}, errMAC
 	}
-	dlen := int(binary.BigEndian.Uint16(body[13:]))
-	if respHdr+dlen != len(body) {
-		return response{}, errShort
-	}
 	return response{
-		Nonce: binary.BigEndian.Uint64(body[2:]),
-		QSeen: binary.BigEndian.Uint16(body[10:]),
-		InTCP: body[12] == 1,
+		Nonce: getNonce(body[1:]),
+		QSeen: binary.BigEndian.Uint16(body[7:]),
+		InTCP: body[0]&1 == 1,
 		Data:  append([]byte(nil), body[respHdr:]...),
 	}, nil
 }

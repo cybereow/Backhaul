@@ -2,6 +2,8 @@ package dnsx
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -26,6 +28,7 @@ type ResolverScore struct {
 // DiscoverOpts tunes DiscoverResolvers. Zero values take the defaults noted.
 type DiscoverOpts struct {
 	Domain, Key string
+	RRTypes     []uint16      // record types a resolver may carry (default TXT, MX, AAAA, A): a candidate is kept if ANY works
 	Timeout     time.Duration // per probe (1.5s)
 	Conc        int           // probes in flight (64)
 	QPS         int           // stage-1 send rate, so a big candidate list is not a flood (150)
@@ -39,6 +42,9 @@ type DiscoverOpts struct {
 func (o *DiscoverOpts) defaults() {
 	if o.Timeout <= 0 {
 		o.Timeout = 1500 * time.Millisecond
+	}
+	if len(o.RRTypes) == 0 {
+		o.RRTypes = []uint16{dns.TypeTXT, dns.TypeMX, dns.TypeAAAA, dns.TypeA}
 	}
 	if o.Conc <= 0 {
 		o.Conc = 64
@@ -62,13 +68,37 @@ func (o *DiscoverOpts) defaults() {
 
 // probe sends one throwaway diagnostic query (1 byte of data: the responder
 // answers it without touching any session) through resolver over transport.
-func (o DiscoverOpts) probe(ctx context.Context, resolver, transport string) (time.Duration, bool) {
+func (o DiscoverOpts) probe(ctx context.Context, resolver string, rrType uint16, transport string) (time.Duration, bool) {
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	t0 := time.Now()
-	_, _, _, _, stage, _ := Exchange(ctx, o.Domain, []byte(o.Key), resolver, dns.TypeTXT, transport, true, 100,
+	_, _, _, _, stage, _ := Exchange(ctx, o.Domain, []byte(o.Key), resolver, rrType, transport, true, 100,
 		func(uint64) []byte { return []byte{0} }, o.Timeout)
 	return time.Since(t0), stage == StageOK
+}
+
+// probeAny reports whether resolver carries any allowed record type over UDP or
+// TCP. The combinations run in parallel, so a dead resolver costs one timeout.
+func (o DiscoverOpts) probeAny(ctx context.Context, resolver string) bool {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	res := make(chan bool, len(o.RRTypes)*2) // buffered: probes cancelled after the first success must not block
+	n := 0
+	for _, t := range o.RRTypes {
+		for _, tr := range []string{"udp", "tcp"} {
+			n++
+			go func(t uint16, tr string) {
+				_, ok := o.probe(ctx, resolver, t, tr)
+				res <- ok
+			}(t, tr)
+		}
+	}
+	for i := 0; i < n; i++ {
+		if <-res {
+			return true
+		}
+	}
+	return false
 }
 
 // DiscoverResolvers finds the good resolvers among candidates: a rate-limited
@@ -78,8 +108,9 @@ func (o DiscoverOpts) probe(ctx context.Context, resolver, transport string) (ti
 // assumed: it works for any list (built-in, user CIDRs, anything else).
 func DiscoverResolvers(ctx context.Context, candidates []string, o DiscoverOpts) []ResolverScore {
 	o.defaults()
+	inputs := discoveryInputs(o, candidates)
 	if o.CachePath != "" {
-		if cached := loadCache(o.CachePath, o.CacheTTL); len(cached) > 0 {
+		if cached := loadCache(o.CachePath, o.CacheTTL, inputs); len(cached) > 0 {
 			o.Logf("dns discovery: using %d cached resolvers from %s", len(cached), o.CachePath)
 			return cached
 		}
@@ -109,11 +140,7 @@ stage1:
 		go func(c string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			_, ok := o.probe(ctx, c, "udp")
-			if !ok {
-				_, ok = o.probe(ctx, c, "tcp")
-			}
-			if ok {
+			if o.probeAny(ctx, c) {
 				mu.Lock()
 				alive = append(alive, c)
 				mu.Unlock()
@@ -132,23 +159,24 @@ stage1:
 			defer wg.Done()
 			defer func() { <-sem }()
 			s := ResolverScore{Resolver: r}
-			var sum time.Duration
+			var sumOK, sumAll time.Duration
 			for k := 0; k < o.Samples && ctx.Err() == nil; k++ {
 				tr := "udp"
 				if k%2 == 1 {
 					tr = "tcp"
 				}
-				d, ok := o.probe(ctx, r, tr)
+				d, ok := o.probe(ctx, r, o.RRTypes[(k/2)%len(o.RRTypes)], tr)
 				s.N++
+				sumAll += d // a probe that ran into its timeout counts at full length
 				if ok {
 					s.OK++
-					sum += d
+					sumOK += d
 				}
 			}
 			if s.OK > 0 {
-				s.Mean = sum / time.Duration(s.OK)
+				s.Mean = sumOK / time.Duration(s.OK)
 				rate := float64(s.OK) / float64(s.N)
-				s.Score = rate * rate / (s.Mean.Seconds() + 0.05)
+				s.Score = rate * rate / (sumAll.Seconds()/float64(s.N) + 0.05)
 			}
 			scores[i] = s
 		}(i, r)
@@ -169,9 +197,22 @@ stage1:
 		o.Logf("dns discovery: %-22s ok %d/%d mean %v score %.1f", s.Resolver, s.OK, s.N, s.Mean.Round(time.Millisecond), s.Score)
 	}
 	if o.CachePath != "" && len(out) > 0 {
-		saveCache(o.CachePath, out)
+		saveCache(o.CachePath, inputs, out)
 	}
 	return out
+}
+
+// discoveryInputs identifies what a cache was computed for, so a cache written
+// for other settings (domain, key, candidate set, record types) is never reused.
+func discoveryInputs(o DiscoverOpts, candidates []string) string {
+	cs := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		cs = append(cs, withPort(c))
+	}
+	sort.Strings(cs)
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%s|%v|%s", o.Domain, o.Key, o.RRTypes, strings.Join(cs, ","))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func withPort(r string) string {
@@ -184,23 +225,24 @@ func withPort(r string) string {
 
 type cacheFile struct {
 	At      time.Time       `json:"at"`
+	Inputs  string          `json:"inputs"` // hash of domain, key, candidates, record types
 	Results []ResolverScore `json:"results"`
 }
 
-func loadCache(path string, ttl time.Duration) []ResolverScore {
+func loadCache(path string, ttl time.Duration, inputs string) []ResolverScore {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
 	var c cacheFile
-	if json.Unmarshal(b, &c) != nil || time.Since(c.At) > ttl {
+	if json.Unmarshal(b, &c) != nil || time.Since(c.At) > ttl || c.Inputs != inputs {
 		return nil
 	}
 	return c.Results
 }
 
-func saveCache(path string, r []ResolverScore) {
-	if b, err := json.MarshalIndent(cacheFile{At: time.Now(), Results: r}, "", " "); err == nil {
+func saveCache(path, inputs string, r []ResolverScore) {
+	if b, err := json.MarshalIndent(cacheFile{At: time.Now(), Inputs: inputs, Results: r}, "", " "); err == nil {
 		_ = os.WriteFile(path, b, 0o600)
 	}
 }

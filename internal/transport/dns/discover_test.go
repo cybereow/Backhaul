@@ -51,8 +51,10 @@ func TestDiscoverRanksAndDropsDead(t *testing.T) {
 		t.Errorf("fast resolver should outscore the slow one: %+v", got)
 	}
 
-	// second call is served from the cache, without any network
-	again := DiscoverResolvers(context.Background(), []string{"192.0.2.1"}, DiscoverOpts{Domain: domain, Key: key, CachePath: cache})
+	// same inputs again: served from the cache (a 1ns timeout would fail every live probe)
+	again := DiscoverResolvers(context.Background(), []string{slow, blackhole.LocalAddr().String(), closedAddr, fast}, DiscoverOpts{
+		Domain: domain, Key: key, Timeout: time.Nanosecond, CachePath: cache,
+	})
 	if len(again) != 2 || again[0].Resolver != fast {
 		t.Fatalf("cache not used: %+v", again)
 	}
@@ -73,5 +75,61 @@ func TestExpandCIDRs(t *testing.T) {
 	}
 	if !IsAuto(nil) || !IsAuto([]string{"1.2.3.4", "Auto"}) || IsAuto([]string{"1.2.3.4"}) {
 		t.Error("IsAuto wrong")
+	}
+}
+
+func TestDiscoverCacheBoundToInputs(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	fast := startResponder(t, domain, key, 0)
+	cache := filepath.Join(t.TempDir(), "r.json")
+	opts := DiscoverOpts{Domain: domain, Key: key, Timeout: time.Second, Samples: 2, CachePath: cache}
+	if got := DiscoverResolvers(context.Background(), []string{fast}, opts); len(got) != 1 {
+		t.Fatalf("first run: %+v", got)
+	}
+	// different candidate set: the cached entry must not be reused
+	if got := DiscoverResolvers(context.Background(), []string{"127.0.0.1:1"}, opts); len(got) != 0 {
+		t.Errorf("cache reused for a different candidate set: %+v", got)
+	}
+	// different domain: same
+	o2 := opts
+	o2.Domain = "other.example.com"
+	if got := DiscoverResolvers(context.Background(), []string{fast}, o2); len(got) != 0 {
+		t.Errorf("cache reused for a different domain: %+v", got)
+	}
+}
+
+func TestDiscoverUsesConfiguredRecordTypes(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	addr := startResponder(t, domain, key, 0)
+	// the carrier may use any type; discovery must keep a resolver that works for the allowed ones
+	got := DiscoverResolvers(context.Background(), []string{addr}, DiscoverOpts{
+		Domain: domain, Key: key, Timeout: time.Second, Samples: 2, RRTypes: []uint16{dns.TypeAAAA},
+	})
+	if len(got) != 1 {
+		t.Fatalf("resolver carrying AAAA dropped: %+v", got)
+	}
+}
+
+func TestResponderAnswersApexSOA(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	addr := startResponder(t, domain, key, 0)
+	c := new(dns.Client)
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeSOA)
+	r, _, err := c.Exchange(m, addr)
+	if err != nil || r.Rcode != dns.RcodeSuccess || len(r.Answer) != 1 {
+		t.Fatalf("apex SOA: err=%v reply=%v", err, r)
+	}
+	m.SetQuestion(dns.Fqdn(domain), dns.TypeTXT)
+	r, _, err = c.Exchange(m, addr)
+	if err != nil || r.Rcode != dns.RcodeSuccess || len(r.Answer) != 0 || len(r.Ns) != 1 {
+		t.Fatalf("apex TXT should be NODATA with SOA authority: err=%v reply=%v", err, r)
+	}
+}
+
+func TestDefaultProfilesDedupesNormalizedResolvers(t *testing.T) {
+	got := DefaultProfiles("t.example.com", []string{"2.189.44.44", "2.189.44.44:53", " 2.189.44.44 "}, []string{"TXT"})
+	if len(got) != 2 { // one resolver x TXT x {udp,tcp}
+		t.Fatalf("got %d profiles, want 2: %v", len(got), got)
 	}
 }

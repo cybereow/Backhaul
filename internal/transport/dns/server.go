@@ -134,6 +134,12 @@ func (s *Server) handle(sid uint32, flags byte, in []byte, maxResp int) ([]byte,
 	}
 
 	s.mu.Lock()
+	select { // recheck under the lock Close takes when it clears the table
+	case <-s.done:
+		s.mu.Unlock()
+		return nil, FlagRST
+	default:
+	}
 	ss := s.sessions[sid]
 	if ss == nil {
 		// Only a SYN creates a session; anything else for an unknown sid means it

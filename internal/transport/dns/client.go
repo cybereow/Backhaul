@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	closeGrace   = 3 * time.Second // max wait for the FIN exchange in Close
-	minClientMSS = 16              // below this the tunnel is not worth running
+	outageLimit  = 90 * time.Second // sustained total failure after which the carrier is torn down
+	closeGrace   = 3 * time.Second  // max wait for the FIN exchange in Close
+	minClientMSS = 16               // below this the tunnel is not worth running
 	pollFast     = 20 * time.Millisecond
 	pollIdle     = 500 * time.Millisecond
 )
@@ -39,6 +40,9 @@ type DialParams struct {
 	// extra in flight) so a resolver that occasionally stalls ~2s does not stall
 	// the stream.
 	NoHedge bool
+	// OutageLimit is how long every exchange may fail after the tunnel was up
+	// before the carrier gives up and reports an error (default 90s).
+	OutageLimit time.Duration
 	// Sel tunes profile selection (zero values take the sel defaults). Raising
 	// TopK spreads the workers over more resolver/record-type profiles.
 	Sel sel.Config
@@ -90,6 +94,10 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	c.logf = p.Logf
 	c.pool = newConnPool()
 	c.hedge = !p.NoHedge
+	c.outage = p.OutageLimit
+	if c.outage <= 0 {
+		c.outage = outageLimit
+	}
 	c.maxHedge = int32(max(p.Workers, 1))
 	c.stats = map[sel.Profile]*profStat{}
 
@@ -256,6 +264,8 @@ type clientConn struct {
 	hedges      atomic.Int32  // extra exchanges currently in flight
 	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
 	nextLog     time.Time
+	lastOK      time.Time // last successful exchange (outage detection)
+	outage      time.Duration
 	established bool // first reply seen: stop sending SYN
 }
 
@@ -375,6 +385,7 @@ func (c *clientConn) exchange() {
 	if stage == StageOK {
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
 		c.established = true
+		c.lastOK = now
 		// Track typical (not stalled) round trips: cap so a 2s stall cannot push
 		// the hedge delay up to where hedging stops helping.
 		rt := min(time.Duration(rttMs)*time.Millisecond, hedgeMaxDelay)
@@ -420,8 +431,13 @@ func (c *clientConn) exchange() {
 	}
 	c.record(now, prof, stage == StageOK, now.Sub(t0))
 
-	active := c.mgr.Active()
-	if len(active) == 0 {
+	// Every resolver/profile has been failing for outageLimit: the tunnel is dead
+	// for practical purposes. End it so the owner can reconnect and re-discover
+	// resolvers instead of queueing streams onto it.
+	if stage != StageOK && c.established && now.Sub(c.lastOK) > c.outage && c.err == nil {
+		c.err = fmt.Errorf("dnsx: no resolver answered for %v", c.outage)
+		c.cancel()
+		c.notifyAll()
 	}
 
 	c.mu.Unlock()

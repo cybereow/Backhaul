@@ -175,6 +175,7 @@ func (c *DnsMuxTransport) runTunnel() {
 		}
 		ranked := dnsx.DiscoverResolvers(c.ctx, cands, dnsx.DiscoverOpts{
 			Domain: c.config.Domain, Key: c.config.Key, CachePath: c.config.ResolverCache, Logf: c.logger.Infof,
+			RRTypes: dnsx.RecordTypeCodes(c.config.Domain, c.config.RecordTypes),
 		})
 		if len(ranked) == 0 {
 			c.logger.Error("dnsmux: no candidate resolver reached the server; will retry")

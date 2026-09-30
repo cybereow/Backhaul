@@ -100,6 +100,23 @@ func (r *Responder) handle(w dns.ResponseWriter, req *dns.Msg) {
 	}
 	q := req.Question[0]
 
+	// The zone apex is answered like an ordinary authoritative server would, so
+	// delegation/health checks (dig SOA <domain>) work.
+	if strings.EqualFold(q.Name, dns.Fqdn(r.domain)) {
+		soa := &dns.SOA{
+			Hdr: dns.RR_Header{Name: dns.Fqdn(r.domain), Rrtype: dns.TypeSOA, Class: dns.ClassINET, Ttl: 60},
+			Ns:  "ns." + dns.Fqdn(r.domain), Mbox: "hostmaster." + dns.Fqdn(r.domain),
+			Serial: 1, Refresh: 3600, Retry: 600, Expire: 86400, Minttl: 60,
+		}
+		if q.Qtype == dns.TypeSOA {
+			m.Answer = []dns.RR{soa}
+		} else {
+			m.Ns = []dns.RR{soa} // NODATA
+		}
+		_ = w.WriteMsg(m)
+		return
+	}
+
 	_, inTCP := w.RemoteAddr().(*net.TCPAddr)
 	rrs, err := r.answer(q, inTCP)
 	if err != nil {

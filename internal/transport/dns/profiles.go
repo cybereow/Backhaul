@@ -1,7 +1,6 @@
 package dnsx
 
 import (
-	"net"
 	"strings"
 
 	"github.com/musix/backhaul/internal/transport/dns/sel"
@@ -23,18 +22,36 @@ func DefaultProfiles(domain string, resolvers, recordTypes []string) []sel.Profi
 	}
 
 	var out []sel.Profile
+	seen := map[string]bool{}
 	for _, r := range resolvers {
 		r = strings.TrimSpace(r)
 		if r == "" {
 			continue
 		}
-		if _, _, err := net.SplitHostPort(r); err != nil {
-			r = net.JoinHostPort(r, "53")
+		r = withPort(r)
+		if seen[r] { // "1.2.3.4" and "1.2.3.4:53" are the same resolver
+			continue
 		}
+		seen[r] = true
 		for _, c := range codecs {
 			for _, t := range []string{"udp", "tcp"} {
 				out = append(out, sel.Profile{Resolver: r, RRType: c.qtype(), Transport: t, Cap: c.capacity()})
 			}
+		}
+	}
+	return out
+}
+
+// RecordTypeCodes maps record type names (empty: TXT, MX, AAAA, A) to their DNS
+// type codes, skipping unknown names.
+func RecordTypeCodes(domain string, names []string) []uint16 {
+	if len(names) == 0 {
+		names = []string{"TXT", "MX", "AAAA", "A"}
+	}
+	var out []uint16
+	for _, n := range names {
+		if c := codecByName(domain, strings.TrimSpace(n)); c != nil {
+			out = append(out, c.qtype())
 		}
 	}
 	return out

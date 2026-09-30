@@ -621,3 +621,50 @@ func TestHedgingKeepsThePipeFullDuringStalls(t *testing.T) {
 		t.Errorf("with hedging the client never exceeded its 4 workers (peak %d)", hedged)
 	}
 }
+
+func TestServerCloseRefusesNewSessions(t *testing.T) {
+	srv := NewServer("t.example.com", "k", newTestLogger())
+	srv.Close()
+	pk := rel.Packet{}
+	if out, flags := srv.handle(42, FlagSYN, pk.Marshal(), 400); out != nil || flags != FlagRST {
+		t.Fatalf("closed server created/answered a session: flags=%d", flags)
+	}
+	srv.mu.Lock()
+	n := len(srv.sessions)
+	srv.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("closed server holds %d sessions", n)
+	}
+}
+
+func TestSustainedOutageEndsTheCarrier(t *testing.T) {
+	srv := NewServer("t.example.com", "k", newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: "t.example.com", Key: "k", Timeout: 500 * time.Millisecond, OutageLimit: 2 * time.Second,
+		Profiles: []sel.Profile{{Resolver: addr, RRType: 16, Transport: "udp", Cap: 700}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	stop() // every resolver is gone now
+	done := make(chan error, 1)
+	go func() {
+		_, err := cli.Read(make([]byte, 1))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Read returned without error after the outage")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("carrier still alive long after a sustained outage")
+	}
+}

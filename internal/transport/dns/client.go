@@ -336,8 +336,11 @@ func (c *clientConn) exchange() {
 				}
 				p, err := rel.Unmarshal(respData[1:])
 				if err == nil {
+					pendingBefore := c.ep.Pending()
 					c.ep.Recv(now, p)
-					if len(p.Data) > 0 || p.Ack > 0 {
+					// Only new data or an ACK that actually advanced counts as
+					// activity; the cumulative ACK alone is nonzero forever.
+					if len(p.Data) > 0 || c.ep.Pending() < pendingBefore {
 						c.recentRX = true
 					}
 					c.notifyAll()

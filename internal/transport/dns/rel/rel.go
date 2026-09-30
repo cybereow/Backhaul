@@ -237,6 +237,12 @@ func (e *Endpoint) Next(now time.Time) Packet {
 			e.backoff++
 			e.lastBackoff = now
 		}
+		// A segment cut under a larger MSS (the server's reply budget shrinks when
+		// the selector fails over to a smaller record type) may no longer fit one
+		// exchange: split it so the retransmission can get through.
+		if len(s.data) > e.cfg.MSS {
+			e.split(s)
+		}
 		s.retx++
 		s.sentAt = now
 		s.deadline = now.Add(e.rto())
@@ -268,6 +274,19 @@ func (e *Endpoint) Next(now time.Time) Packet {
 		pk.Seq, pk.Data = s.seq, s.data
 	}
 	return pk
+}
+
+// split cuts s down to the current MSS and queues the remainder right after it
+// as an already-expired segment, so the next Next() retransmits it too.
+func (e *Endpoint) split(s *seg) {
+	tail := &seg{seq: s.seq + uint32(e.cfg.MSS), data: s.data[e.cfg.MSS:], sentAt: s.sentAt, deadline: s.deadline, retx: s.retx}
+	s.data = s.data[:e.cfg.MSS]
+	for i, x := range e.inflight {
+		if x == s {
+			e.inflight = append(e.inflight[:i+1], append([]*seg{tail}, e.inflight[i+1:]...)...)
+			return
+		}
+	}
 }
 
 // Recv processes a packet from the peer: its ACK/window first, then its data.

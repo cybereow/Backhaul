@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
@@ -55,6 +56,7 @@ type DnsMuxTransport struct {
 	logger       *logrus.Logger
 	usageMonitor *web.Usage
 	wg           sync.WaitGroup
+	live         atomic.Int32 // tunnels currently established
 }
 
 func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *logrus.Logger) *DnsMuxTransport {
@@ -141,6 +143,9 @@ func (c *DnsMuxTransport) tunnelLoop() {
 // would cap a stream at a few hundred bytes in flight however many workers run).
 const dnsMaxInflight = 32 * 1024
 
+// dnsAuthTimeout bounds the token handshake on a fresh tunnel conn.
+const dnsAuthTimeout = 60 * time.Second
+
 func (c *DnsMuxTransport) runTunnel() {
 	// Spread workers over several profiles: one resolver/record type collapses
 	// well before the path does when it carries every in-flight query.
@@ -174,11 +179,9 @@ func (c *DnsMuxTransport) runTunnel() {
 	}
 	defer conn.Close()
 
-	dial := c.config.DialTimeOut
-	if dial <= 0 {
-		dial = 60 * time.Second
-	}
-	_ = conn.SetDeadline(time.Now().Add(dial))
+	// Not DialTimeOut (applyDefaults makes it 10s): the handshake is several DNS
+	// round trips and must survive profile timeouts and retransmissions.
+	_ = conn.SetDeadline(time.Now().Add(dnsAuthTimeout))
 	// Challenge-response: the token is never sent (the carrier is not encrypted).
 	if err := dnsx.ClientAuth(conn, c.config.Token); err != nil {
 		c.logger.Errorf("dnsmux: authentication: %v", err)
@@ -193,8 +196,14 @@ func (c *DnsMuxTransport) runTunnel() {
 	}
 	defer session.Close()
 	c.config.TunnelStatus = "Connected (DNSMUX)"
+	c.live.Add(1)
 	c.logger.Info("dnsmux: tunnel established")
-	defer func() { c.config.TunnelStatus = "Disconnected (DNSMUX)" }()
+	defer func() {
+		// With a pool, only the last live tunnel going away means disconnected.
+		if c.live.Add(-1) == 0 {
+			c.config.TunnelStatus = "Disconnected (DNSMUX)"
+		}
+	}()
 
 	for {
 		stream, err := session.AcceptStream()

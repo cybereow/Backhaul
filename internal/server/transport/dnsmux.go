@@ -39,7 +39,7 @@ type DnsMuxConfig struct {
 	MaxFrameSize     int
 	MaxReceiveBuffer int
 	MaxStreamBuffer  int
-	AuthTimeout      time.Duration // token handshake deadline (default 30s: a DNS round trip is slow)
+	AuthTimeout      time.Duration // token handshake deadline (default 60s: a DNS round trip is slow)
 }
 
 type DnsMuxTransport struct {
@@ -78,7 +78,7 @@ func NewDnsMuxServer(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 	// A tunnel round trip is at least one DNS exchange, so the default 30s
 	// keepalive timeout is fine but must not be shortened.
 	if config.AuthTimeout <= 0 {
-		config.AuthTimeout = 30 * time.Second
+		config.AuthTimeout = 60 * time.Second
 	}
 	return &DnsMuxTransport{
 		config:       config,

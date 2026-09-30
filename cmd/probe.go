@@ -302,7 +302,8 @@ func printReport(results []dnsx.ProfileResult) {
 
 	var ok int
 	for _, r := range results {
-		if r.Stage == dnsx.StageOK && r.Successes == r.Attempts && r.Err == "" {
+		if r.Stage == dnsx.StageOK && r.Successes == r.Attempts && r.Err == "" &&
+			r.QBytesThrough >= r.QueryBudget && r.RespBytesThrough >= r.RespBudget {
 			ok++
 		}
 	}

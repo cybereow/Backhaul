@@ -214,6 +214,39 @@ func TestSetMSS(t *testing.T) {
 	}
 }
 
+// A segment cut under a large MSS must still get through after the MSS shrinks
+// (selector failover to a smaller record type): its retransmission is split.
+func TestRetransmitSplitsOversizeSegment(t *testing.T) {
+	now := time.Now()
+	sender := New(Config{MSS: 400, MinRTO: 10 * time.Millisecond, MaxRTO: 50 * time.Millisecond})
+	recv := New(Config{MSS: 400})
+	data := payload(9, 400)
+	sender.Write(data)
+
+	first := sender.Next(now) // 400-byte segment, "lost"
+	if len(first.Data) != 400 {
+		t.Fatalf("first segment %d bytes, want 400", len(first.Data))
+	}
+	sender.SetMSS(100)
+
+	var got []byte
+	for i := 0; i < 50 && len(got) < len(data); i++ {
+		now = now.Add(time.Second) // past any RTO
+		pk := sender.Next(now)
+		if len(pk.Data) > 100 {
+			t.Fatalf("retransmission of %d bytes exceeds MSS 100", len(pk.Data))
+		}
+		recv.Recv(now, pk)
+		sender.Recv(now, recv.Next(now))
+		buf := make([]byte, 400)
+		got = append(got, buf[:recv.Read(buf)]...)
+		_ = buf
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("stream not delivered intact: got %d bytes", len(got))
+	}
+}
+
 func TestPacketRoundTrip(t *testing.T) {
 	in := Packet{Seq: 0xfffffff0, Ack: 7, Wnd: 1234, Data: []byte("hello")}
 	out, err := Unmarshal(in.Marshal())

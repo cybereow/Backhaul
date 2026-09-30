@@ -164,8 +164,8 @@ func (s *DnsMuxTransport) handshake(conn net.Conn) {
 	s.mu.Lock()
 	s.sessions = append(s.sessions, ds)
 	n := len(s.sessions)
+	s.config.TunnelStatus = "Connected (DNSMUX)" // under mu: serialized with removal below
 	s.mu.Unlock()
-	s.config.TunnelStatus = "Connected (DNSMUX)"
 	s.logger.Infof("dnsmux: tunnel session established (%d active)", n)
 
 	// Keep the session registered until it dies.
@@ -182,19 +182,19 @@ func (s *DnsMuxTransport) handshake(conn net.Conn) {
 		}
 	}
 	remaining := len(s.sessions)
-	s.mu.Unlock()
 	if remaining == 0 {
 		s.config.TunnelStatus = "Disconnected (DNSMUX)"
 	}
+	s.mu.Unlock()
 	s.logger.Warnf("dnsmux: tunnel session closed (%d active)", remaining)
 }
 
 // pick returns a live session, round-robin, skipping closed ones and ones whose
-// client has gone silent (a dead tunnel lingers until the carrier's idle GC).
+// client has gone silent (a dead tunnel lingers until the carrier's idle GC); nil
+// when there is none, so the caller rejects the connection promptly.
 func (s *DnsMuxTransport) pick() *smux.Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var fallback *smux.Session
 	for range s.sessions {
 		s.next = (s.next + 1) % len(s.sessions)
 		ds := s.sessions[s.next]
@@ -202,12 +202,11 @@ func (s *DnsMuxTransport) pick() *smux.Session {
 			continue
 		}
 		if ds.idle != nil && ds.idle() > staleAfter {
-			fallback = ds.mux
 			continue
 		}
 		return ds.mux
 	}
-	return fallback
+	return nil
 }
 
 type dnsPortMap struct{ local, remote string }

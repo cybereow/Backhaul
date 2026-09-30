@@ -152,6 +152,12 @@ func runStream(ctx context.Context, pr *Prober, params SoakParams, s SoakStream,
 					return // deadline hit mid-flight; don't record a phantom failure
 				}
 				bad := a.stage == StageOK && a.err != ""
+				// A reply shorter than requested (the responder caps at the codec's
+				// capacity) did not carry the requested size: not a success.
+				short := a.stage == StageOK && a.err == "" && (a.qBytes < pr.effectiveQLen() || a.respBytes < s.RespSize)
+				if short {
+					a.err = "short payload"
+				}
 				st.add(event{
 					at:   time.Now(),
 					ok:   a.stage == StageOK && a.err == "",
@@ -243,10 +249,12 @@ func summarize(s SoakStream, st *streamStat, seconds float64) SoakResult {
 			r.UpBytes += int64(e.up)
 			r.DownBytes += int64(e.down)
 			rtts = append(rtts, e.rtt)
+			ref := begin // before the first success the stall runs from the start
 			if haveOK {
-				if gap := e.at.Sub(lastOK).Milliseconds(); gap > r.LongestStallMs {
-					r.LongestStallMs = gap
-				}
+				ref = lastOK
+			}
+			if gap := e.at.Sub(ref).Milliseconds(); gap > r.LongestStallMs {
+				r.LongestStallMs = gap
 			}
 			lastOK, haveOK = e.at, true
 			consec = 0

@@ -56,7 +56,8 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	if maxQ <= 0 {
 		return nil, fmt.Errorf("dnsx: domain %q is too long to carry payload", domain)
 	}
-	mss := maxQ - queryHdr - sessionFrame - rel.HeaderLen
+	// maxQueryData already excludes the query header and MAC.
+	mss := maxQ - sessionFrame - rel.HeaderLen
 	if mss < minClientMSS {
 		return nil, fmt.Errorf("dnsx: domain %q leaves only %d bytes per query, need at least %d", domain, mss, minClientMSS)
 	}

@@ -16,8 +16,10 @@ import (
 )
 
 const (
-	pollFast = 20 * time.Millisecond
-	pollIdle = 500 * time.Millisecond
+	closeGrace   = 3 * time.Second // max wait for the FIN exchange in Close
+	minClientMSS = 16              // below this the tunnel is not worth running
+	pollFast     = 20 * time.Millisecond
+	pollIdle     = 500 * time.Millisecond
 )
 
 // DialParams configures the client dialer.
@@ -55,8 +57,8 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 		return nil, fmt.Errorf("dnsx: domain %q is too long to carry payload", domain)
 	}
 	mss := maxQ - queryHdr - sessionFrame - rel.HeaderLen
-	if mss < 0 {
-		mss = 0
+	if mss < minClientMSS {
+		return nil, fmt.Errorf("dnsx: domain %q leaves only %d bytes per query, need at least %d", domain, mss, minClientMSS)
 	}
 
 	rcfg := p.Rel
@@ -75,6 +77,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 		timeout: p.Timeout,
 		sid:     sid32,
 		closed:  make(chan struct{}),
+		finDone: make(chan struct{}),
 	}
 	c.cond = sync.NewCond(&c.mu)
 	c.logf = p.Logf
@@ -82,6 +85,14 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	c.stats = map[sel.Profile]*profStat{}
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
+	// Wake any Read/Write parked on the cond when the context ends (parent
+	// cancellation included), or they would sleep until their deadline.
+	go func() {
+		<-c.ctx.Done()
+		c.mu.Lock()
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}()
 
 	c.warmup(p.Profiles)
 	c.exchange()
@@ -122,10 +133,7 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 		go func(p sel.Profile) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			respSize := p.Cap - envelopeOverhead
-			if respSize < 0 {
-				respSize = 0
-			}
+			respSize := carrierRespSize(p.Cap)
 			fails := 0
 			for i := 0; i < warmSamples; i++ {
 				if c.ctx.Err() != nil {
@@ -158,6 +166,22 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 	wg.Wait()
 }
 
+// carrierRespSize is the reply payload a carrier exchange asks for on a profile
+// with codec capacity cap: the largest reply the carrier will actually send
+// (flags + rel header + one capped segment), never the codec's nominal capacity,
+// which can exceed what a 1232-byte EDNS message holds once the DNS framing is
+// added.
+func carrierRespSize(cap int) int {
+	n := cap - envelopeOverhead
+	if max := 1 + rel.HeaderLen + maxSegment; n > max {
+		n = max
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n
+}
+
 // profStat counts exchanges per profile for the Logf summary.
 type profStat struct {
 	ok, fail int
@@ -179,8 +203,10 @@ type clientConn struct {
 	mu   sync.Mutex // protects reads/writes to ep
 	cond *sync.Cond
 
-	closed chan struct{}
-	err    error
+	closed  chan struct{}
+	finDone chan struct{} // closed once a FIN has been delivered
+	finOnce sync.Once
+	err     error
 
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -222,7 +248,6 @@ func (c *clientConn) loop(primary bool) {
 
 			c.mu.Lock()
 			pending := c.ep.Pending()
-			inflight := c.ep.Sent - c.ep.Retx
 			recent := c.recentRX
 			if primary {
 				c.recentRX = false
@@ -230,7 +255,7 @@ func (c *clientConn) loop(primary bool) {
 			peerWnd := c.ep.PeerWnd()
 			c.mu.Unlock()
 
-			if recent || pending > 0 || inflight > 0 || peerWnd == 0 {
+			if recent || pending > 0 || peerWnd == 0 {
 				timer.Reset(1 * time.Microsecond)
 			} else {
 				timer.Reset(pollIdle)
@@ -245,14 +270,7 @@ func (c *clientConn) exchange() {
 	c.mu.Lock()
 	prof := c.mgr.Pick(now)
 
-	srvMss := prof.Cap - envelopeOverhead - sessionFrame - rel.HeaderLen
-	if srvMss < 0 {
-		srvMss = 0
-	}
-	respSize := prof.Cap - envelopeOverhead
-	if respSize < 0 {
-		respSize = 0
-	}
+	respSize := carrierRespSize(prof.Cap)
 
 	pk := c.ep.Next(now)
 	isFIN := false // we'll set this if the connection is closed and we have no more pending data
@@ -299,6 +317,9 @@ func (c *clientConn) exchange() {
 	if stage == StageOK {
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
 		c.established = true
+		if isFIN {
+			c.finOnce.Do(func() { close(c.finDone) })
+		}
 
 		if len(respData) >= 1 {
 			flags := respData[0]
@@ -384,6 +405,9 @@ func (c *clientConn) Read(b []byte) (n int, err error) {
 		select {
 		case <-c.closed:
 			return 0, io.ErrClosedPipe
+		default:
+		}
+		select {
 		case <-c.ctx.Done():
 			return 0, c.ctx.Err()
 		default:
@@ -429,6 +453,9 @@ func (c *clientConn) Write(b []byte) (n int, err error) {
 		select {
 		case <-c.closed:
 			return written, io.ErrClosedPipe
+		default:
+		}
+		select {
 		case <-c.ctx.Done():
 			return written, c.ctx.Err()
 		default:
@@ -462,10 +489,14 @@ func (c *clientConn) Close() error {
 	}
 	c.mu.Unlock()
 
-	go func() {
-		time.Sleep(5 * time.Second)
-		c.cancel()
-	}()
+	// Give the FIN one round trip to get out, but never hold the caller for long
+	// (a dead link would otherwise stall every reconnect).
+	select {
+	case <-c.finDone:
+	case <-time.After(closeGrace):
+	case <-c.ctx.Done():
+	}
+	c.cancel()
 	c.wg.Wait()
 	c.pool.closeAll()
 	return nil

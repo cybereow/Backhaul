@@ -230,6 +230,8 @@ func summarize(s SoakStream, st *streamStat, seconds float64) SoakResult {
 	var rtts []int64
 	var lastOK time.Time
 	haveOK := false
+	end := time.Now()
+	begin := end.Add(-time.Duration(seconds * float64(time.Second)))
 	consec := 0
 	for _, e := range evs {
 		r.Exchanges++
@@ -259,6 +261,15 @@ func summarize(s SoakStream, st *streamStat, seconds float64) SoakResult {
 				r.Errs[e.err]++
 			}
 		}
+	}
+	// The outage still open at the end (or the whole run if nothing ever
+	// succeeded) is a stall too, and the one that matters most.
+	ref := begin
+	if haveOK {
+		ref = lastOK
+	}
+	if gap := end.Sub(ref).Milliseconds(); gap > r.LongestStallMs {
+		r.LongestStallMs = gap
 	}
 	if r.Exchanges > 0 {
 		r.SuccessRate = float64(r.Successes) / float64(r.Exchanges)

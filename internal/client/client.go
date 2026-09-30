@@ -109,6 +109,7 @@ func (c *Client) Start() {
 			Resolvers:        c.config.DNSResolvers,
 			RecordTypes:      c.config.DNSRecordTypes,
 			Timeout:          time.Duration(c.config.DNSTimeoutMS) * time.Millisecond,
+			Workers:          c.config.DNSWorkers,
 			Token:            c.config.Token,
 			RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,

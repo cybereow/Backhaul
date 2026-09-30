@@ -4,6 +4,8 @@
 # sub-domain (dns_domain) to the SERVER host, UDP+TCP port 53 reachable there
 # and free (on Ubuntu: stop/disable systemd-resolved's stub listener).
 # The CLIENT never contacts the server directly, only the listed resolvers.
+# NOTE: the tunnel payload is authenticated (token challenge-response) but NOT
+# encrypted; anything sensitive inside it must be encrypted end to end.
 # Throughput is low by design (about 100 bytes per query upstream); this
 # transport is for networks where nothing else gets through.
 
@@ -13,7 +15,7 @@ transport = "dnsmux"
 token = "change-me"            # shared token, same on both sides
 dns_domain = "ttt.example.com" # sub-zone delegated to this host
 dns_listen = "0.0.0.0:53"      # authoritative responder (UDP+TCP)
-# dns_key = ""                 # per-query MAC secret; defaults to token
+# dns_key = ""                 # per-query MAC secret; defaults to token (set a different one)
 ports = ["8080=127.0.0.1:80"]  # local listener = target the CLIENT dials
 log_level = "info"
 

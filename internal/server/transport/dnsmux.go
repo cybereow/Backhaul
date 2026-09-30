@@ -131,18 +131,13 @@ func (s *DnsMuxTransport) acceptLoop(srv *dnsx.Server) {
 // handshake authenticates a fresh tunnel conn with the shared token and turns it
 // into a smux session (this side opens streams, the client accepts them).
 func (s *DnsMuxTransport) handshake(conn net.Conn) {
-	_ = conn.SetReadDeadline(time.Now().Add(s.config.AuthTimeout))
-	got, err := utils.ReceiveBinaryString(conn)
-	if err != nil || got != s.config.Token {
-		s.logger.Warnf("dnsmux: rejected tunnel conn (bad or missing token: %v)", err)
+	_ = conn.SetDeadline(time.Now().Add(s.config.AuthTimeout))
+	if err := dnsx.ServerAuth(conn, s.config.Token); err != nil {
+		s.logger.Warnf("dnsmux: rejected tunnel conn: %v", err)
 		conn.Close()
 		return
 	}
-	_ = conn.SetReadDeadline(time.Time{})
-	if err := utils.SendBinaryString(conn, s.config.Token); err != nil {
-		conn.Close()
-		return
-	}
+	_ = conn.SetDeadline(time.Time{})
 
 	session, err := smux.Client(conn, s.smuxConfig)
 	if err != nil {

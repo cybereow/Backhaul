@@ -67,6 +67,7 @@ type ProfileResult struct {
 
 // attempt is one exchange; Run aggregates many into a ProfileResult.
 type attempt struct {
+	ran       bool // the probe actually ran (slots never started stay zero)
 	stage     Stage
 	qBytes    int
 	respBytes int
@@ -204,7 +205,9 @@ func (p *Prober) Run(ctx context.Context) []ProfileResult {
 			go func(i, rep int, prof profileKey) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				attempts[i][rep] = p.probe(ctx, prof.resolver, prof.rrType, prof.transport, prof.edns, prof.respSize)
+				a := p.probe(ctx, prof.resolver, prof.rrType, prof.transport, prof.edns, prof.respSize)
+				a.ran = true
+				attempts[i][rep] = a
 			}(i, rep, prof)
 			if p.pacing > 0 {
 				time.Sleep(p.pacing)
@@ -218,8 +221,17 @@ func (p *Prober) Run(ctx context.Context) []ProfileResult {
 // aggregate folds each profile's repeated attempts into one ProfileResult with
 // success rate, RTT distribution (over successful attempts) and max bytes-through.
 func (p *Prober) aggregate(profiles []profileKey, attempts [][]attempt) []ProfileResult {
-	out := make([]ProfileResult, len(profiles))
+	out := make([]ProfileResult, 0, len(profiles))
 	for i, prof := range profiles {
+		var ran []attempt
+		for _, a := range attempts[i] {
+			if a.ran {
+				ran = append(ran, a)
+			}
+		}
+		if len(ran) == 0 {
+			continue // cancelled before this profile started: nothing to report
+		}
 		r := ProfileResult{
 			Resolver:    prof.resolver,
 			RRType:      dns.TypeToString[prof.rrType],
@@ -227,11 +239,11 @@ func (p *Prober) aggregate(profiles []profileKey, attempts [][]attempt) []Profil
 			EDNS:        prof.edns,
 			QueryBudget: p.effectiveQLen(),
 			RespBudget:  prof.respSize,
-			Attempts:    len(attempts[i]),
+			Attempts:    len(ran),
 			Stage:       StageUnknown,
 		}
 		var okRTTs []int64
-		for _, a := range attempts[i] {
+		for _, a := range ran {
 			if stageRankLower(a.stage, r.Stage) {
 				r.Stage = a.stage
 			}
@@ -260,7 +272,7 @@ func (p *Prober) aggregate(profiles []profileKey, attempts [][]attempt) []Profil
 			r.Err = "" // clean-enough profiles don't need a note
 			r.RTTminMs, r.RTTp50Ms, r.RTTp90Ms = percentiles(okRTTs)
 		}
-		out[i] = r
+		out = append(out, r)
 	}
 	return out
 }

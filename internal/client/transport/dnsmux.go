@@ -179,17 +179,9 @@ func (c *DnsMuxTransport) runTunnel() {
 		dial = 60 * time.Second
 	}
 	_ = conn.SetDeadline(time.Now().Add(dial))
-	if err := utils.SendBinaryString(conn, c.config.Token); err != nil {
-		c.logger.Errorf("dnsmux: failed to send token: %v", err)
-		return
-	}
-	got, err := utils.ReceiveBinaryString(conn)
-	if err != nil {
-		c.logger.Errorf("dnsmux: token handshake: %v", err)
-		return
-	}
-	if got != c.config.Token {
-		c.logger.Error("dnsmux: server answered with a different token")
+	// Challenge-response: the token is never sent (the carrier is not encrypted).
+	if err := dnsx.ClientAuth(conn, c.config.Token); err != nil {
+		c.logger.Errorf("dnsmux: authentication: %v", err)
 		return
 	}
 	_ = conn.SetDeadline(time.Time{})

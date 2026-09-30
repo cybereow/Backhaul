@@ -169,6 +169,10 @@ func (ss *serverSession) idleSince(now time.Time) time.Duration {
 	return now.Sub(ss.last)
 }
 
+// IdleFor is how long ago the client last queried this session. A live client
+// polls at least every ~0.5s, so a long idle time means the client is gone.
+func (ss *serverSession) IdleFor() time.Duration { return ss.idleSince(time.Now()) }
+
 func (ss *serverSession) fail(err error) {
 	ss.mu.Lock()
 	if ss.err == nil {

@@ -42,6 +42,17 @@ type DnsMuxConfig struct {
 	AuthTimeout      time.Duration // token handshake deadline (default 60s: a DNS round trip is slow)
 }
 
+// dnsSession is one registered tunnel: the smux session plus how long its
+// carrier has been silent (nil when unknown).
+type dnsSession struct {
+	mux  *smux.Session
+	idle func() time.Duration
+}
+
+// staleAfter: a carrier silent this long has lost its client (which polls at
+// least every ~0.5s even on a bad path), so new streams must not go there.
+const staleAfter = 20 * time.Second
+
 type DnsMuxTransport struct {
 	config       *DnsMuxConfig
 	smuxConfig   *smux.Config
@@ -51,7 +62,7 @@ type DnsMuxTransport struct {
 	usageMonitor *web.Usage
 
 	mu       sync.Mutex
-	sessions []*smux.Session
+	sessions []*dnsSession
 	next     int
 }
 
@@ -146,8 +157,12 @@ func (s *DnsMuxTransport) handshake(conn net.Conn) {
 		return
 	}
 
+	ds := &dnsSession{mux: session}
+	if ic, ok := conn.(interface{ IdleFor() time.Duration }); ok {
+		ds.idle = ic.IdleFor
+	}
 	s.mu.Lock()
-	s.sessions = append(s.sessions, session)
+	s.sessions = append(s.sessions, ds)
 	n := len(s.sessions)
 	s.mu.Unlock()
 	s.config.TunnelStatus = "Connected (DNSMUX)"
@@ -161,7 +176,7 @@ func (s *DnsMuxTransport) handshake(conn net.Conn) {
 	session.Close()
 	s.mu.Lock()
 	for i, x := range s.sessions {
-		if x == session {
+		if x == ds {
 			s.sessions = append(s.sessions[:i], s.sessions[i+1:]...)
 			break
 		}
@@ -174,17 +189,25 @@ func (s *DnsMuxTransport) handshake(conn net.Conn) {
 	s.logger.Warnf("dnsmux: tunnel session closed (%d active)", remaining)
 }
 
-// pick returns a live session, round-robin.
+// pick returns a live session, round-robin, skipping closed ones and ones whose
+// client has gone silent (a dead tunnel lingers until the carrier's idle GC).
 func (s *DnsMuxTransport) pick() *smux.Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var fallback *smux.Session
 	for range s.sessions {
 		s.next = (s.next + 1) % len(s.sessions)
-		if sess := s.sessions[s.next]; !sess.IsClosed() {
-			return sess
+		ds := s.sessions[s.next]
+		if ds.mux.IsClosed() {
+			continue
 		}
+		if ds.idle != nil && ds.idle() > staleAfter {
+			fallback = ds.mux
+			continue
+		}
+		return ds.mux
 	}
-	return nil
+	return fallback
 }
 
 type dnsPortMap struct{ local, remote string }

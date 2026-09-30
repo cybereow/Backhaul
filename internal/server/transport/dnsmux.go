@@ -99,7 +99,7 @@ func (s *DnsMuxTransport) Start() {
 	srv := dnsx.NewServer(s.config.Domain, s.config.Key, s.logger)
 	// Real DNS round trips take 0.1-1.5s and vary widely; a 300ms minimum RTO
 	// would retransmit most segments spuriously and waste the scarce capacity.
-	srv.SetRel(rel.Config{MinRTO: 2 * time.Second, MaxRTO: 15 * time.Second})
+	srv.SetRel(rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: 32 * 1024})
 	go func() {
 		<-s.ctx.Done()
 		srv.Close()

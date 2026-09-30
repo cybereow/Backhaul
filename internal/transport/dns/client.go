@@ -18,8 +18,6 @@ import (
 const (
 	pollFast = 20 * time.Millisecond
 	pollIdle = 500 * time.Millisecond
-
-	minExchangeTimeout = 100 * time.Millisecond
 )
 
 // DialParams configures the client dialer.
@@ -33,6 +31,9 @@ type DialParams struct {
 	// workers raise throughput roughly linearly until the resolvers push back;
 	// extra workers only run while there is data to move.
 	Workers int
+	// Sel tunes profile selection (zero values take the sel defaults). Raising
+	// TopK spreads the workers over more resolver/record-type profiles.
+	Sel sel.Config
 	// Logf, if set, receives a periodic per-profile summary (debug aid).
 	Logf func(format string, args ...any)
 }
@@ -62,7 +63,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	rcfg.MSS = mss
 	rcfg.ISN = isn
 	ep := rel.New(rcfg)
-	mgr := sel.New(sel.Config{}, p.Profiles)
+	mgr := sel.New(p.Sel, p.Profiles)
 	sid := randNonce() // Use 32-bit of it
 	sid32 := uint32(sid)
 
@@ -77,6 +78,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	}
 	c.cond = sync.NewCond(&c.mu)
 	c.logf = p.Logf
+	c.pool = newConnPool()
 	c.stats = map[sel.Profile]*profStat{}
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
@@ -189,9 +191,9 @@ type clientConn struct {
 	recentRX    bool
 	logf        func(string, ...any)
 	stats       map[sel.Profile]*profStat
+	pool        *connPool
 	nextLog     time.Time
-	established bool          // first reply seen: stop sending SYN
-	srtt        time.Duration // smoothed exchange RTT, drives the per-exchange timeout
+	established bool // first reply seen: stop sending SYN
 }
 
 // loop is one exchange worker. The primary keeps polling while idle; helpers
@@ -282,36 +284,21 @@ func (c *clientConn) exchange() {
 		return buf
 	}
 
-	// A lost query/response is just a lost packet, so do not wait the full Timeout
-	// for it: 8x the smoothed RTT, floored at minExchangeTimeout.
+	// A lost query/response is just a lost packet (rel retransmits), but a slow
+	// one is not: cutting it off early throws away a reply that was on its way.
 	to := c.timeout
-	c.mu.Lock()
-	if c.srtt > 0 {
-		if t := 8 * c.srtt; t < to {
-			to = t
-		}
-		if to < minExchangeTimeout {
-			to = minExchangeTimeout
-		}
-	}
-	c.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(c.ctx, to)
 	defer cancel()
 
 	t0 := time.Now()
-	respData, _, _, rttMs, stage, _ := Exchange(ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
+	respData, _, _, rttMs, stage, _ := exchangeVia(c.pool, ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
 
 	now = time.Now()
 	c.mu.Lock()
 	if stage == StageOK {
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
 		c.established = true
-		if r := now.Sub(t0); c.srtt == 0 {
-			c.srtt = r
-		} else {
-			c.srtt = (7*c.srtt + r) / 8
-		}
 
 		if len(respData) >= 1 {
 			flags := respData[0]
@@ -480,6 +467,7 @@ func (c *clientConn) Close() error {
 		c.cancel()
 	}()
 	c.wg.Wait()
+	c.pool.closeAll()
 	return nil
 }
 

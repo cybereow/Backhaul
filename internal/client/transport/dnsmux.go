@@ -9,6 +9,7 @@ import (
 
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/transport/dns/rel"
+	"github.com/musix/backhaul/internal/transport/dns/sel"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
@@ -27,7 +28,7 @@ type DnsMuxConfig struct {
 	Resolvers        []string
 	RecordTypes      []string
 	Timeout          time.Duration // per DNS query (default 2s)
-	Workers          int           // DNS queries in flight per tunnel conn (default 4)
+	Workers          int           // DNS queries in flight per tunnel conn (default 16)
 	Token            string
 	RetryInterval    time.Duration
 	DialTimeOut      time.Duration
@@ -83,7 +84,7 @@ func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 		config.RetryInterval = 3 * time.Second
 	}
 	if config.Workers <= 0 {
-		config.Workers = 4
+		config.Workers = 16
 	}
 	if config.ConnPoolSize <= 0 {
 		config.ConnPoolSize = 1
@@ -136,7 +137,21 @@ func (c *DnsMuxTransport) tunnelLoop() {
 	}
 }
 
+// dnsMaxInflight is the unacked-byte window of the carrier (the default, 8 MSS,
+// would cap a stream at a few hundred bytes in flight however many workers run).
+const dnsMaxInflight = 32 * 1024
+
 func (c *DnsMuxTransport) runTunnel() {
+	// Spread workers over several profiles: one resolver/record type collapses
+	// well before the path does when it carries every in-flight query.
+	topK := c.config.Workers / 3
+	if topK < 2 {
+		topK = 2
+	}
+	if topK > 8 {
+		topK = 8
+	}
+
 	profiles := dnsx.DefaultProfiles(c.config.Domain, c.config.Resolvers, c.config.RecordTypes)
 	if len(profiles) == 0 {
 		c.logger.Error("dnsmux: no usable resolver/record-type profiles")
@@ -149,7 +164,8 @@ func (c *DnsMuxTransport) runTunnel() {
 		Profiles: profiles,
 		Timeout:  c.config.Timeout,
 		Workers:  c.config.Workers,
-		Rel:      rel.Config{MinRTO: 2 * time.Second, MaxRTO: 15 * time.Second}, // see the server side: real DNS RTTs are slow and jittery
+		Rel:      rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: dnsMaxInflight}, // see the server side: real DNS RTTs are slow and jittery
+		Sel:      sel.Config{TopK: topK, SpreadFloor: 0.3},
 		Logf:     c.logger.Debugf,
 	})
 	if err != nil {
@@ -160,7 +176,7 @@ func (c *DnsMuxTransport) runTunnel() {
 
 	dial := c.config.DialTimeOut
 	if dial <= 0 {
-		dial = 30 * time.Second
+		dial = 60 * time.Second
 	}
 	_ = conn.SetDeadline(time.Now().Add(dial))
 	if err := utils.SendBinaryString(conn, c.config.Token); err != nil {

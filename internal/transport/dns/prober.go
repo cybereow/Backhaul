@@ -338,6 +338,11 @@ func matchingPrefix(a, b []byte) int {
 
 // Exchange attempts a single query and response through the given resolver.
 func Exchange(ctx context.Context, domain string, key []byte, resolver string, rrType uint16, transport string, edns bool, respSize int, qDataFunc func(uint64) []byte, timeout time.Duration) (respData []byte, qSeen uint16, insideTCP bool, rttMs int64, stage Stage, err error) {
+	return exchangeVia(nil, ctx, domain, key, resolver, rrType, transport, edns, respSize, qDataFunc, timeout)
+}
+
+// exchangeVia is Exchange, optionally reusing TCP conns from pool.
+func exchangeVia(pool *connPool, ctx context.Context, domain string, key []byte, resolver string, rrType uint16, transport string, edns bool, respSize int, qDataFunc func(uint64) []byte, timeout time.Duration) (respData []byte, qSeen uint16, insideTCP bool, rttMs int64, stage Stage, err error) {
 	nonce := randNonce()
 
 	q := query{
@@ -361,7 +366,16 @@ func Exchange(ctx context.Context, domain string, key []byte, resolver string, r
 		msg.SetEdns0(1232, false)
 		client.UDPSize = 1232
 	}
-	reply, rtt, netErr := client.ExchangeContext(ctx, msg, resolver)
+	var (
+		reply  *dns.Msg
+		rtt    time.Duration
+		netErr error
+	)
+	if pool != nil && transport == "tcp" {
+		reply, rtt, netErr = pool.exchange(ctx, client, msg, resolver)
+	} else {
+		reply, rtt, netErr = client.ExchangeContext(ctx, msg, resolver)
+	}
 	rttMs = rtt.Milliseconds()
 	if netErr != nil {
 		return nil, 0, false, rttMs, StageUnknown, netErr

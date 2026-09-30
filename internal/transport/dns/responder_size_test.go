@@ -25,33 +25,41 @@ func longName(n int) string {
 	return b.String() + suffix
 }
 
-// The computed TXT budget must always produce a reply that packs to at most the
-// advertised size, for any question length, and use most of the room.
-func TestTxtMaxPayloadFitsTheReply(t *testing.T) {
-	for _, qlen := range []int{30, 60, 120, 200, 250} {
-		name := longName(qlen)
-		payload := make([]byte, txtMaxPayload(1232, len(name)))
-		rrs, err := txtCodec{}.answer(name, payload)
-		if err != nil {
-			t.Fatal(err)
-		}
-		m := new(dns.Msg)
-		m.SetQuestion(name, dns.TypeTXT)
-		m.Answer = rrs
-		m.Compress = true
-		m.SetEdns0(1232, false)
-		b, err := m.Pack()
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(b) > 1232 {
-			t.Errorf("qname %d bytes: reply %d > 1232 with %d payload bytes", qlen, len(b), len(payload))
-		}
-		if len(b) < 1232-40 {
-			t.Errorf("qname %d bytes: reply only %d of 1232 used", qlen, len(b))
+// For every record type and any question length, the largest payload the budget
+// allows must pack into a reply of at most the advertised size.
+func TestReplyBudgetFitsEveryCodec(t *testing.T) {
+	for _, c := range registry("t.example.com") {
+		for _, qlen := range []int{30, 120, 250} {
+			name := longName(qlen)
+			n := maxReplyPayload(c, name, 1232)
+			rrs, err := c.answer(name, make([]byte, n))
+			if err != nil {
+				t.Fatalf("%s: %v", c.name(), err)
+			}
+			m := new(dns.Msg)
+			m.SetQuestion(name, c.qtype())
+			m.Answer = rrs
+			m.Compress = true
+			m.SetEdns0(1232, false)
+			b, err := m.Pack()
+			if err != nil {
+				t.Fatalf("%s qname %d: %v", c.name(), qlen, err)
+			}
+			if len(b) > 1232 {
+				t.Errorf("%s qname %d bytes: reply %d > 1232 with %d payload bytes", c.name(), qlen, len(b), n)
+			}
+			if n > c.capacity() {
+				t.Errorf("%s: budget %d above its capacity %d", c.name(), n, c.capacity())
+			}
 		}
 	}
-	if short, long := txtMaxPayload(1232, 60), txtMaxPayload(1232, 250); short < 600 || long >= short {
-		t.Errorf("a short question should leave more room: %d vs %d", short, long)
+	// a short question leaves more room than a near-maximum one, for TXT
+	txt := txtCodec{}
+	if short, long := maxReplyPayload(txt, longName(60), 1232), maxReplyPayload(txt, longName(250), 1232); short < 600 || long >= short {
+		t.Errorf("TXT: short question should leave more room: %d vs %d", short, long)
+	}
+	// A records are bulky: the old nominal capacity of 180 bytes does not fit beside a long question
+	if n := maxReplyPayload(aCodec{}, longName(250), 1232); n >= 180 {
+		t.Errorf("A budget beside a long question should be below the nominal 180, got %d", n)
 	}
 }

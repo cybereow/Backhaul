@@ -151,9 +151,9 @@ func (s *Server) handle(sid uint32, flags byte, in []byte, maxResp int) ([]byte,
 		select {
 		case s.acceptCh <- ss:
 			s.sessions[sid] = ss
-		default: // accept queue full: drop, the client retries
+		default: // accept queue full: refuse, so the client errors out and reconnects later
 			s.mu.Unlock()
-			return nil, 0
+			return nil, FlagRST
 		}
 	}
 	s.mu.Unlock()

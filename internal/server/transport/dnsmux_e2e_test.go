@@ -14,6 +14,7 @@ import (
 	clienttransport "github.com/musix/backhaul/internal/client/transport"
 
 	"github.com/sirupsen/logrus"
+	"github.com/xtaci/smux"
 )
 
 func TestExpandPorts(t *testing.T) {
@@ -138,4 +139,25 @@ func roundTrip(addr string, payload []byte) ([]byte, error) {
 		return nil, err
 	}
 	return buf, nil
+}
+
+func TestPickSkipsClosedAndExcludedSessions(t *testing.T) {
+	mk := func() *smux.Session {
+		a, b := net.Pipe()
+		t.Cleanup(func() { a.Close(); b.Close() })
+		ses, err := smux.Client(a, smux.DefaultConfig())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ses
+	}
+	dead, live := mk(), mk()
+	dead.Close()
+	s := &DnsMuxTransport{sessions: []*dnsSession{{mux: dead}, {mux: live}}}
+	if got := s.pick(nil); got != live {
+		t.Fatal("pick returned a closed session")
+	}
+	if got := s.pick(map[*smux.Session]bool{live: true}); got != nil {
+		t.Fatal("pick returned an excluded session")
+	}
 }

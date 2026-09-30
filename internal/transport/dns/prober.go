@@ -303,7 +303,10 @@ func percentiles(rtts []int64) (min, p50, p90 int64) {
 	s := append([]int64(nil), rtts...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 	at := func(q int) int64 {
-		idx := (len(s)*q + 99) / 100
+		idx := (len(s)*q+99)/100 - 1 // nearest rank is 1-based
+		if idx < 0 {
+			idx = 0
+		}
 		if idx >= len(s) {
 			idx = len(s) - 1
 		}

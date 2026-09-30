@@ -183,12 +183,14 @@ func (r *Responder) answer(q dns.Question, inTCP bool, udpSz int) ([]dns.RR, err
 	}
 
 	// Tunnel mode: fit the reply to what the asker's UDP size allows beside THIS
-	// question (a short poll leaves far more room than a data-carrying query). A
-	// resolver that advertises no EDNS gets the old conservative segment size.
-	if r.Handler != nil && q.Qtype == dns.TypeTXT {
+	// question, for whatever record type is used (a short poll leaves far more
+	// room than a data-carrying query; A/AAAA/NULL/name types have their own
+	// framing costs). A resolver that advertises no EDNS gets the conservative
+	// segment size.
+	if r.Handler != nil {
 		budget := 1 + rel.HeaderLen + conservativeSegment
 		if udpSz >= 1232 {
-			budget = txtMaxPayload(1232, len(q.Name)) - envelopeOverhead
+			budget = maxReplyPayload(c, q.Name, 1232) - envelopeOverhead
 		}
 		if respLen > budget {
 			respLen = budget
@@ -260,16 +262,34 @@ func udpSize(req *dns.Msg) int {
 	return 0
 }
 
-// txtMaxPayload is how many raw payload bytes a single TXT answer can carry in a
-// reply of at most size bytes to a question with the given name length: the
-// header, the echoed question, one answer record with compressed owner, the EDNS
-// OPT record, and one length byte per 255 base32 characters are subtracted, then
-// base32 (5 bytes per 8 characters) is undone.
-func txtMaxPayload(size, qnameLen int) int {
-	fixed := 12 + (qnameLen + 2) + 4 + 12 + 11
-	chars := (size - fixed) * 255 / 256
-	if chars < 0 {
-		return 0
+// maxReplyPayload is the largest payload (the bytes handed to the codec) whose
+// complete reply - header, echoed question, answer records, EDNS OPT - still
+// packs to at most size bytes for a question named qname. Binary search over the
+// codec's own encoding, so every record type gets its real framing cost.
+func maxReplyPayload(c codec, qname string, size int) int {
+	fits := func(n int) bool {
+		rrs, err := c.answer(qname, make([]byte, n))
+		if err != nil {
+			return false
+		}
+		m := new(dns.Msg)
+		m.SetQuestion(qname, c.qtype())
+		m.Answer = rrs
+		m.Compress = true
+		m.SetEdns0(uint16(size), false)
+		return m.Len() <= size
 	}
-	return chars * 5 / 8
+	lo, hi := 0, c.capacity()
+	if fits(hi) {
+		return hi
+	}
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if fits(mid) {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return lo
 }

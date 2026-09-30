@@ -192,13 +192,13 @@ func (s *DnsMuxTransport) handshake(conn net.Conn) {
 // pick returns a live session, round-robin, skipping closed ones and ones whose
 // client has gone silent (a dead tunnel lingers until the carrier's idle GC); nil
 // when there is none, so the caller rejects the connection promptly.
-func (s *DnsMuxTransport) pick() *smux.Session {
+func (s *DnsMuxTransport) pick(skip map[*smux.Session]bool) *smux.Session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for range s.sessions {
 		s.next = (s.next + 1) % len(s.sessions)
 		ds := s.sessions[s.next]
-		if ds.mux.IsClosed() {
+		if ds.mux.IsClosed() || skip[ds.mux] {
 			continue
 		}
 		if ds.idle != nil && ds.idle() > staleAfter {
@@ -283,17 +283,24 @@ func (s *DnsMuxTransport) acceptLocal(l net.Listener, remote string) {
 }
 
 func (s *DnsMuxTransport) forward(local net.Conn, remote string) {
-	session := s.pick()
-	if session == nil {
-		s.logger.Debugf("dnsmux: no tunnel session, dropping connection from %s", local.RemoteAddr())
-		local.Close()
-		return
-	}
-	stream, err := session.OpenStream()
-	if err != nil {
+	// A session can die between pick and OpenStream (a pool member reconnecting):
+	// try the other live sessions before giving up on the user's connection.
+	var stream *smux.Stream
+	tried := map[*smux.Session]bool{}
+	for {
+		session := s.pick(tried)
+		if session == nil {
+			s.logger.Debugf("dnsmux: no tunnel session, dropping connection from %s", local.RemoteAddr())
+			local.Close()
+			return
+		}
+		st, err := session.OpenStream()
+		if err == nil {
+			stream = st
+			break
+		}
 		s.logger.Debugf("dnsmux: open stream: %v", err)
-		local.Close()
-		return
+		tried[session] = true
 	}
 	if err := utils.SendBinaryString(stream, remote); err != nil {
 		stream.Close()

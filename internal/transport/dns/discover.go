@@ -21,7 +21,8 @@ type ResolverScore struct {
 	Resolver string        `json:"resolver"`
 	OK       int           `json:"ok"`
 	N        int           `json:"n"`
-	Mean     time.Duration `json:"mean_ns"` // mean RTT of answered probes; stalls count, so flaky resolvers rank lower
+	Best     string        `json:"best,omitempty"` // the (record type/transport) pair that scored best
+	Mean     time.Duration `json:"mean_ns"`        // mean RTT of answered probes; stalls count, so flaky resolvers rank lower
 	Score    float64       `json:"score"`
 }
 
@@ -30,14 +31,19 @@ type DiscoverOpts struct {
 	Domain, Key string
 	RRTypes     []uint16      // record types a resolver may carry (default TXT, MX, AAAA, A): a candidate is kept if ANY works
 	Timeout     time.Duration // per probe (1.5s)
-	Conc        int           // probes in flight (64)
-	QPS         int           // stage-1 send rate, so a big candidate list is not a flood (150)
-	Samples     int           // stage-2 probes per survivor (6)
+	Conc        int           // DNS probes in flight, counted per probe (64)
+	QPS         int           // DNS probes started per second, counted per probe, so a big candidate list is not a flood (150)
+	Samples     int           // stage-2 probes per (record type, transport) pair (3)
 	Keep        int           // best resolvers returned (8)
 	CachePath   string        // if set: reuse a fresh cache, and write the result
 	CacheTTL    time.Duration // (30m)
+	Refresh     bool          // ignore the cache (e.g. after an outage with the cached set), but still write it
 	Logf        func(format string, args ...any)
+
+	lim *limiter
 }
+
+const maxStage2 = 64 // survivors measured in depth (the fastest to answer in stage 1)
 
 func (o *DiscoverOpts) defaults() {
 	if o.Timeout <= 0 {
@@ -53,7 +59,7 @@ func (o *DiscoverOpts) defaults() {
 		o.QPS = 150
 	}
 	if o.Samples <= 0 {
-		o.Samples = 6
+		o.Samples = 3
 	}
 	if o.Keep <= 0 {
 		o.Keep = 8
@@ -66,9 +72,40 @@ func (o *DiscoverOpts) defaults() {
 	}
 }
 
+// limiter enforces both limits on every individual DNS probe: at most Conc in
+// flight and at most QPS started per second.
+type limiter struct {
+	sem  chan struct{}
+	tick *time.Ticker
+}
+
+func newLimiter(conc, qps int) *limiter {
+	return &limiter{sem: make(chan struct{}, conc), tick: time.NewTicker(time.Second / time.Duration(qps))}
+}
+
+func (l *limiter) acquire(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-l.tick.C:
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case l.sem <- struct{}{}:
+		return true
+	}
+}
+
+func (l *limiter) release() { <-l.sem }
+
 // probe sends one throwaway diagnostic query (1 byte of data: the responder
 // answers it without touching any session) through resolver over transport.
 func (o DiscoverOpts) probe(ctx context.Context, resolver string, rrType uint16, transport string) (time.Duration, bool) {
+	if !o.lim.acquire(ctx) {
+		return 0, false
+	}
+	defer o.lim.release()
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 	t0 := time.Now()
@@ -77,109 +114,143 @@ func (o DiscoverOpts) probe(ctx context.Context, resolver string, rrType uint16,
 	return time.Since(t0), stage == StageOK
 }
 
-// probeAny reports whether resolver carries any allowed record type over UDP or
-// TCP. The combinations run in parallel, so a dead resolver costs one timeout.
-func (o DiscoverOpts) probeAny(ctx context.Context, resolver string) bool {
+// firstAnswer probes every allowed record type over UDP and TCP in parallel (each
+// probe under the shared limiter) and returns how fast the first success came.
+func (o DiscoverOpts) firstAnswer(ctx context.Context, resolver string) (time.Duration, bool) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	res := make(chan bool, len(o.RRTypes)*2) // buffered: probes cancelled after the first success must not block
+	type result struct {
+		d  time.Duration
+		ok bool
+	}
+	res := make(chan result, len(o.RRTypes)*2) // buffered: probes cancelled after the first success must not block
 	n := 0
 	for _, t := range o.RRTypes {
 		for _, tr := range []string{"udp", "tcp"} {
 			n++
 			go func(t uint16, tr string) {
-				_, ok := o.probe(ctx, resolver, t, tr)
-				res <- ok
+				d, ok := o.probe(ctx, resolver, t, tr)
+				res <- result{d, ok}
 			}(t, tr)
 		}
 	}
 	for i := 0; i < n; i++ {
-		if <-res {
-			return true
+		if r := <-res; r.ok {
+			return r.d, true
 		}
 	}
-	return false
+	return 0, false
+}
+
+// pairScore measures one (record type, transport) pair with Samples probes. A
+// probe that ran into its timeout counts at full length, so stalls lower the score.
+func (o DiscoverOpts) pairScore(ctx context.Context, resolver string, rrType uint16, tr string) ResolverScore {
+	s := ResolverScore{Resolver: resolver, Best: dns.TypeToString[rrType] + "/" + tr}
+	var sumOK, sumAll time.Duration
+	for k := 0; k < o.Samples && ctx.Err() == nil; k++ {
+		d, ok := o.probe(ctx, resolver, rrType, tr)
+		s.N++
+		sumAll += d
+		if ok {
+			s.OK++
+			sumOK += d
+		}
+	}
+	if s.OK > 0 {
+		s.Mean = sumOK / time.Duration(s.OK)
+		rate := float64(s.OK) / float64(s.N)
+		s.Score = rate * rate / (sumAll.Seconds()/float64(s.N) + 0.05)
+	}
+	return s
 }
 
 // DiscoverResolvers finds the good resolvers among candidates: a rate-limited
-// reachability sweep (UDP, then TCP) over everything, then a few repeated probes
-// of each survivor to measure success and round-trip time including stalls. The
-// best Keep resolvers are returned, best first. Nothing about the candidates is
-// assumed: it works for any list (built-in, user CIDRs, anything else).
+// reachability sweep over everything (every allowed record type, UDP and TCP),
+// then every (record type, transport) pair of the fastest survivors is sampled
+// and each resolver is ranked by its best pair - a resolver that blocks some
+// types but carries one well is still good. The best Keep are returned, best
+// first. Nothing about the candidates is assumed: it works for any list
+// (built-in, user CIDRs, anything else).
 func DiscoverResolvers(ctx context.Context, candidates []string, o DiscoverOpts) []ResolverScore {
 	o.defaults()
 	inputs := discoveryInputs(o, candidates)
-	if o.CachePath != "" {
+	if o.CachePath != "" && !o.Refresh {
 		if cached := loadCache(o.CachePath, o.CacheTTL, inputs); len(cached) > 0 {
 			o.Logf("dns discovery: using %d cached resolvers from %s", len(cached), o.CachePath)
 			return cached
 		}
 	}
+	o.lim = newLimiter(o.Conc, o.QPS)
+	defer o.lim.tick.Stop()
 
-	cands := make([]string, 0, len(candidates))
+	seen := map[string]bool{}
+	var cands []string
 	for _, c := range candidates {
-		cands = append(cands, withPort(c))
+		c = withPort(c)
+		if !seen[c] { // "1.2.3.4" and "1.2.3.4:53" are one resolver
+			seen[c] = true
+			cands = append(cands, c)
+		}
 	}
 
-	// Stage 1: who answers at all.
+	// Stage 1: who answers at all, and how fast.
+	type alive struct {
+		r string
+		d time.Duration
+	}
 	var mu sync.Mutex
-	var alive []string
-	sem := make(chan struct{}, o.Conc)
-	tick := time.NewTicker(time.Second / time.Duration(o.QPS))
-	defer tick.Stop()
+	var up []alive
 	var wg sync.WaitGroup
-stage1:
+	outer := make(chan struct{}, o.Conc) // bounds goroutines; the limiter bounds the probes themselves
 	for _, c := range cands {
-		select {
-		case <-ctx.Done():
-			break stage1
-		case <-tick.C:
+		if ctx.Err() != nil {
+			break
 		}
-		sem <- struct{}{}
+		outer <- struct{}{}
 		wg.Add(1)
 		go func(c string) {
 			defer wg.Done()
-			defer func() { <-sem }()
-			if o.probeAny(ctx, c) {
+			defer func() { <-outer }()
+			if d, ok := o.firstAnswer(ctx, c); ok {
 				mu.Lock()
-				alive = append(alive, c)
+				up = append(up, alive{c, d})
 				mu.Unlock()
 			}
 		}(c)
 	}
 	wg.Wait()
-	o.Logf("dns discovery: %d/%d candidates answered", len(alive), len(cands))
+	o.Logf("dns discovery: %d/%d candidates answered", len(up), len(cands))
+	sort.Slice(up, func(i, j int) bool { return up[i].d < up[j].d })
+	if len(up) > maxStage2 {
+		up = up[:maxStage2]
+	}
 
-	// Stage 2: how good are the ones that answered.
-	scores := make([]ResolverScore, len(alive))
-	for i, r := range alive {
+	// Stage 2: sample every pair of each survivor; a resolver's score is its best pair.
+	scores := make([]ResolverScore, len(up))
+	for i, a := range up {
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(i int, r string) {
 			defer wg.Done()
-			defer func() { <-sem }()
-			s := ResolverScore{Resolver: r}
-			var sumOK, sumAll time.Duration
-			for k := 0; k < o.Samples && ctx.Err() == nil; k++ {
-				tr := "udp"
-				if k%2 == 1 {
-					tr = "tcp"
-				}
-				d, ok := o.probe(ctx, r, o.RRTypes[(k/2)%len(o.RRTypes)], tr)
-				s.N++
-				sumAll += d // a probe that ran into its timeout counts at full length
-				if ok {
-					s.OK++
-					sumOK += d
+			var pairs sync.WaitGroup
+			var pm sync.Mutex
+			best := ResolverScore{Resolver: r}
+			for _, t := range o.RRTypes {
+				for _, tr := range []string{"udp", "tcp"} {
+					pairs.Add(1)
+					go func(t uint16, tr string) {
+						defer pairs.Done()
+						ps := o.pairScore(ctx, r, t, tr)
+						pm.Lock()
+						if ps.Score > best.Score {
+							best = ps
+						}
+						pm.Unlock()
+					}(t, tr)
 				}
 			}
-			if s.OK > 0 {
-				s.Mean = sumOK / time.Duration(s.OK)
-				rate := float64(s.OK) / float64(s.N)
-				s.Score = rate * rate / (sumAll.Seconds()/float64(s.N) + 0.05)
-			}
-			scores[i] = s
-		}(i, r)
+			pairs.Wait()
+			scores[i] = best
+		}(i, a.r)
 	}
 	wg.Wait()
 
@@ -194,7 +265,7 @@ stage1:
 		out = out[:o.Keep]
 	}
 	for _, s := range out {
-		o.Logf("dns discovery: %-22s ok %d/%d mean %v score %.1f", s.Resolver, s.OK, s.N, s.Mean.Round(time.Millisecond), s.Score)
+		o.Logf("dns discovery: %-22s best %-8s ok %d/%d mean %v score %.1f", s.Resolver, s.Best, s.OK, s.N, s.Mean.Round(time.Millisecond), s.Score)
 	}
 	if o.CachePath != "" && len(out) > 0 {
 		saveCache(o.CachePath, inputs, out)

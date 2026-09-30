@@ -133,3 +133,67 @@ func TestDefaultProfilesDedupesNormalizedResolvers(t *testing.T) {
 		t.Fatalf("got %d profiles, want 2: %v", len(got), got)
 	}
 }
+
+func TestDiscoverKeepsResolverThatCarriesOnlyOneType(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := NewResponder(domain, key, newTestLogger())
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if len(req.Question) == 1 && req.Question[0].Qtype == dns.TypeA { // everything else is filtered
+			r.handle(w, req)
+		}
+	})}
+	go func() { _ = srv.ActivateAndServe() }()
+	defer srv.Shutdown()
+
+	got := DiscoverResolvers(context.Background(), []string{pc.LocalAddr().String()}, DiscoverOpts{
+		Domain: domain, Key: key, Timeout: 400 * time.Millisecond,
+	})
+	if len(got) != 1 || got[0].Best != "A/udp" {
+		t.Fatalf("resolver whose only carrier is A dropped or mis-scored: %+v", got)
+	}
+}
+
+func TestDiscoverDedupesAndRefreshes(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	addr := startResponder(t, domain, key, 0)
+	cache := filepath.Join(t.TempDir(), "r.json")
+	opts := DiscoverOpts{Domain: domain, Key: key, Timeout: time.Second, CachePath: cache}
+	got := DiscoverResolvers(context.Background(), []string{addr, " " + addr + " "}, opts)
+	if len(got) != 1 {
+		t.Fatalf("the same endpoint listed twice must be one resolver: %+v", got)
+	}
+	// Refresh must bypass the cache: with no time to answer, a cache hit would still return the entry.
+	opts.Refresh, opts.Timeout = true, time.Nanosecond
+	if got := DiscoverResolvers(context.Background(), []string{addr, " " + addr + " "}, opts); len(got) != 0 {
+		t.Fatalf("Refresh still served the cache: %+v", got)
+	}
+}
+
+func TestDiscoverRespectsQPSPerProbe(t *testing.T) {
+	var dead []string
+	for i := 0; i < 5; i++ {
+		c, _ := net.ListenPacket("udp", "127.0.0.1:0")
+		dead = append(dead, c.LocalAddr().String())
+		c.Close()
+	}
+	// 5 candidates x 4 record types x 2 transports = 40 probes; at 20/s that takes >= ~2s
+	start := time.Now()
+	DiscoverResolvers(context.Background(), dead, DiscoverOpts{Domain: "t.example.com", Key: "k", Timeout: 300 * time.Millisecond, QPS: 20})
+	if el := time.Since(start); el < 1800*time.Millisecond {
+		t.Errorf("40 probes at 20 QPS finished in %v: the limit is applied per candidate, not per probe", el)
+	}
+}
+
+func TestPercentilesNearestRank(t *testing.T) {
+	if _, p50, _ := percentiles([]int64{10, 20}); p50 != 10 {
+		t.Errorf("p50 of two samples = %d, want the lower (10)", p50)
+	}
+	ten := []int64{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
+	if _, p50, p90 := percentiles(ten); p50 != 5 || p90 != 9 {
+		t.Errorf("p50/p90 of 1..10 = %d/%d, want 5/9", p50, p90)
+	}
+}

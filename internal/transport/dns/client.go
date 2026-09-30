@@ -19,6 +19,7 @@ import (
 const (
 	outageLimit  = 90 * time.Second // sustained total failure after which the carrier is torn down
 	closeGrace   = 3 * time.Second  // max wait for the FIN exchange in Close
+	rxWindow     = time.Second      // how long receive activity keeps helper workers polling
 	minClientMSS = 16               // below this the tunnel is not worth running
 	pollFast     = 20 * time.Millisecond
 	pollIdle     = 500 * time.Millisecond
@@ -255,7 +256,7 @@ type clientConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
-	recentRX    bool
+	lastRX      time.Time // when data (or an advancing ACK) last arrived
 	logf        func(string, ...any)
 	stats       map[sel.Profile]*profStat
 	pool        *connPool
@@ -284,7 +285,7 @@ func (c *clientConn) loop(primary bool) {
 		case <-timer.C:
 			if !primary {
 				c.mu.Lock()
-				busy := c.ep.Pending() > 0 || c.recentRX || c.ep.PeerWnd() == 0
+				busy := c.ep.Pending() > 0 || c.recentRX() || c.ep.PeerWnd() == 0
 				c.mu.Unlock()
 				if !busy {
 					timer.Reset(pollFast)
@@ -295,10 +296,7 @@ func (c *clientConn) loop(primary bool) {
 
 			c.mu.Lock()
 			pending := c.ep.Pending()
-			recent := c.recentRX
-			if primary {
-				c.recentRX = false
-			}
+			recent := c.recentRX()
 			peerWnd := c.ep.PeerWnd()
 			c.mu.Unlock()
 
@@ -418,7 +416,7 @@ func (c *clientConn) exchange() {
 					// Only new data or an ACK that actually advanced counts as
 					// activity; the cumulative ACK alone is nonzero forever.
 					if len(p.Data) > 0 || c.ep.Pending() < pendingBefore {
-						c.recentRX = true
+						c.lastRX = now
 					}
 					c.notifyAll()
 				}
@@ -466,7 +464,7 @@ func (c *clientConn) hedgeDelay() time.Duration {
 // keeps the pipe full while a stalled exchange is still waiting.
 func (c *clientConn) startHedge() {
 	c.mu.Lock()
-	busy := c.ep.Pending() > 0 || c.recentRX
+	busy := c.ep.Pending() > 0 || c.recentRX()
 	c.mu.Unlock()
 	if !busy || c.ctx.Err() != nil {
 		return
@@ -481,6 +479,14 @@ func (c *clientConn) startHedge() {
 		defer c.hedges.Add(-1)
 		c.exchange()
 	}()
+}
+
+// recentRX reports whether data arrived within rxWindow. It is a time window, not
+// a flag one worker consumes: helper workers sleep on their own timers and would
+// otherwise never see receive activity, so downloads ran through one poller.
+// mu must be held.
+func (c *clientConn) recentRX() bool {
+	return !c.lastRX.IsZero() && time.Since(c.lastRX) < rxWindow
 }
 
 // record updates the per-profile counters and, at most every 5s, logs them.

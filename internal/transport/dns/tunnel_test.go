@@ -668,3 +668,37 @@ func TestSustainedOutageEndsTheCarrier(t *testing.T) {
 		t.Fatal("carrier still alive long after a sustained outage")
 	}
 }
+
+func TestFullAcceptQueueRefusesNewSessions(t *testing.T) {
+	srv := NewServer("t.example.com", "k", newTestLogger())
+	defer srv.Close()
+	for i := 0; i < cap(srv.acceptCh); i++ {
+		srv.acceptCh <- nil // nobody is accepting
+	}
+	pk := rel.Packet{}
+	out, flags := srv.handle(7, FlagSYN, pk.Marshal(), 400)
+	if out != nil || flags != FlagRST {
+		t.Fatalf("a SYN with a full accept queue must be refused (RST), got flags=%d out=%v", flags, out != nil)
+	}
+	srv.mu.Lock()
+	n := len(srv.sessions)
+	srv.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("refused SYN left %d sessions behind", n)
+	}
+}
+
+func TestReceiveActivityIsAWindow(t *testing.T) {
+	c := &clientConn{}
+	if c.recentRX() {
+		t.Fatal("no activity yet")
+	}
+	c.lastRX = time.Now()
+	if !c.recentRX() {
+		t.Fatal("fresh activity not visible")
+	}
+	c.lastRX = time.Now().Add(-2 * rxWindow)
+	if c.recentRX() {
+		t.Fatal("stale activity still counted")
+	}
+}

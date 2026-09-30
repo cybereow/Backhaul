@@ -28,7 +28,7 @@ type DnsMuxConfig struct {
 	Resolvers        []string
 	RecordTypes      []string
 	Timeout          time.Duration // per DNS query (default 2s)
-	Workers          int           // DNS queries in flight per tunnel conn (default 16)
+	Workers          int           // DNS queries in flight per tunnel conn (default 8)
 	Token            string
 	RetryInterval    time.Duration
 	DialTimeOut      time.Duration
@@ -84,7 +84,7 @@ func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 		config.RetryInterval = 3 * time.Second
 	}
 	if config.Workers <= 0 {
-		config.Workers = 16
+		config.Workers = 8
 	}
 	if config.ConnPoolSize <= 0 {
 		config.ConnPoolSize = 1

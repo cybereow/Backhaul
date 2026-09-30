@@ -31,5 +31,6 @@ log_level = "info"
 # dns_timeout_ms = 2000        # per-query timeout
 # dns_workers = 8              # DNS queries in flight per tunnel connection (8 measured best; more only adds retransmits)
 # connection_pool = 1          # parallel tunnel connections
+# dns_no_hedge = false         # hedging: start one extra query when one is slow (resolvers sometimes sit on a query ~2s)
 # retry_interval = 3
 # log_level = "info"

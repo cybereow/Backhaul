@@ -110,6 +110,7 @@ func (c *Client) Start() {
 			RecordTypes:      c.config.DNSRecordTypes,
 			Timeout:          time.Duration(c.config.DNSTimeoutMS) * time.Millisecond,
 			Workers:          c.config.DNSWorkers,
+			NoHedge:          c.config.DNSNoHedge,
 			Token:            c.config.Token,
 			RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,

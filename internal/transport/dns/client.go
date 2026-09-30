@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
@@ -33,6 +34,11 @@ type DialParams struct {
 	// workers raise throughput roughly linearly until the resolvers push back;
 	// extra workers only run while there is data to move.
 	Workers int
+	// NoHedge turns off hedging: an exchange that has not answered after a few
+	// typical round trips otherwise starts one extra exchange (up to Workers
+	// extra in flight) so a resolver that occasionally stalls ~2s does not stall
+	// the stream.
+	NoHedge bool
 	// Sel tunes profile selection (zero values take the sel defaults). Raising
 	// TopK spreads the workers over more resolver/record-type profiles.
 	Sel sel.Config
@@ -83,6 +89,8 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	c.cond = sync.NewCond(&c.mu)
 	c.logf = p.Logf
 	c.pool = newConnPool()
+	c.hedge = !p.NoHedge
+	c.maxHedge = int32(max(p.Workers, 1))
 	c.stats = map[sel.Profile]*profStat{}
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
@@ -243,6 +251,10 @@ type clientConn struct {
 	logf        func(string, ...any)
 	stats       map[sel.Profile]*profStat
 	pool        *connPool
+	hedge       bool          // hedging enabled
+	maxHedge    int32         // cap on extra in-flight exchanges
+	hedges      atomic.Int32  // extra exchanges currently in flight
+	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
 	nextLog     time.Time
 	established bool // first reply seen: stop sending SYN
 }
@@ -335,13 +347,42 @@ func (c *clientConn) exchange() {
 	defer cancel()
 
 	t0 := time.Now()
-	respData, _, _, rttMs, stage, _ := exchangeVia(c.pool, ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
+	type netResult struct {
+		data  []byte
+		rttMs int64
+		stage Stage
+	}
+	resCh := make(chan netResult, 1)
+	go func() {
+		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
+		resCh <- netResult{d, ms, st}
+	}()
+	var res netResult
+	if c.hedge {
+		select {
+		case res = <-resCh:
+		case <-time.After(c.hedgeDelay()):
+			c.startHedge()
+			res = <-resCh
+		}
+	} else {
+		res = <-resCh
+	}
+	respData, rttMs, stage := res.data, res.rttMs, res.stage
 
 	now = time.Now()
 	c.mu.Lock()
 	if stage == StageOK {
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
 		c.established = true
+		// Track typical (not stalled) round trips: cap so a 2s stall cannot push
+		// the hedge delay up to where hedging stops helping.
+		rt := min(time.Duration(rttMs)*time.Millisecond, hedgeMaxDelay)
+		if c.srtt == 0 {
+			c.srtt = rt
+		} else {
+			c.srtt = (7*c.srtt + rt) / 8
+		}
 		if isFIN {
 			c.finOnce.Do(func() { close(c.finDone) })
 		}
@@ -384,6 +425,46 @@ func (c *clientConn) exchange() {
 	}
 
 	c.mu.Unlock()
+}
+
+const (
+	hedgeMinDelay = 250 * time.Millisecond
+	hedgeMaxDelay = 1200 * time.Millisecond
+)
+
+// hedgeDelay is how long an exchange may run before a helper is started: a few
+// typical round trips, clamped.
+func (c *clientConn) hedgeDelay() time.Duration {
+	c.mu.Lock()
+	d := 3 * c.srtt
+	c.mu.Unlock()
+	if d == 0 {
+		d = 400 * time.Millisecond
+	}
+	return min(max(d, hedgeMinDelay), hedgeMaxDelay)
+}
+
+// startHedge runs one extra exchange in the background when there is data to
+// move and the extra-exchange budget allows. Each extra exchange carries its own
+// packet and processes its own reply, so nothing is duplicated or wasted; it just
+// keeps the pipe full while a stalled exchange is still waiting.
+func (c *clientConn) startHedge() {
+	c.mu.Lock()
+	busy := c.ep.Pending() > 0 || c.recentRX
+	c.mu.Unlock()
+	if !busy || c.ctx.Err() != nil {
+		return
+	}
+	if c.hedges.Add(1) > c.maxHedge {
+		c.hedges.Add(-1)
+		return
+	}
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		defer c.hedges.Add(-1)
+		c.exchange()
+	}()
 }
 
 // record updates the per-profile counters and, at most every 5s, logs them.

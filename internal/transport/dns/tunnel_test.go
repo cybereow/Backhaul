@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -550,5 +551,73 @@ func TestServerCloseStopsListener(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve still running after Close")
+	}
+}
+
+// stallConn delays replies, like a resolver that sits on a query for a couple
+// of seconds before answering, and records how many stalled replies were pending
+// at once (= exchanges the client had in flight).
+type stallConn struct {
+	net.PacketConn
+	delay   time.Duration
+	pending atomic.Int32
+	peak    atomic.Int32
+}
+
+func (c *stallConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n := c.pending.Add(1)
+	for {
+		old := c.peak.Load()
+		if n <= old || c.peak.CompareAndSwap(old, n) {
+			break
+		}
+	}
+	cp := append([]byte(nil), p...)
+	time.AfterFunc(c.delay, func() {
+		_, _ = c.PacketConn.WriteTo(cp, addr)
+		c.pending.Add(-1)
+	})
+	return len(p), nil
+}
+
+// peakInflight runs a client against a resolver that delays every reply by
+// 1.5s and returns the most exchanges it ever had in flight.
+func peakInflight(t *testing.T, noHedge bool) int32 {
+	t.Helper()
+	domain, key := "tunnel.example.com", "secret"
+	srv := NewServer(domain, key, newTestLogger())
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := &stallConn{PacketConn: pc, delay: 1500 * time.Millisecond}
+	ds := &dns.Server{PacketConn: sc, Handler: dns.HandlerFunc(srv.responder.handle)}
+	go func() { _ = ds.ActivateAndServe() }()
+	defer ds.Shutdown()
+	defer srv.Close()
+
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Workers: 4, NoHedge: noHedge,
+		Profiles: []sel.Profile{{Resolver: pc.LocalAddr().String(), RRType: 16, Transport: "udp", Cap: 700}},
+		Timeout:  4 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = cli.Write(payload(11, 32*1024)) }() // keep data pending so helpers are allowed
+	time.Sleep(5 * time.Second)
+	cli.Close()
+	return sc.peak.Load()
+}
+
+func TestHedgingKeepsThePipeFullDuringStalls(t *testing.T) {
+	plain := peakInflight(t, true)
+	hedged := peakInflight(t, false)
+	t.Logf("peak in-flight exchanges with every reply stalled 1.5s (4 workers): no hedging %d, hedging %d", plain, hedged)
+	if plain > 4 {
+		t.Errorf("without hedging the client had %d in flight, want <= 4 workers", plain)
+	}
+	if hedged <= 4 {
+		t.Errorf("with hedging the client never exceeded its 4 workers (peak %d)", hedged)
 	}
 }

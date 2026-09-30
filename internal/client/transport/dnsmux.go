@@ -30,6 +30,7 @@ type DnsMuxConfig struct {
 	RecordTypes      []string
 	Timeout          time.Duration // per DNS query (default 2s)
 	Workers          int           // DNS queries in flight per tunnel conn (default 8)
+	NoHedge          bool          // disable hedging
 	Token            string
 	RetryInterval    time.Duration
 	DialTimeOut      time.Duration
@@ -169,6 +170,7 @@ func (c *DnsMuxTransport) runTunnel() {
 		Profiles: profiles,
 		Timeout:  c.config.Timeout,
 		Workers:  c.config.Workers,
+		NoHedge:  c.config.NoHedge,
 		Rel:      rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: dnsMaxInflight}, // see the server side: real DNS RTTs are slow and jittery
 		Sel:      sel.Config{TopK: topK, SpreadFloor: 0.3},
 		Logf:     c.logger.Debugf,

@@ -102,6 +102,7 @@ type ClientConfig struct {
 	DNSResolvers         []string      `toml:"dns_resolvers"`    // dnsmux: recursive resolvers to query (never the authoritative server directly); empty or "auto" = built-in list, tested at startup
 	DNSRecordTypes       []string      `toml:"dns_record_types"` // dnsmux: limit the RR types tried (default all); the best one is auto-selected
 	DNSTimeoutMS         int           `toml:"dns_timeout_ms"`   // dnsmux: per-query timeout (default 2000)
+	DNSNoHedge           bool          `toml:"dns_no_hedge"`     // dnsmux: disable hedging (extra exchange when one stalls)
 	DNSWorkers           int           `toml:"dns_workers"`      // dnsmux: DNS queries in flight per tunnel connection (default 8)
 	TLSVerify            bool          `toml:"tls_verify"`       // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
 }

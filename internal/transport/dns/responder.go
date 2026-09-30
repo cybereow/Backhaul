@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	"github.com/miekg/dns"
+	"github.com/musix/backhaul/internal/transport/dns/rel"
 	"github.com/sirupsen/logrus"
 )
 
@@ -118,7 +119,7 @@ func (r *Responder) handle(w dns.ResponseWriter, req *dns.Msg) {
 	}
 
 	_, inTCP := w.RemoteAddr().(*net.TCPAddr)
-	rrs, err := r.answer(q, inTCP)
+	rrs, err := r.answer(q, inTCP, udpSize(req))
 	if err != nil {
 		// Not our payload (foreign name, bad MAC, garbage): behave like an
 		// ordinary authoritative server with nothing to say.
@@ -153,7 +154,7 @@ func (r *Responder) handle(w dns.ResponseWriter, req *dns.Msg) {
 // payload of the requested size into answer records of the question's type.
 // inTCP is the transport the query arrived on, echoed back so the prober can
 // see the resolver->inside hop.
-func (r *Responder) answer(q dns.Question, inTCP bool) ([]dns.RR, error) {
+func (r *Responder) answer(q dns.Question, inTCP bool, udpSz int) ([]dns.RR, error) {
 	raw, err := decodeName(q.Name, r.domain)
 	if err != nil {
 		return nil, err
@@ -179,6 +180,22 @@ func (r *Responder) answer(q dns.Question, inTCP bool) ([]dns.RR, error) {
 	}
 	if respLen < 0 {
 		respLen = 0
+	}
+
+	// Tunnel mode: fit the reply to what the asker's UDP size allows beside THIS
+	// question (a short poll leaves far more room than a data-carrying query). A
+	// resolver that advertises no EDNS gets the old conservative segment size.
+	if r.Handler != nil && q.Qtype == dns.TypeTXT {
+		budget := 1 + rel.HeaderLen + conservativeSegment
+		if udpSz >= 1232 {
+			budget = txtMaxPayload(1232, len(q.Name)) - envelopeOverhead
+		}
+		if respLen > budget {
+			respLen = budget
+		}
+		if respLen < 0 {
+			respLen = 0
+		}
 	}
 
 	var respData []byte
@@ -228,4 +245,31 @@ func stripPort(addr string) string {
 		return h
 	}
 	return strings.TrimSpace(addr)
+}
+
+// conservativeSegment is the server->client segment size used when the asking
+// resolver advertises no usable EDNS size: base32 of it plus a worst-case
+// question still fits a 1232-byte message.
+const conservativeSegment = 400
+
+// udpSize is the UDP payload size the asker advertises (0 without EDNS).
+func udpSize(req *dns.Msg) int {
+	if opt := req.IsEdns0(); opt != nil {
+		return int(opt.UDPSize())
+	}
+	return 0
+}
+
+// txtMaxPayload is how many raw payload bytes a single TXT answer can carry in a
+// reply of at most size bytes to a question with the given name length: the
+// header, the echoed question, one answer record with compressed owner, the EDNS
+// OPT record, and one length byte per 255 base32 characters are subtracted, then
+// base32 (5 bytes per 8 characters) is undone.
+func txtMaxPayload(size, qnameLen int) int {
+	fixed := 12 + (qnameLen + 2) + 4 + 12 + 11
+	chars := (size - fixed) * 255 / 256
+	if chars < 0 {
+		return 0
+	}
+	return chars * 5 / 8
 }

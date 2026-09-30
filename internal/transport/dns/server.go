@@ -16,9 +16,8 @@ const (
 	sessionIdle = 60 * time.Second
 	gcInterval  = 10 * time.Second
 	acceptQueue = 64
-	// maxSegment is the largest server->client rel segment (data bytes): base32
-	// of it plus a 255-byte question still fits a 1232-byte EDNS response.
-	maxSegment   = 400
+	// maxSegment is the largest server->client rel segment (data bytes).
+	maxSegment   = 1000 // sanity bound only; the responder sizes each reply to its question
 	errClosedStr = "dnsx: server closed"
 )
 

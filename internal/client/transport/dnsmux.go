@@ -28,6 +28,8 @@ type DnsMuxConfig struct {
 	Key              string
 	Resolvers        []string // empty or containing "auto": also test dnsx.DefaultResolvers
 	RecordTypes      []string
+	ResolverCIDRs    []string      // extra candidates to discover (CIDRs or IPs)
+	ResolverCache    string        // discovery result cache file
 	Timeout          time.Duration // per DNS query (default 2s)
 	Workers          int           // DNS queries in flight per tunnel conn (default 8)
 	NoHedge          bool          // disable hedging
@@ -158,7 +160,32 @@ func (c *DnsMuxTransport) runTunnel() {
 		topK = 8
 	}
 
-	profiles := dnsx.DefaultProfiles(c.config.Domain, dnsx.ExpandResolvers(c.config.Resolvers), c.config.RecordTypes)
+	resolvers := dnsx.ExpandResolvers(c.config.Resolvers)
+	if dnsx.IsAuto(c.config.Resolvers) || len(c.config.ResolverCIDRs) > 0 {
+		// Discovery: measure every candidate and keep the best few, whatever the
+		// list came from (built-in, configured, or a CIDR sweep).
+		cands := resolvers
+		if len(c.config.ResolverCIDRs) > 0 {
+			extra, err := dnsx.ExpandCIDRs(c.config.ResolverCIDRs, 4096)
+			if err != nil {
+				c.logger.Errorf("dnsmux: dns_resolver_cidrs: %v", err)
+				return
+			}
+			cands = append(cands, extra...)
+		}
+		ranked := dnsx.DiscoverResolvers(c.ctx, cands, dnsx.DiscoverOpts{
+			Domain: c.config.Domain, Key: c.config.Key, CachePath: c.config.ResolverCache, Logf: c.logger.Infof,
+		})
+		if len(ranked) == 0 {
+			c.logger.Error("dnsmux: no candidate resolver reached the server; will retry")
+			return
+		}
+		resolvers = resolvers[:0:0]
+		for _, r := range ranked {
+			resolvers = append(resolvers, r.Resolver)
+		}
+	}
+	profiles := dnsx.DefaultProfiles(c.config.Domain, resolvers, c.config.RecordTypes)
 	if len(profiles) == 0 {
 		c.logger.Error("dnsmux: no usable resolver/record-type profiles")
 		return

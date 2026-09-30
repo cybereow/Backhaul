@@ -108,6 +108,8 @@ func (c *Client) Start() {
 			Key:              dnsKey,
 			Resolvers:        c.config.DNSResolvers,
 			RecordTypes:      c.config.DNSRecordTypes,
+			ResolverCIDRs:    c.config.DNSResolverCIDRs,
+			ResolverCache:    c.config.DNSResolverCache,
 			Timeout:          time.Duration(c.config.DNSTimeoutMS) * time.Millisecond,
 			Workers:          c.config.DNSWorkers,
 			NoHedge:          c.config.DNSNoHedge,

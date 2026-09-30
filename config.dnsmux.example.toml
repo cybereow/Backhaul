@@ -28,6 +28,8 @@ log_level = "info"
 #                              # resolvers at startup and keep the ones that work from here;
 #                              # add your own: ["auto", "1.2.3.4"]; an explicit list disables auto
 # dns_record_types = []        # empty = try all (TXT, NULL, A, AAAA, CNAME, MX, SRV, PTR); the best is auto-selected
+# dns_resolver_cidrs = []      # extra candidates to test at startup, e.g. ["198.51.100.0/24"] (rate-limited, max 4096 addresses)
+# dns_resolver_cache = ""     # file to cache the discovered best resolvers (reused for 30 min)
 # dns_timeout_ms = 2000        # per-query timeout
 # dns_workers = 8              # DNS queries in flight per tunnel connection (8 measured best; more only adds retransmits)
 # connection_pool = 1          # parallel tunnel connections

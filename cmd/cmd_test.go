@@ -181,12 +181,13 @@ func TestValidateDNSMux(t *testing.T) {
 	}
 
 	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
-	if validateDNSMux(cli, "client") == nil {
-		t.Error("client without dns_resolvers accepted")
-	}
-	cli.Client.DNSResolvers = []string{"1.1.1.1"}
+	// dns_resolvers is optional: empty means auto-discovery.
 	if err := validateDNSMux(cli, "client"); err != nil {
-		t.Errorf("valid client rejected: %v", err)
+		t.Errorf("client without dns_resolvers rejected: %v", err)
+	}
+	cli.Client.DNSDomain = ""
+	if validateDNSMux(cli, "client") == nil {
+		t.Error("client without dns_domain accepted")
 	}
 
 	other := &config.Config{Server: config.ServerConfig{Transport: config.TCP}}
@@ -200,7 +201,7 @@ func TestDetectConfigTypeDNSMux(t *testing.T) {
 	if got := detectConfigType(srv); got != "server" {
 		t.Errorf("dnsmux server detected as %q", got)
 	}
-	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSResolvers: []string{"1.1.1.1"}}}
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
 	if got := detectConfigType(cli); got != "client" {
 		t.Errorf("dnsmux client detected as %q", got)
 	}

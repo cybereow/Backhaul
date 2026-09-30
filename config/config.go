@@ -99,7 +99,7 @@ type ClientConfig struct {
 	Path                 string        `toml:"path"`
 	DNSDomain            string        `toml:"dns_domain"`
 	DNSKey               string        `toml:"dns_key"`
-	DNSResolvers         []string      `toml:"dns_resolvers"`    // dnsmux: recursive resolvers to query (never the authoritative server directly)
+	DNSResolvers         []string      `toml:"dns_resolvers"`    // dnsmux: recursive resolvers to query (never the authoritative server directly); empty or "auto" = built-in list, tested at startup
 	DNSRecordTypes       []string      `toml:"dns_record_types"` // dnsmux: limit the RR types tried (default all); the best one is auto-selected
 	DNSTimeoutMS         int           `toml:"dns_timeout_ms"`   // dnsmux: per-query timeout (default 2000)
 	DNSWorkers           int           `toml:"dns_workers"`      // dnsmux: DNS queries in flight per tunnel connection (default 8)

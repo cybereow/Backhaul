@@ -79,3 +79,5 @@ smux exactly like `tcpmux`. See `config.dnsmux.example.toml`.
   maximum-size question (retransmissions cannot be shrunk).
 - Transfer tests default to 32 KiB per direction (the carrier is slow, `-race`
   slower); `DNS_SLOW_TESTS=1` runs the 256 KiB soak.
+- **Resolver discovery**: `dns_resolvers` may be empty or contain `"auto"`; the client then tests a built-in list of Iranian public resolvers (`DefaultResolvers`) in parallel at startup and keeps the ones that work from its vantage point (sel re-checks failed ones with backoff).
+- **SACK**: `rel.Packet` carries the first out-of-order block (offset+length, 4 bytes) so the peer does not resend bytes that arrived behind a gap; simulated retransmit overhead 11.2% -> 8.5%.

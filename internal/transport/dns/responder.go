@@ -119,8 +119,13 @@ func (r *Responder) handle(w dns.ResponseWriter, req *dns.Msg) {
 		size = int(opt.UDPSize())
 		m.SetEdns0(opt.UDPSize(), false)
 	}
-	if !inTCP {
-		m.Truncate(size) // sets TC and drops answers that do not fit; TCP stays intact
+	// Diagnostic mode measures what UDP really carries, so honour the advertised
+	// size (TC + dropped answers; TCP stays intact). The tunnel does not: its
+	// segments are already capped to fit 1232 bytes, and on real resolvers that
+	// advertise no EDNS towards us a TC reply costs a ~2s TCP retry, which cut
+	// throughput roughly in half.
+	if !inTCP && r.Handler == nil {
+		m.Truncate(size)
 	}
 	if err := w.WriteMsg(m); err != nil {
 		r.logger.Tracef("write reply to %s: %v", w.RemoteAddr(), err)

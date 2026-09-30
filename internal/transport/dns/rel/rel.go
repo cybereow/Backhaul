@@ -21,15 +21,21 @@ import (
 	"time"
 )
 
-// HeaderLen is the fixed per-packet overhead: seq(4) ack(4) wnd(2).
-const HeaderLen = 10
+// HeaderLen is the fixed per-packet overhead: seq(4) ack(4) wnd(2) sackOff(2)
+// sackLen(2).
+const HeaderLen = 14
 
 // Packet is one exchange payload in one direction.
 type Packet struct {
-	Seq  uint32 // stream offset of Data[0] in the sender's byte stream
-	Ack  uint32 // next byte the sender expects from the peer (cumulative)
-	Wnd  uint16 // sender's free receive space in bytes, clamped to 65535
-	Data []byte
+	Seq uint32 // stream offset of Data[0] in the sender's byte stream
+	Ack uint32 // next byte the sender expects from the peer (cumulative)
+	Wnd uint16 // sender's free receive space in bytes, clamped to 65535
+	// SackOff/SackLen describe the first block of out-of-order bytes the sender
+	// holds: [Ack+SackOff, Ack+SackOff+SackLen). Zero length means none. It lets
+	// the peer skip retransmitting what already arrived behind a gap.
+	SackOff uint16
+	SackLen uint16
+	Data    []byte
 }
 
 func (p Packet) Marshal() []byte {
@@ -37,6 +43,8 @@ func (p Packet) Marshal() []byte {
 	binary.BigEndian.PutUint32(b[0:], p.Seq)
 	binary.BigEndian.PutUint32(b[4:], p.Ack)
 	binary.BigEndian.PutUint16(b[8:], p.Wnd)
+	binary.BigEndian.PutUint16(b[10:], p.SackOff)
+	binary.BigEndian.PutUint16(b[12:], p.SackLen)
 	copy(b[HeaderLen:], p.Data)
 	return b
 }
@@ -48,10 +56,12 @@ func Unmarshal(b []byte) (Packet, error) {
 		return Packet{}, ErrShort
 	}
 	return Packet{
-		Seq:  binary.BigEndian.Uint32(b[0:]),
-		Ack:  binary.BigEndian.Uint32(b[4:]),
-		Wnd:  binary.BigEndian.Uint16(b[8:]),
-		Data: append([]byte(nil), b[HeaderLen:]...),
+		Seq:     binary.BigEndian.Uint32(b[0:]),
+		Ack:     binary.BigEndian.Uint32(b[4:]),
+		Wnd:     binary.BigEndian.Uint16(b[8:]),
+		SackOff: binary.BigEndian.Uint16(b[10:]),
+		SackLen: binary.BigEndian.Uint16(b[12:]),
+		Data:    append([]byte(nil), b[HeaderLen:]...),
 	}, nil
 }
 
@@ -93,6 +103,8 @@ type seg struct {
 	sentAt   time.Time
 	deadline time.Time
 	retx     int
+	sacked   bool // the peer reported holding these bytes behind a gap: do not resend
+	gapped   bool // later bytes were sacked but these were not: likely lost, resend early
 }
 
 // Endpoint is one side of the reliable stream.
@@ -227,16 +239,26 @@ func (e *Endpoint) sample(r time.Duration) {
 // serves as the poll that lets the peer answer).
 func (e *Endpoint) Next(now time.Time) Packet {
 	pk := Packet{Seq: e.sndNxt, Ack: e.rcvNxt, Wnd: e.window()}
+	pk.SackOff, pk.SackLen = e.sackBlock()
 
 	for _, s := range e.inflight {
-		if now.Before(s.deadline) {
+		if s.sacked {
+			continue // the peer has it; only the cumulative ACK is pending
+		}
+		timedOut := !now.Before(s.deadline)
+		// A gap before a sacked block is evidence of loss; resend after half an
+		// RTO instead of waiting out the whole timer (and without backing off:
+		// this is loss, not congestion).
+		early := s.gapped && now.Sub(s.sentAt) >= e.rto()/2
+		if !timedOut && !early {
 			continue
 		}
 		// Grow the backoff at most once per RTO so a burst of timeouts is one event.
-		if now.Sub(e.lastBackoff) >= e.rto() && e.backoff < 6 {
+		if timedOut && now.Sub(e.lastBackoff) >= e.rto() && e.backoff < 6 {
 			e.backoff++
 			e.lastBackoff = now
 		}
+		s.gapped = false
 		// A segment cut under a larger MSS (the server's reply budget shrinks when
 		// the selector fails over to a smaller record type) may no longer fit one
 		// exchange: split it so the retransmission can get through.
@@ -313,9 +335,62 @@ func (e *Endpoint) Recv(now time.Time, p Packet) {
 		}
 	}
 
+	e.applySack(p)
+
 	if len(p.Data) > 0 {
 		e.rx(p.Seq, p.Data)
 	}
+}
+
+// applySack marks in-flight segments using the peer's first out-of-order block:
+// segments inside it are held (sacked); segments wholly before it are in the gap
+// and likely lost (gapped).
+func (e *Endpoint) applySack(p Packet) {
+	if p.SackLen == 0 {
+		return
+	}
+	start := p.Ack + uint32(p.SackOff)
+	end := start + uint32(p.SackLen)
+	for _, s := range e.inflight {
+		sEnd := s.seq + uint32(len(s.data))
+		switch {
+		case !after(start, s.seq) && !after(sEnd, end):
+			s.sacked = true
+		case !s.sacked && !after(sEnd, start):
+			s.gapped = true
+		}
+	}
+}
+
+// sackBlock returns the first run of buffered out-of-order bytes relative to the
+// cumulative ACK point, or zeros when there is none.
+func (e *Endpoint) sackBlock() (off, n uint16) {
+	first, found := uint32(0), false
+	for k := range e.ooo {
+		if after(k, e.rcvNxt) && (!found || after(first, k)) {
+			first, found = k, true
+		}
+	}
+	if !found {
+		return 0, 0
+	}
+	end := first + uint32(len(e.ooo[first]))
+	for grew := true; grew; {
+		grew = false
+		for k, v := range e.ooo {
+			if kEnd := k + uint32(len(v)); !after(k, end) && after(kEnd, end) {
+				end, grew = kEnd, true
+			}
+		}
+	}
+	o, l := first-e.rcvNxt, end-first
+	if o > 0xffff {
+		return 0, 0
+	}
+	if l > 0xffff {
+		l = 0xffff
+	}
+	return uint16(o), uint16(l)
 }
 
 func (e *Endpoint) rx(seq uint32, d []byte) {

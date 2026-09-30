@@ -24,7 +24,9 @@ log_level = "info"
 # transport = "dnsmux"
 # token = "change-me"
 # dns_domain = "ttt.example.com"
-# dns_resolvers = ["178.22.122.100", "185.51.200.2"]  # recursive resolvers to query
+# dns_resolvers = []           # empty (or containing "auto") = test a built-in list of Iranian public
+#                              # resolvers at startup and keep the ones that work from here;
+#                              # add your own: ["auto", "1.2.3.4"]; an explicit list disables auto
 # dns_record_types = []        # empty = try all (TXT, NULL, A, AAAA, CNAME, MX, SRV, PTR); the best is auto-selected
 # dns_timeout_ms = 2000        # per-query timeout
 # dns_workers = 8              # DNS queries in flight per tunnel connection (8 measured best; more only adds retransmits)

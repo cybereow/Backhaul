@@ -116,7 +116,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 
 const (
 	warmSamples     = 4  // samples per profile before first use (>= sel MinWeight, == FailStreak)
-	warmConcurrency = 16 // profiles probed in parallel
+	warmConcurrency = 48 // profiles probed in parallel (spread over resolvers, see interleave)
 	warmFailStop    = 2  // consecutive failures after which the rest count as failed without waiting
 )
 
@@ -126,6 +126,7 @@ const (
 // possibly dead profile per exchange. A profile that fails warmFailStop times in
 // a row is marked failed at once.
 func (c *clientConn) warmup(profiles []sel.Profile) {
+	profiles = interleave(profiles)
 	sem := make(chan struct{}, warmConcurrency)
 	var wg sync.WaitGroup
 	for _, p := range profiles {
@@ -181,6 +182,29 @@ func carrierRespSize(cap int) int {
 		n = 0
 	}
 	return n
+}
+
+// interleave reorders profiles round-robin by resolver so the parallel warm-up
+// hits many resolvers at once instead of hammering one (rate limits would read
+// as failures).
+func interleave(profiles []sel.Profile) []sel.Profile {
+	var order []string
+	by := map[string][]sel.Profile{}
+	for _, p := range profiles {
+		if _, ok := by[p.Resolver]; !ok {
+			order = append(order, p.Resolver)
+		}
+		by[p.Resolver] = append(by[p.Resolver], p)
+	}
+	out := make([]sel.Profile, 0, len(profiles))
+	for i := 0; len(out) < len(profiles); i++ {
+		for _, r := range order {
+			if i < len(by[r]) {
+				out = append(out, by[r][i])
+			}
+		}
+	}
+	return out
 }
 
 // profStat counts exchanges per profile for the Logf summary.

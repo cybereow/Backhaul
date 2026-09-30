@@ -28,10 +28,11 @@ func detectConfigType(cfg *config.Config) string {
 	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
 		return "client"
 	// dnsmux has no bind_addr/remote_addr: the server is identified by the
-	// domain it is authoritative for, the client by the resolvers it queries.
+	// domain it is authoritative for, the client by the domain it tunnels through
+	// (dns_resolvers is optional: empty means auto-discover).
 	case cfg.Server.Transport == config.DNSMUX && cfg.Server.DNSDomain != "":
 		return "server"
-	case cfg.Client.Transport == config.DNSMUX && len(cfg.Client.DNSResolvers) > 0:
+	case cfg.Client.Transport == config.DNSMUX && cfg.Client.DNSDomain != "":
 		return "client"
 	default:
 		return ""
@@ -84,9 +85,6 @@ func validateDNSMux(cfg *config.Config, configType string) error {
 	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
 		if cfg.Client.DNSDomain == "" {
 			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")
-		}
-		if len(cfg.Client.DNSResolvers) == 0 {
-			return fmt.Errorf("client 'dns_resolvers' is required for the dnsmux transport (the recursive resolvers to query)")
 		}
 	}
 	return nil

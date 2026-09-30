@@ -26,7 +26,7 @@ import (
 type DnsMuxConfig struct {
 	Domain           string
 	Key              string
-	Resolvers        []string
+	Resolvers        []string // empty or containing "auto": also test dnsx.DefaultResolvers
 	RecordTypes      []string
 	Timeout          time.Duration // per DNS query (default 2s)
 	Workers          int           // DNS queries in flight per tunnel conn (default 8)
@@ -157,7 +157,7 @@ func (c *DnsMuxTransport) runTunnel() {
 		topK = 8
 	}
 
-	profiles := dnsx.DefaultProfiles(c.config.Domain, c.config.Resolvers, c.config.RecordTypes)
+	profiles := dnsx.DefaultProfiles(c.config.Domain, dnsx.ExpandResolvers(c.config.Resolvers), c.config.RecordTypes)
 	if len(profiles) == 0 {
 		c.logger.Error("dnsmux: no usable resolver/record-type profiles")
 		return

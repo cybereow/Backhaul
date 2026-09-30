@@ -27,6 +27,12 @@ func detectConfigType(cfg *config.Config) string {
 		return "server"
 	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
 		return "client"
+	// dnsmux has no bind_addr/remote_addr: the server is identified by the
+	// domain it is authoritative for, the client by the resolvers it queries.
+	case cfg.Server.Transport == config.DNSMUX && cfg.Server.DNSDomain != "":
+		return "server"
+	case cfg.Client.Transport == config.DNSMUX && len(cfg.Client.DNSResolvers) > 0:
+		return "client"
 	default:
 		return ""
 	}

@@ -194,3 +194,14 @@ func TestValidateDNSMux(t *testing.T) {
 		t.Errorf("non-dnsmux transport affected: %v", err)
 	}
 }
+
+func TestDetectConfigTypeDNSMux(t *testing.T) {
+	srv := &config.Config{Server: config.ServerConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
+	if got := detectConfigType(srv); got != "server" {
+		t.Errorf("dnsmux server detected as %q", got)
+	}
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSResolvers: []string{"1.1.1.1"}}}
+	if got := detectConfigType(cli); got != "client" {
+		t.Errorf("dnsmux client detected as %q", got)
+	}
+}

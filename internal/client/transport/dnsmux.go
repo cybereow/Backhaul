@@ -8,6 +8,7 @@ import (
 	"time"
 
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
+	"github.com/musix/backhaul/internal/transport/dns/rel"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
@@ -26,6 +27,7 @@ type DnsMuxConfig struct {
 	Resolvers        []string
 	RecordTypes      []string
 	Timeout          time.Duration // per DNS query (default 2s)
+	Workers          int           // DNS queries in flight per tunnel conn (default 4)
 	Token            string
 	RetryInterval    time.Duration
 	DialTimeOut      time.Duration
@@ -57,6 +59,11 @@ type DnsMuxTransport struct {
 func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *logrus.Logger) *DnsMuxTransport {
 	ctx, cancel := context.WithCancel(parentCtx)
 	sc := smux.DefaultConfig()
+	// One DNS round trip is slow and mux keepalive frames queue behind bulk data,
+	// so the default 30s keepalive timeout would kill a healthy but busy session.
+	// The carrier has its own liveness handling (RST / idle timeout).
+	sc.KeepAliveInterval = 30 * time.Second
+	sc.KeepAliveTimeout = 10 * time.Minute
 	if config.MuxVersion > 0 {
 		sc.Version = config.MuxVersion
 	}
@@ -74,6 +81,9 @@ func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 	}
 	if config.RetryInterval <= 0 {
 		config.RetryInterval = 3 * time.Second
+	}
+	if config.Workers <= 0 {
+		config.Workers = 4
 	}
 	if config.ConnPoolSize <= 0 {
 		config.ConnPoolSize = 1
@@ -138,6 +148,9 @@ func (c *DnsMuxTransport) runTunnel() {
 		Key:      c.config.Key,
 		Profiles: profiles,
 		Timeout:  c.config.Timeout,
+		Workers:  c.config.Workers,
+		Rel:      rel.Config{MinRTO: 2 * time.Second, MaxRTO: 15 * time.Second}, // see the server side: real DNS RTTs are slow and jittery
+		Logf:     c.logger.Debugf,
 	})
 	if err != nil {
 		c.logger.Errorf("dnsmux: dial: %v", err)

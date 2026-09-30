@@ -29,6 +29,12 @@ type DialParams struct {
 	Profiles []sel.Profile
 	Timeout  time.Duration
 	Rel      rel.Config
+	// Workers is how many exchanges may be in flight at once (default 1). More
+	// workers raise throughput roughly linearly until the resolvers push back;
+	// extra workers only run while there is data to move.
+	Workers int
+	// Logf, if set, receives a periodic per-profile summary (debug aid).
+	Logf func(format string, args ...any)
 }
 
 // Dial returns a reliable net.Conn running over DNS.
@@ -37,6 +43,9 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 		return nil, errors.New("dnsx: no profiles provided")
 	}
 
+	if p.Timeout <= 0 {
+		p.Timeout = 2 * time.Second
+	}
 	domain := dns.Fqdn(p.Domain)
 	isn := uint32(0)
 
@@ -67,19 +76,90 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 		closed:  make(chan struct{}),
 	}
 	c.cond = sync.NewCond(&c.mu)
+	c.logf = p.Logf
+	c.stats = map[sel.Profile]*profStat{}
 
 	c.ctx, c.cancel = context.WithCancel(ctx)
 
+	c.warmup(p.Profiles)
 	c.exchange()
 	if c.err != nil {
 		c.cancel()
 		return nil, c.err
 	}
 
-	c.wg.Add(1)
-	go c.loop()
+	n := p.Workers
+	if n < 1 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		c.wg.Add(1)
+		go c.loop(i == 0)
+	}
 
 	return c, nil
+}
+
+const (
+	warmSamples     = 4  // samples per profile before first use (>= sel MinWeight, == FailStreak)
+	warmConcurrency = 16 // profiles probed in parallel
+	warmFailStop    = 2  // consecutive failures after which the rest count as failed without waiting
+)
+
+// warmup measures every profile in parallel with throwaway probe queries (1 byte
+// of data: the responder answers those in diagnostic mode without touching any
+// session) so sel starts with real numbers instead of exploring one slow,
+// possibly dead profile per exchange. A profile that fails warmFailStop times in
+// a row is marked failed at once.
+func (c *clientConn) warmup(profiles []sel.Profile) {
+	sem := make(chan struct{}, warmConcurrency)
+	var wg sync.WaitGroup
+	for _, p := range profiles {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(p sel.Profile) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			respSize := p.Cap - envelopeOverhead
+			if respSize < 0 {
+				respSize = 0
+			}
+			fails := 0
+			for i := 0; i < warmSamples; i++ {
+				if c.ctx.Err() != nil {
+					return
+				}
+				ok := false
+				if fails < warmFailStop {
+					ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
+					t0 := time.Now()
+					_, _, _, _, stage, _ := Exchange(ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, respSize, func(uint64) []byte { return []byte{0} }, c.timeout)
+					cancel()
+					ok = stage == StageOK
+					c.mu.Lock()
+					c.mgr.Observe(time.Now(), p, ok, time.Since(t0))
+					c.record(time.Now(), p, ok, time.Since(t0))
+					c.mu.Unlock()
+				} else {
+					c.mu.Lock()
+					c.mgr.Observe(time.Now(), p, false, 0)
+					c.mu.Unlock()
+				}
+				if ok {
+					fails = 0
+				} else {
+					fails++
+				}
+			}
+		}(p)
+	}
+	wg.Wait()
+}
+
+// profStat counts exchanges per profile for the Logf summary.
+type profStat struct {
+	ok, fail int
+	rtt      time.Duration
 }
 
 type clientConn struct {
@@ -107,11 +187,16 @@ type clientConn struct {
 	remoteAddr net.Addr
 
 	recentRX    bool
+	logf        func(string, ...any)
+	stats       map[sel.Profile]*profStat
+	nextLog     time.Time
 	established bool          // first reply seen: stop sending SYN
 	srtt        time.Duration // smoothed exchange RTT, drives the per-exchange timeout
 }
 
-func (c *clientConn) loop() {
+// loop is one exchange worker. The primary keeps polling while idle; helpers
+// only run while there is data to move.
+func (c *clientConn) loop(primary bool) {
 	defer c.wg.Done()
 
 	timer := time.NewTimer(0) // Start immediately
@@ -122,13 +207,24 @@ func (c *clientConn) loop() {
 		case <-c.ctx.Done():
 			return
 		case <-timer.C:
+			if !primary {
+				c.mu.Lock()
+				busy := c.ep.Pending() > 0 || c.recentRX || c.ep.PeerWnd() == 0
+				c.mu.Unlock()
+				if !busy {
+					timer.Reset(pollFast)
+					continue
+				}
+			}
 			c.exchange()
 
 			c.mu.Lock()
 			pending := c.ep.Pending()
 			inflight := c.ep.Sent - c.ep.Retx
 			recent := c.recentRX
-			c.recentRX = false
+			if primary {
+				c.recentRX = false
+			}
 			peerWnd := c.ep.PeerWnd()
 			c.mu.Unlock()
 
@@ -204,7 +300,7 @@ func (c *clientConn) exchange() {
 	defer cancel()
 
 	t0 := time.Now()
-	respData, _, _, rttMs, stage, err := Exchange(ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
+	respData, _, _, rttMs, stage, _ := Exchange(ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
 
 	now = time.Now()
 	c.mu.Lock()
@@ -240,15 +336,45 @@ func (c *clientConn) exchange() {
 				}
 			}
 		}
-	} else if err != nil && stage != StageUnknown {
+	} else {
+		// No reply at all counts as a failure too: otherwise a profile the path
+		// silently drops would never be disabled and would eat every Nth exchange.
 		c.mgr.Observe(now, prof, false, 0)
 	}
+	c.record(now, prof, stage == StageOK, now.Sub(t0))
 
 	active := c.mgr.Active()
 	if len(active) == 0 {
 	}
 
 	c.mu.Unlock()
+}
+
+// record updates the per-profile counters and, at most every 5s, logs them.
+// mu is held.
+func (c *clientConn) record(now time.Time, prof sel.Profile, ok bool, rtt time.Duration) {
+	if c.logf == nil {
+		return
+	}
+	st := c.stats[prof]
+	if st == nil {
+		st = &profStat{}
+		c.stats[prof] = st
+	}
+	if ok {
+		st.ok++
+		st.rtt = rtt
+	} else {
+		st.fail++
+	}
+	if now.Before(c.nextLog) {
+		return
+	}
+	c.nextLog = now.Add(5 * time.Second)
+	for p, s := range c.stats {
+		c.logf("dns profile %s rr=%d %s: ok=%d fail=%d lastrtt=%v score=%.0f", p.Resolver, p.RRType, p.Transport, s.ok, s.fail, s.rtt, c.mgr.Score(p, now))
+	}
+	c.logf("dns carrier: pending=%d sent=%d retx=%d peerWnd=%d active=%d", c.ep.Pending(), c.ep.Sent, c.ep.Retx, c.ep.PeerWnd(), len(c.mgr.Active()))
 }
 
 func (c *clientConn) notifyAll() {

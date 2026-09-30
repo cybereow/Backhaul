@@ -54,6 +54,10 @@ func NewServer(domain, key string, logger *logrus.Logger) *Server {
 	return s
 }
 
+// SetRel sets the rel parameters (RTO bounds, buffers) for sessions created from
+// now on; call it before Serve.
+func (s *Server) SetRel(cfg rel.Config) { s.relCfg = cfg }
+
 // Serve runs the DNS listener (UDP+TCP) until ctx ends.
 func (s *Server) Serve(ctx context.Context, addr string) error {
 	return s.responder.Serve(ctx, addr)
@@ -111,6 +115,7 @@ func (s *Server) handle(sid uint32, flags byte, in []byte, maxResp int) ([]byte,
 		return nil, 0
 	}
 	now := time.Now()
+	s.responder.logger.Tracef("dns session %08x: flags=%d seq=%d ack=%d wnd=%d data=%d maxResp=%d", sid, flags, pk.Seq, pk.Ack, pk.Wnd, len(pk.Data), maxResp)
 
 	s.mu.Lock()
 	ss := s.sessions[sid]

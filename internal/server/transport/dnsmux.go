@@ -10,6 +10,7 @@ import (
 	"time"
 
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
+	"github.com/musix/backhaul/internal/transport/dns/rel"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/web"
@@ -57,6 +58,11 @@ type DnsMuxTransport struct {
 func NewDnsMuxServer(parentCtx context.Context, config *DnsMuxConfig, logger *logrus.Logger) *DnsMuxTransport {
 	ctx, cancel := context.WithCancel(parentCtx)
 	sc := smux.DefaultConfig()
+	// One DNS round trip is slow and mux keepalive frames queue behind bulk data,
+	// so the default 30s keepalive timeout would kill a healthy but busy session.
+	// The carrier has its own liveness handling (RST / idle timeout).
+	sc.KeepAliveInterval = 30 * time.Second
+	sc.KeepAliveTimeout = 10 * time.Minute
 	if config.MuxVersion > 0 {
 		sc.Version = config.MuxVersion
 	}
@@ -91,6 +97,9 @@ func (s *DnsMuxTransport) Start() {
 	s.config.TunnelStatus = "Disconnected (DNSMUX)"
 
 	srv := dnsx.NewServer(s.config.Domain, s.config.Key, s.logger)
+	// Real DNS round trips take 0.1-1.5s and vary widely; a 300ms minimum RTO
+	// would retransmit most segments spuriously and waste the scarce capacity.
+	srv.SetRel(rel.Config{MinRTO: 2 * time.Second, MaxRTO: 15 * time.Second})
 	go func() {
 		<-s.ctx.Done()
 		srv.Close()

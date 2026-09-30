@@ -26,6 +26,7 @@ const version = "v0.7.3"
 
 func main() {
 	configPath = flag.String("c", "", "path to the configuration file (TOML format)")
+	probePath := flag.String("probe", "", "run the standalone DNS reachability/capacity prober with this [dns_probe] config and exit (Phase 1; does not start a tunnel)")
 	showVersion := flag.Bool("v", false, "print the version and exit")
 
 	flag.Parse()
@@ -34,6 +35,22 @@ func main() {
 	if *showVersion {
 		fmt.Println(version)
 		os.Exit(0)
+	}
+
+	// The DNS prober/responder is a standalone diagnostic, deliberately kept off
+	// the normal server/client run path and its config hot-reload. It runs until
+	// it finishes (prober) or is interrupted (responder).
+	if *probePath != "" {
+		ctx, cancel = context.WithCancel(context.Background())
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		go func() {
+			<-sigChan
+			cancel()
+		}()
+		cmd.RunProbe(*probePath, ctx)
+		cancel()
+		return
 	}
 
 	// Check if the configPath is provided

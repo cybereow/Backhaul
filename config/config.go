@@ -96,8 +96,89 @@ type ClientConfig struct {
 	TLSVerify            bool          `toml:"tls_verify"` // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
 }
 
+// ProbeConfig configures the DNS reachability/capacity prober (Phase 1 of the
+// DNS transport). It is deliberately separate from ServerConfig/ClientConfig and
+// only read by the `-probe` subcommand, so it touches none of the existing
+// transports. See internal/transport/dns and the design doc §8 step 1.
+type ProbeConfig struct {
+	// Role selects what this process does: "prober" (outside client, sends
+	// queries through recursive resolvers) or "responder" (inside authoritative
+	// server for Domain). Default "prober".
+	Role string `toml:"role"`
+
+	// Domain is the tunnel domain both sides own, e.g. "t.example.com". The
+	// responder is authoritative for it; the prober encodes payload into QNAMEs
+	// under it. Required.
+	Domain string `toml:"domain"`
+
+	// Key is a shared secret used only to derive a per-query MAC (HMAC-SHA256)
+	// over the nonce+payload, so the token itself never appears on the wire and
+	// only a matching peer's response is accepted. Required; must match on both
+	// sides.
+	Key string `toml:"key"`
+
+	// Resolvers is the prober's candidate recursive resolvers ("ip:port", :53
+	// assumed). The prober queries ONLY these plus the system resolver; it never
+	// dials the authoritative server directly. Required for the prober role.
+	Resolvers []string `toml:"resolvers"`
+
+	// RecordTypes limits the probed RR families (e.g. ["TXT","NULL","A"]). Empty
+	// means all built-in candidates: TXT, NULL, A, AAAA, CNAME, MX, SRV, PTR.
+	RecordTypes []string `toml:"record_types"`
+
+	// QueryBudget / ResponseBudget are the payload sizes (bytes) the prober asks
+	// to carry each way, to measure real capacity rather than advertised limits.
+	// 0 picks conservative defaults.
+	QueryBudget    int `toml:"query_budget"`
+	ResponseBudget int `toml:"response_budget"`
+
+	// ResponseSizes sweeps several requested response payload sizes (bytes) per
+	// profile to find the capacity ceiling. Empty falls back to ResponseBudget.
+	ResponseSizes []int `toml:"response_sizes"`
+
+	// Repeat runs each profile this many times so the report reflects stability
+	// (success rate + RTT percentiles), not a single lucky/unlucky sample. 0→1.
+	Repeat int `toml:"repeat"`
+
+	// SoakDurationMin and SoakMaxInflight configure role="soak": a sustained
+	// bidirectional path test over resolvers×record_types (transport forced TCP
+	// outside), ramping the in-flight window per stream from 1 to SoakMaxInflight
+	// across the run. Defaults: 20 min, 4.
+	SoakDurationMin int `toml:"soak_duration_min"`
+	SoakMaxInflight int `toml:"soak_max_inflight"`
+	// SoakNoRamp runs all SoakMaxInflight workers from the start (fixed load) so
+	// several runs can be compared at different concurrencies.
+	SoakNoRamp bool `toml:"soak_no_ramp"`
+
+	// EDNS selects the EDNS(0) mode to probe: "off", "on", or "both" (default).
+	// EDNS is hop-by-hop, so advertising a size is not proof of MTU.
+	EDNS string `toml:"edns"`
+
+	// UseTCP also probes the client-to-resolver hop over TCP (in addition to
+	// UDP). TCP success to the resolver does not prove TCP resolver->authoritative.
+	UseTCP bool `toml:"use_tcp"`
+
+	// Concurrency and PacingMS bound how fast profiles are probed. Conservative
+	// defaults; a weak path is not helped by a flood.
+	Concurrency int `toml:"concurrency"`
+	PacingMS    int `toml:"pacing_ms"`
+
+	// TimeoutMS is the per-query wait before a profile is recorded as failing at
+	// stage "unknown" (no reply != query never arrived).
+	TimeoutMS int `toml:"timeout_ms"`
+
+	// ResponderListen is the inside responder's UDP+TCP listen address, e.g.
+	// "0.0.0.0:53". Required for the responder role.
+	ResponderListen string `toml:"responder_listen"`
+
+	// ReportJSON, if set, writes the per-profile report to this file as JSON in
+	// addition to the log.
+	ReportJSON string `toml:"report_json"`
+}
+
 // Config represents the complete configuration, including both server and client settings.
 type Config struct {
-	Server ServerConfig `toml:"server"`
-	Client ClientConfig `toml:"client"`
+	Server   ServerConfig `toml:"server"`
+	Client   ClientConfig `toml:"client"`
+	DNSProbe ProbeConfig  `toml:"dns_probe"`
 }

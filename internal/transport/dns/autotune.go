@@ -254,9 +254,11 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 			allowed = append(allowed, np)
 		}
 	}
-	if len(allowed) > 0 {
-		tuned = allowed
+	if len(allowed) == 0 {
+		c.mu.Unlock()
+		return // everything measured is denied now: keep the current (allowed) selector
 	}
+	tuned = allowed
 	mgr := sel.New(selCfg, tuned)
 	for _, np := range tuned {
 		for i := 0; i < warmSamples; i++ { // measured, so proven: seed the selector with what we saw

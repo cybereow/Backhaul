@@ -128,7 +128,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	// The session must really come up: a few attempts (one lost query is normal),
 	// then give up instead of returning a connection no server ever answered.
 	for try := 0; try < dialAttempts && c.ctx.Err() == nil; try++ {
-		c.exchange()
+		c.exchange(false)
 		c.mu.Lock()
 		up, err := c.established, c.err
 		c.mu.Unlock()
@@ -362,8 +362,7 @@ func (c *clientConn) loop(idx int) {
 				timer.Reset(pollFast)
 				continue
 			}
-			c.exchange()
-			c.slots.Add(-1)
+			c.exchange(true)
 
 			c.mu.Lock()
 			pending := c.ep.Pending()
@@ -380,7 +379,10 @@ func (c *clientConn) loop(idx int) {
 	}
 }
 
-func (c *clientConn) exchange() {
+// exchange runs one poll. With slotHeld the caller reserved a slot (takeSlot) and
+// the primary network attempt releases it when that attempt really ends, not when
+// exchange returns: a hedge can answer first while the primary is still in flight.
+func (c *clientConn) exchange(slotHeld bool) {
 	now := time.Now()
 
 	c.mu.Lock()
@@ -450,7 +452,12 @@ func (c *clientConn) exchange() {
 		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, rs, qDataFunc, to)
 		resCh <- netResult{p, d, ms, st}
 	}
-	go send(prof, respSize)
+	go func() {
+		send(prof, respSize)
+		if slotHeld {
+			c.slots.Add(-1)
+		}
+	}()
 
 	dup := false
 	var res netResult

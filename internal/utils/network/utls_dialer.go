@@ -50,7 +50,10 @@ func UtlsDialTLS(ctx context.Context, dialAddr string, serverName string, insecu
 	// HTTP/1.1 Upgrade request lands on an HTTP/2 connection and fails.
 	// Building the spec explicitly and overwriting its ALPN extension
 	// keeps every other part of the Chrome fingerprint intact while
-	// constraining negotiation to what the caller actually asked for.
+	// constraining negotiation to what the caller actually asked for. (This is
+	// also what real Chrome does for a WebSocket: its ClientHello on a WebSocket
+	// connection offers only http/1.1 - checked against Chromium 141 - so the
+	// override is not a deviation from the browser for this use.)
 	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_Auto)
 	if err != nil {
 		rawConn.Close()

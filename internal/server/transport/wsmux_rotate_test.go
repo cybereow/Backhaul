@@ -86,6 +86,64 @@ func TestRetireSessionDrainsBeforeClosing(t *testing.T) {
 	}
 }
 
+// max_drain bounds the wait: a stream that never ends (an idle keep-alive) must
+// not pin a retired connection open forever. retireSession returns at the
+// deadline so the caller closes the session; with max_drain unset it keeps
+// waiting, as before.
+func TestRetireSessionMaxDrain(t *testing.T) {
+	newSession := func(t *testing.T) *smux.Session {
+		srvConn, cliConn := net.Pipe()
+		t.Cleanup(func() { srvConn.Close(); cliConn.Close() })
+		session, err := smux.Client(srvConn, smux.DefaultConfig())
+		if err != nil {
+			t.Fatalf("smux.Client: %v", err)
+		}
+		peer, err := smux.Server(cliConn, smux.DefaultConfig())
+		if err != nil {
+			t.Fatalf("smux.Server: %v", err)
+		}
+		t.Cleanup(func() { peer.Close() })
+		go func() {
+			for {
+				st, err := peer.AcceptStream()
+				if err != nil {
+					return
+				}
+				go io.Copy(io.Discard, st)
+			}
+		}()
+		if _, err := session.OpenStream(); err != nil {
+			t.Fatalf("OpenStream: %v", err)
+		}
+		return session
+	}
+
+	t.Run("deadline ends the drain with a stream still live", func(t *testing.T) {
+		session := newSession(t)
+		s := newRotateTestTransport()
+		s.config.MaxDrain = 500 * time.Millisecond
+		done := make(chan struct{})
+		go func() { s.retireSession(session); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("retireSession ignored max_drain")
+		}
+	})
+
+	t.Run("unset keeps draining", func(t *testing.T) {
+		session := newSession(t)
+		s := newRotateTestTransport()
+		done := make(chan struct{})
+		go func() { s.retireSession(session); close(done) }()
+		select {
+		case <-done:
+			t.Fatal("retireSession returned with a live stream and no max_drain")
+		case <-time.After(1500 * time.Millisecond):
+		}
+	})
+}
+
 // Rotation must not wedge on a connection the peer already tore down.
 func TestRetireSessionReturnsOnClosedSession(t *testing.T) {
 	srvConn, cliConn := net.Pipe()

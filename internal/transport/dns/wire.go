@@ -20,8 +20,10 @@ import (
 )
 
 const (
-	magicQuery = 0xB6 // marks a backhaul-dns v2 query
-	magicResp  = 0xB4 // v2 reply; the low bit carries inTCP
+	// v3: the rel window is in 16-byte units. The magics changed with it, so an older
+	// peer rejects the packets loudly instead of misreading the window by 16x.
+	magicQuery = 0xB7 // marks a backhaul-dns v3 query
+	magicResp  = 0xB2 // v3 reply; the low bit carries inTCP
 	macLen     = 10   // truncated HMAC-SHA256 (80 bits)
 
 	maxLabel = 63 // RFC 1035 label octet limit

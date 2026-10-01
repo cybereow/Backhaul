@@ -206,3 +206,19 @@ func TestServerCapBoundsWorkersAndHedgesTogether(t *testing.T) {
 		t.Error("a hedge refused although a slot is free")
 	}
 }
+
+// A denied record type is set aside, not forgotten: lifting the deny brings it back.
+func TestLiftedDenyRestoresProfiles(t *testing.T) {
+	txt := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeTXT, Transport: "udp", Cap: 700}
+	mx := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeMX, Transport: "udp", Cap: 150}
+	c := &clientConn{profiles: []sel.Profile{txt, mx}}
+	c.mgr = sel.New(sel.Config{}, c.profiles)
+	c.applyControl(Control{DenyTypes: []uint16{dns.TypeMX}})
+	if len(c.profiles) != 1 || len(c.denyHeld) != 1 {
+		t.Fatalf("deny not applied: profiles=%d held=%d", len(c.profiles), len(c.denyHeld))
+	}
+	c.applyControl(Control{})
+	if len(c.profiles) != 2 || len(c.denyHeld) != 0 {
+		t.Fatalf("lifted deny did not restore the profile: profiles=%d held=%d", len(c.profiles), len(c.denyHeld))
+	}
+}

@@ -315,6 +315,7 @@ type clientConn struct {
 	selCfg       sel.Config
 	profiles     []sel.Profile // current candidate set (a deny rebuilds the selector from it)
 	denied       []uint16      // record types the server told us not to use
+	denyHeld     []sel.Profile // profiles of denied types, set aside (not dropped) until the deny is lifted
 	lastCtrlReq  time.Time     // last control block actually received
 	lastCtrlTry  time.Time     // last time we asked for one
 	standby      []sel.Profile // warm survivors autotune did not measure (failover pool)
@@ -483,7 +484,7 @@ func (c *clientConn) exchange() {
 			defer c.wg.Done()
 			select {
 			case r := <-resCh:
-				c.process(r.prof, r.stage, r.data, r.rttMs, false, t0)
+				c.process(r.prof, r.stage, r.data, r.rttMs, isFIN, t0) // a FIN delivered by the slower copy still counts (finOnce dedupes)
 			case <-c.ctx.Done():
 			}
 		}()

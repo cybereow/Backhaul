@@ -241,6 +241,22 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 			standby = append(standby, r.p)
 		}
 	}
+	c.mu.Lock()
+	// A control block may have denied a type while this ran: apply the CURRENT deny
+	// list to the result (denied profiles wait in denyHeld, never dropped).
+	var allowed []sel.Profile
+	for _, np := range tuned {
+		if typeIn(c.denied, np.RRType) {
+			if !containsProfile(c.denyHeld, np) {
+				c.denyHeld = append(c.denyHeld, np)
+			}
+		} else {
+			allowed = append(allowed, np)
+		}
+	}
+	if len(allowed) > 0 {
+		tuned = allowed
+	}
 	mgr := sel.New(selCfg, tuned)
 	for _, np := range tuned {
 		for i := 0; i < warmSamples; i++ { // measured, so proven: seed the selector with what we saw
@@ -248,7 +264,6 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 		}
 	}
 	c.standby = standby
-	c.mu.Lock()
 	c.mgr = mgr
 	c.caps = caps
 	c.profiles = tuned // later denies rebuild the selector from the tuned set
@@ -269,6 +284,10 @@ func (c *clientConn) failover(maxQ int) {
 	for _, p := range append(append([]sel.Profile(nil), c.standby...), c.profiles...) {
 		if !typeIn(c.denied, p.RRType) { // the server's deny list outlives a failover
 			pool = append(pool, p)
+		} else {
+			if !containsProfile(c.denyHeld, p) {
+				c.denyHeld = append(c.denyHeld, p) // kept so a later lifted deny can bring it back
+			}
 		}
 	}
 	c.mu.Unlock()
@@ -287,4 +306,13 @@ func (c *clientConn) failover(maxQ int) {
 			c.autotune(c.ctx, c.selCfg, maxQ)
 		}
 	}()
+}
+
+func containsProfile(l []sel.Profile, p sel.Profile) bool {
+	for _, x := range l {
+		if keyOf(x) == keyOf(p) {
+			return true
+		}
+	}
+	return false
 }

@@ -113,14 +113,17 @@ func (c *clientConn) applyControl(ctl Control) {
 	c.lastCtrlReq = time.Now() // delivered: the next request is due in controlPullEvery
 	changed := !sameTypes(c.denied, ctl.DenyTypes)
 	if changed {
-		var keep []sel.Profile
-		for _, p := range c.profiles {
-			if !typeIn(ctl.DenyTypes, p.RRType) {
+		var keep, held []sel.Profile
+		for _, p := range append(append([]sel.Profile(nil), c.profiles...), c.denyHeld...) {
+			if typeIn(ctl.DenyTypes, p.RRType) {
+				held = append(held, p) // not lost: a later control block may lift the deny
+			} else {
 				keep = append(keep, p)
 			}
 		}
 		if len(keep) > 0 { // a deny list that leaves nothing to try is ignored as a whole
 			c.denied = append([]uint16(nil), ctl.DenyTypes...)
+			c.denyHeld, c.profiles = held, keep
 			mgr := sel.New(c.selCfg, keep)
 			for _, p := range keep {
 				pc, ok := c.caps[keyOf(p)]

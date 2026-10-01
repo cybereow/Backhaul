@@ -108,6 +108,9 @@ func TestControlNeverDeniesEverything(t *testing.T) {
 	if c.mgr != before {
 		t.Error("the selector was replaced by an empty one")
 	}
+	if len(c.denied) != 0 {
+		t.Errorf("an all-denied list was stored: %v", c.denied)
+	}
 }
 
 // A change made on the server while clients are running reaches them: the client

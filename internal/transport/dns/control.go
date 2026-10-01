@@ -110,16 +110,17 @@ func (c *clientConn) applyControl(ctl Control) {
 	c.idlePoll.Store(int64(ctl.IdlePoll))
 
 	c.mu.Lock()
+	c.lastCtrlReq = time.Now() // delivered: the next request is due in controlPullEvery
 	changed := !sameTypes(c.denied, ctl.DenyTypes)
 	if changed {
-		c.denied = append([]uint16(nil), ctl.DenyTypes...)
 		var keep []sel.Profile
 		for _, p := range c.profiles {
 			if !typeIn(ctl.DenyTypes, p.RRType) {
 				keep = append(keep, p)
 			}
 		}
-		if len(keep) > 0 { // never deny the client into having nothing to try
+		if len(keep) > 0 { // a deny list that leaves nothing to try is ignored as a whole
+			c.denied = append([]uint16(nil), ctl.DenyTypes...)
 			mgr := sel.New(c.selCfg, keep)
 			for _, p := range keep {
 				pc, ok := c.caps[keyOf(p)]

@@ -308,13 +308,15 @@ type clientConn struct {
 	noHedgeCfg   bool                 // hedging disabled by the caller
 	maxHedge     int32                // cap on extra in-flight exchanges
 	hedges       atomic.Int32         // extra exchanges currently in flight
+	inflight     atomic.Int32 // ordinary exchanges running now
 	target       atomic.Int32         // workers currently allowed to run (shaping)
 	ctrlCap      atomic.Int32         // server's MaxWorkers (0: none)
 	idlePoll     atomic.Int64         // server's idle polling interval in ns (0: default)
 	selCfg       sel.Config
 	profiles     []sel.Profile // current candidate set (a deny rebuilds the selector from it)
 	denied       []uint16      // record types the server told us not to use
-	lastCtrlReq  time.Time
+	lastCtrlReq  time.Time // last control block actually received
+	lastCtrlTry  time.Time // last time we asked for one
 	standby      []sel.Profile // warm survivors autotune did not measure (failover pool)
 	failingOver  bool
 	lastFailover time.Time
@@ -373,6 +375,8 @@ func (c *clientConn) loop(idx int) {
 }
 
 func (c *clientConn) exchange() {
+	c.inflight.Add(1)
+	defer c.inflight.Add(-1)
 	now := time.Now()
 
 	c.mu.Lock()
@@ -403,9 +407,9 @@ func (c *clientConn) exchange() {
 	if !c.established {
 		flags |= FlagSYN
 	}
-	if now.Sub(c.lastCtrlReq) > controlPullEvery {
-		flags |= FlagCtrlReq
-		c.lastCtrlReq = now
+	if now.Sub(c.lastCtrlReq) > controlPullEvery && now.Sub(c.lastCtrlTry) > 2*time.Second {
+		flags |= FlagCtrlReq // asked again until a block arrives: a lost first exchange must not cost 30 s
+		c.lastCtrlTry = now
 	}
 	c.mu.Unlock()
 	if isFIN {
@@ -642,10 +646,9 @@ func (c *clientConn) acquireHedge() bool {
 		return false
 	}
 	limit := min(c.maxHedge, max(c.effTarget(), 1))
-	if cp := c.ctrlCap.Load(); cp > 0 {
-		limit = min(limit, cp-1) // the server's cap is a total: hedges share it with the workers
-	}
-	if c.hedges.Add(1) > limit {
+	n := c.hedges.Add(1)
+	// the server's cap is a total: a hedge needs a free slot beside the exchanges in flight
+	if n > limit || c.ctrlCap.Load() > 0 && c.inflight.Load()+n > c.ctrlCap.Load() {
 		c.hedges.Add(-1)
 		return false
 	}

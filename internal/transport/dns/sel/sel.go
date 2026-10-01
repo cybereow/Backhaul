@@ -199,6 +199,16 @@ func (m *Manager) Score(p Profile, now time.Time) float64 {
 	return sc
 }
 
+// NoneUsable reports whether every profile is disabled or unproven (nothing scores).
+func (m *Manager) NoneUsable(now time.Time) bool {
+	for _, p := range m.ps {
+		if m.Score(p, now) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Active returns the profiles currently sharing load.
 func (m *Manager) Active() []Profile { return append([]Profile(nil), m.active...) }
 

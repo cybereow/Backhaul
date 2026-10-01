@@ -121,6 +121,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	c.allProfiles = p.Profiles
 	c.maxQ = maxQ
 	c.baseMSS = mss
+	c.bootstrapControl() // learn the server's worker cap / deny list before any bulk probing
 	c.warmup(p.Profiles)
 	if !p.NoAutotune {
 		c.autotune(c.ctx, p.Sel, maxQ)
@@ -177,6 +178,27 @@ const (
 // session) so sel starts with real numbers instead of exploring one slow,
 // possibly dead profile per exchange. A profile that fails warmFailStop times in
 // a row is marked failed at once.
+// bootstrapControl makes up to two plain exchanges just to receive the server's
+// control block (worker cap, denied types), so the startup probes already obey it.
+func (c *clientConn) bootstrapControl() {
+	for try := 0; try < 2 && c.ctx.Err() == nil; try++ {
+		c.exchange(false)
+		c.mu.Lock()
+		got := !c.lastCtrlReq.IsZero()
+		c.mu.Unlock()
+		if got {
+			return
+		}
+	}
+}
+
+// isDenied reports whether the server forbade this record type.
+func (c *clientConn) isDenied(rr uint16) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return typeIn(c.denied, rr)
+}
+
 func (c *clientConn) warmup(profiles []sel.Profile) {
 	profiles = interleave(profiles)
 	sem := make(chan struct{}, warmConcurrency)
@@ -193,7 +215,7 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 			respSize := livenessReply
 			fails := 0
 			for i := 0; i < warmSamples; i++ {
-				if c.ctx.Err() != nil {
+				if c.ctx.Err() != nil || c.isDenied(p.RRType) { // a control block may have denied it meanwhile
 					return
 				}
 				ok := false
@@ -584,12 +606,12 @@ func (c *clientConn) process(prof sel.Profile, stage Stage, respData []byte, rtt
 		}
 	} else {
 		c.winFail.Add(1)
-		if len(c.mgr.Active()) == 0 {
-			defer c.failover(c.maxQ) // everything measured is failing: look for another way through
-		}
 		// No reply at all counts as a failure too: otherwise a profile the path
 		// silently drops would never be disabled and would eat every Nth exchange.
 		c.mgr.Observe(now, prof, false, 0)
+		if c.mgr.NoneUsable(now) { // checked after recording this failure, so the last profile counts
+			defer c.failover(c.maxQ) // everything measured is failing: look for another way through
+		}
 	}
 	c.record(now, prof, stage == StageOK, now.Sub(t0))
 	if c.logf != nil && (stage != StageOK || now.Sub(t0) > 1500*time.Millisecond) {

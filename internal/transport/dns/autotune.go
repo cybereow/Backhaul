@@ -48,7 +48,7 @@ func (pc profCaps) downMSS() int { return pc.down - 1 - rel.HeaderLen }
 // probeUp sends diagnostic queries carrying n data bytes and reports whether the
 // responder received all n (the QNAME survived the path).
 func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Duration, bool) {
-	if !c.acquireProbe(ctx) { // wait for a slot first: the timeout covers the query, not the queue
+	if c.isDenied(p.RRType) || !c.acquireProbe(ctx) { // wait for a slot first: the timeout covers the query, not the queue
 		return 0, false
 	}
 	defer c.slots.Add(-1)
@@ -67,7 +67,7 @@ func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Du
 
 // probeDown requests a reply of size bytes and returns how many arrived intact.
 func (c *clientConn) probeDown(ctx context.Context, p sel.Profile, size int) (time.Duration, int) {
-	if !c.acquireProbe(ctx) {
+	if c.isDenied(p.RRType) || !c.acquireProbe(ctx) {
 		return 0, 0
 	}
 	defer c.slots.Add(-1)
@@ -166,6 +166,9 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	allCand := append([]sel.Profile(nil), c.allProfiles...)
 	var ranked []scored
 	for _, p := range c.allProfiles {
+		if typeIn(c.denied, p.RRType) {
+			continue
+		}
 		if s := c.mgr.Score(p, now); s > 0 {
 			ranked = append(ranked, scored{p, s})
 		}
@@ -340,6 +343,12 @@ func (c *clientConn) failover(maxQ int) {
 			if len(allowedPool) == 0 {
 				c.mu.Unlock()
 				return
+			}
+		}
+		// profiles a control update released since the snapshot belong in the pool too
+		for _, p := range append(append([]sel.Profile(nil), c.profiles...), c.standby...) {
+			if !typeIn(c.denied, p.RRType) && !containsProfile(allowedPool, p) {
+				allowedPool = append(allowedPool, p)
 			}
 		}
 		pool = allowedPool

@@ -112,6 +112,11 @@ func (c *clientConn) applyControl(ctl Control) {
 	c.mu.Lock()
 	c.lastCtrlReq = time.Now() // delivered: the next request is due in controlPullEvery
 	changed := !sameTypes(c.denied, ctl.DenyTypes)
+	if changed && len(c.profiles) == 0 && len(c.standby) == 0 {
+		// startup, before any profile is measured: just remember it, warm-up and autotune skip denied types
+		c.denied = append([]uint16(nil), ctl.DenyTypes...)
+		changed = false
+	}
 	if changed {
 		var keep, held []sel.Profile
 		for _, p := range append(append([]sel.Profile(nil), c.profiles...), c.denyHeld...) {

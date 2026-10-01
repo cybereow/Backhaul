@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
@@ -59,7 +58,8 @@ type DnsMuxTransport struct {
 	logger       *logrus.Logger
 	usageMonitor *web.Usage
 	wg           sync.WaitGroup
-	live         atomic.Int32 // tunnels currently established
+	statusMu     sync.Mutex
+	live         int // tunnels currently established (under statusMu, with TunnelStatus)
 	disc         discoveryShare
 }
 
@@ -240,15 +240,20 @@ func (c *DnsMuxTransport) runTunnel(refresh bool) (wasUp bool) {
 	defer session.Close()
 	// Count first, then publish: a teardown on another tunnel must never see a
 	// transient zero after we have reported Connected.
-	c.live.Add(1)
+	c.statusMu.Lock()
+	c.live++
 	c.config.TunnelStatus = "Connected (DNSMUX)"
+	c.statusMu.Unlock()
 	c.logger.Info("dnsmux: tunnel established")
 	wasUp = true
 	defer func() {
 		// With a pool, only the last live tunnel going away means disconnected.
-		if c.live.Add(-1) == 0 {
+		c.statusMu.Lock()
+		c.live--
+		if c.live == 0 {
 			c.config.TunnelStatus = "Disconnected (DNSMUX)"
 		}
+		c.statusMu.Unlock()
 	}()
 
 	for {
@@ -301,9 +306,10 @@ const refreshMinAge = 20 * time.Second
 // sweep is serialized, and loops that arrive while (or shortly after) it ran use
 // its result instead of launching their own throttled-in-isolation sweeps.
 type discoveryShare struct {
-	mu     sync.Mutex
-	result []string
-	at     time.Time
+	mu      sync.Mutex
+	result  []string
+	at      time.Time
+	pending bool // a refresh was requested and no new sweep has completed yet
 }
 
 // get returns the shared resolver set, running run when there is none yet, or
@@ -312,13 +318,17 @@ type discoveryShare struct {
 func (d *discoveryShare) get(refresh bool, run func(refresh bool) ([]string, error)) ([]string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if len(d.result) > 0 && (!refresh || time.Since(d.at) < refreshMinAge) {
+	if refresh {
+		d.pending = true // stays set until a sweep has actually run, however many retries it takes
+	}
+	if len(d.result) > 0 && (!d.pending || time.Since(d.at) < refreshMinAge) {
 		return append([]string(nil), d.result...), nil
 	}
 	res, err := run(refresh)
 	if err != nil {
 		return nil, err
 	}
+	d.pending = false
 	if len(res) > 0 {
 		d.result, d.at = res, time.Now()
 	}

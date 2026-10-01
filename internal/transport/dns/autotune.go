@@ -21,7 +21,7 @@ import (
 // instead of stalling the stream forever.
 
 const (
-	autotuneTop        = 12 // profiles measured in depth
+	autotuneTop        = 16 // profiles measured in depth
 	autotunePerResolve = 4  // at most this many of them per resolver
 	minUsableUp        = sessionFrame + rel.HeaderLen + minClientMSS
 )
@@ -164,17 +164,28 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	c.mu.Unlock()
 	sort.Slice(ranked, func(i, j int) bool { return ranked[i].s > ranked[j].s })
 
+	// Cover every resolver first (its best profile), then fill by rank, so the
+	// measured set keeps the diversity discovery found.
 	perRes := map[string]int{}
+	chosen := map[profKey]bool{}
 	var cands []sel.Profile
+	take := func(p sel.Profile) {
+		perRes[p.Resolver]++
+		chosen[keyOf(p)] = true
+		cands = append(cands, p)
+	}
+	for _, r := range ranked {
+		if perRes[r.p.Resolver] == 0 && len(cands) < autotuneTop {
+			take(r.p)
+		}
+	}
 	for _, r := range ranked {
 		if len(cands) >= autotuneTop {
 			break
 		}
-		if perRes[r.p.Resolver] >= autotunePerResolve {
-			continue
+		if !chosen[keyOf(r.p)] && perRes[r.p.Resolver] < autotunePerResolve {
+			take(r.p)
 		}
-		perRes[r.p.Resolver]++
-		cands = append(cands, r.p)
 	}
 	if len(cands) == 0 {
 		return
@@ -214,8 +225,21 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	if len(tuned) == 0 {
 		return
 	}
+	// Warm survivors that were not measured stay available (nominal sizes, never
+	// worse than before autotune): if the measured resolvers later fail, sel can
+	// still fail over to the others instead of the carrier reaching its outage limit.
+	unmeasured := map[profKey]bool{}
+	for _, r := range ranked {
+		if k := keyOf(r.p); !chosen[k] {
+			tuned = append(tuned, r.p)
+			unmeasured[k] = true
+		}
+	}
 	mgr := sel.New(selCfg, tuned)
 	for _, np := range tuned {
+		if unmeasured[keyOf(np)] {
+			continue // left unproven: sel samples it on its own schedule
+		}
 		for i := 0; i < warmSamples; i++ { // measured, so proven: seed the selector with what we saw
 			mgr.Observe(time.Now(), np, true, caps[keyOf(np)].rtt)
 		}

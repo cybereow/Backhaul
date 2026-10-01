@@ -524,7 +524,8 @@ func (c *clientConn) startHedge() {
 	if !busy || c.ctx.Err() != nil {
 		return
 	}
-	if c.hedges.Add(1) > c.maxHedge {
+	limit := min(c.maxHedge, max(c.target.Load(), 1)) // hedges count against the shaped budget too
+	if c.hedges.Add(1) > limit {
 		c.hedges.Add(-1)
 		return
 	}

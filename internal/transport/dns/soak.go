@@ -158,7 +158,7 @@ func runStream(ctx context.Context, pr *Prober, params SoakParams, s SoakStream,
 				if short {
 					a.err = "short payload"
 				}
-				bad := a.stage == StageOK && a.err != ""
+				bad := (a.stage == StageOK && a.err != "") || a.stage == StageBadPeer // incl. MAC/nonce failures
 				st.add(event{
 					at:   time.Now(),
 					ok:   a.stage == StageOK && a.err == "",

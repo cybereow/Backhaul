@@ -860,3 +860,24 @@ func TestWorkerShapingFollowsTheFailureRatio(t *testing.T) {
 		t.Errorf("a maximum below the floor wins: %d", got)
 	}
 }
+
+func TestHedgesFollowTheShapedTarget(t *testing.T) {
+	c := &clientConn{maxHedge: 16, ctx: context.Background()}
+	c.cond = sync.NewCond(&c.mu)
+	c.ep = rel.New(rel.Config{})
+	c.ep.Write([]byte("pending")) // data waiting: hedging is allowed
+	c.target.Store(4)
+	c.hedges.Store(4) // already at the shaped budget
+	started := c.hedges.Load()
+	c.startHedge()
+	if c.hedges.Load() != started {
+		t.Fatalf("hedges exceeded the shaped target: %d in flight with target 4", c.hedges.Load())
+	}
+}
+
+func TestSoakCountsBadPeerAsIntegrityFailure(t *testing.T) {
+	st := stat(event{at: time.Now(), bad: true, err: "mac mismatch"}, event{at: time.Now(), ok: true})
+	if r := summarize(SoakStream{}, st, 1); r.IntegrityFails != 1 {
+		t.Fatalf("IntegrityFails=%d, want 1", r.IntegrityFails)
+	}
+}

@@ -75,7 +75,13 @@ func (p *connPool) closeAll() {
 // retried once on a fresh one. Failed conns are closed, good ones go back.
 func (p *connPool) exchange(ctx context.Context, client *dns.Client, msg *dns.Msg, addr string) (*dns.Msg, time.Duration, error) {
 	if c := p.get(addr); c != nil {
-		pctx, cancel := context.WithTimeout(ctx, pooledTimeout)
+		// Cap the reused conn's attempt, but leave the fresh retry at least as much
+		// time as this one gets (half of what is left when that is less).
+		wait := pooledTimeout
+		if dl, ok := ctx.Deadline(); ok {
+			wait = min(wait, time.Until(dl)/2)
+		}
+		pctx, cancel := context.WithTimeout(ctx, wait)
 		reply, rtt, err := client.ExchangeWithConnContext(pctx, msg, c)
 		cancel()
 		if err == nil {

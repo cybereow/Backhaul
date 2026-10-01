@@ -122,12 +122,12 @@ func (c *clientConn) applyControl(ctl Control) {
 		if len(keep) > 0 { // never deny the client into having nothing to try
 			mgr := sel.New(c.selCfg, keep)
 			for _, p := range keep {
-				rtt := 100 * time.Millisecond
-				if pc, ok := c.caps[keyOf(p)]; ok && pc.rtt > 0 {
-					rtt = pc.rtt
+				pc, ok := c.caps[keyOf(p)]
+				if !ok || pc.rtt <= 0 {
+					continue // never measured: no evidence to seed, it must earn its place
 				}
 				for i := 0; i < warmSamples; i++ {
-					mgr.Observe(time.Now(), p, true, rtt)
+					mgr.Observe(time.Now(), p, true, pc.rtt)
 				}
 			}
 			c.mgr = mgr
@@ -166,6 +166,16 @@ func (c *clientConn) effTarget() int32 {
 	t := c.target.Load()
 	if cp := c.ctrlCap.Load(); cp > 0 && cp < t {
 		return cp
+	}
+	return t
+}
+
+// workerLimit is how many workers may run: effTarget, less the hedges in flight
+// when the server capped the total.
+func (c *clientConn) workerLimit() int32 {
+	t := c.effTarget()
+	if c.ctrlCap.Load() > 0 {
+		t = max(t-c.hedges.Load(), 1)
 	}
 	return t
 }

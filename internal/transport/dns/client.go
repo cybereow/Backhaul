@@ -343,7 +343,7 @@ func (c *clientConn) loop(idx int) {
 			return
 		case <-timer.C:
 			if !primary {
-				if int32(idx) >= c.effTarget() {
+				if int32(idx) >= c.workerLimit() {
 					timer.Reset(pollFast) // shaped out: the resolvers are being asked to carry less
 					continue
 				}
@@ -456,7 +456,7 @@ func (c *clientConn) exchange() {
 			// delay instead of a full stall plus a retransmission timeout.
 			if c.hedgeWorthIt() && c.acquireHedge() {
 				dup = true
-				p2, rs2 := c.pickOther(prof)
+				p2, rs2 := c.pickOther(prof, segMSS)
 				go func() {
 					defer c.hedges.Add(-1)
 					send(p2, rs2)
@@ -642,6 +642,9 @@ func (c *clientConn) acquireHedge() bool {
 		return false
 	}
 	limit := min(c.maxHedge, max(c.effTarget(), 1))
+	if cp := c.ctrlCap.Load(); cp > 0 {
+		limit = min(limit, cp-1) // the server's cap is a total: hedges share it with the workers
+	}
 	if c.hedges.Add(1) > limit {
 		c.hedges.Add(-1)
 		return false
@@ -650,13 +653,23 @@ func (c *clientConn) acquireHedge() bool {
 }
 
 // pickOther returns a profile (and its reply size) for a duplicate, preferring a
-// different resolver than the original's.
-func (c *clientConn) pickOther(orig sel.Profile) (sel.Profile, int) {
+// different resolver than the original's. The duplicate is the same packet, so the
+// profile must carry segMSS upstream; if none does, it falls back to orig.
+func (c *clientConn) pickOther(orig sel.Profile, segMSS int) (sel.Profile, int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	p := c.mgr.Pick(time.Now())
-	for i := 0; i < 3 && p.Resolver == orig.Resolver; i++ {
-		p = c.mgr.Pick(time.Now())
+	fits := func(p sel.Profile) bool {
+		if pc, ok := c.caps[keyOf(p)]; ok {
+			return pc.upMSS() >= segMSS
+		}
+		return c.baseMSS >= segMSS
+	}
+	p := orig
+	for i := 0; i < 4; i++ {
+		if q := c.mgr.Pick(time.Now()); fits(q) && (q.Resolver != orig.Resolver || i == 3) {
+			p = q
+			break
+		}
 	}
 	rs := carrierRespSize(p.Cap)
 	if pc, ok := c.caps[keyOf(p)]; ok {

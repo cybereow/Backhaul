@@ -261,7 +261,12 @@ func (c *clientConn) failover(maxQ int) {
 		return
 	}
 	c.failingOver = true
-	pool := append(append([]sel.Profile(nil), c.standby...), c.profiles...)
+	var pool []sel.Profile
+	for _, p := range append(append([]sel.Profile(nil), c.standby...), c.profiles...) {
+		if !typeIn(c.denied, p.RRType) { // the server's deny list outlives a failover
+			pool = append(pool, p)
+		}
+	}
 	c.mu.Unlock()
 	go func() {
 		defer func() {

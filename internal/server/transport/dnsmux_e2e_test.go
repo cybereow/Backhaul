@@ -83,8 +83,12 @@ func TestDnsMuxEndToEnd(t *testing.T) {
 		}
 	}()
 
+	// the responder binds the same port on udp and tcp, so the forward port must differ from it
 	dnsAddr := freeAddr(t, "udp")
 	fwdAddr := freeAddr(t, "tcp")
+	for fwdAddr == dnsAddr {
+		fwdAddr = freeAddr(t, "tcp")
+	}
 	_, fwdPort, _ := net.SplitHostPort(fwdAddr)
 
 	const domain, key, token = "t.example.com", "dns-key", "tok"

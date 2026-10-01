@@ -162,8 +162,8 @@ func (s *Server) handle(sid uint32, flags byte, in []byte, maxResp int) ([]byte,
 	s.mu.Unlock()
 
 	var ctl []byte
-	if flags&(FlagSYN|FlagCtrlReq) != 0 {
-		ctl = s.ctlBlock() // a client asks for it at session start and then periodically
+	if flags&FlagCtrlReq != 0 {
+		ctl = s.ctlBlock() // only clients that ask get it: an older client would misparse the prefix
 	}
 	return ss.exchange(now, flags, pk, maxResp, ctl)
 }

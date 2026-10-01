@@ -830,3 +830,33 @@ func (c *sizeLimitConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 	return c.PacketConn.WriteTo(p, addr)
 }
+
+func TestBalancedCapPenalizesLopsidedProfiles(t *testing.T) {
+	if balancedCap(16, 750) >= balancedCap(105, 666) {
+		t.Error("a 16 up / 750 down profile must not outrank 105 / 666")
+	}
+	if balancedCap(0, 500) != 0 || balancedCap(500, 0) != 0 {
+		t.Error("a profile that carries nothing one way is worth nothing")
+	}
+}
+
+func TestWorkerShapingFollowsTheFailureRatio(t *testing.T) {
+	if got := nextWorkerTarget(16, 16, 50, 50); got != 8 {
+		t.Errorf("heavy failures: %d, want halved (8)", got)
+	}
+	if got := nextWorkerTarget(8, 16, 100, 0); got != 10 {
+		t.Errorf("clean window: %d, want +2 (10)", got)
+	}
+	if got := nextWorkerTarget(16, 16, 100, 0); got != 16 {
+		t.Errorf("already at the maximum: %d", got)
+	}
+	if got := nextWorkerTarget(5, 16, 40, 40); got != 4 {
+		t.Errorf("must not drop below the floor: %d", got)
+	}
+	if got := nextWorkerTarget(8, 16, 3, 3); got != 8 {
+		t.Errorf("too few observations must change nothing: %d", got)
+	}
+	if got := nextWorkerTarget(2, 2, 100, 100); got != 2 {
+		t.Errorf("a maximum below the floor wins: %d", got)
+	}
+}

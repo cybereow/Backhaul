@@ -134,6 +134,17 @@ func (c *clientConn) measureCaps(ctx context.Context, p sel.Profile, maxQ int) (
 	return pc, true
 }
 
+// balancedCap scores a profile by the harmonic mean of what one exchange can
+// carry each way: traffic goes both ways and the heavy direction is not known in
+// advance, so a profile that carries 750 bytes down but 16 up must not outrank
+// one that carries a solid 100 and 650.
+func balancedCap(up, down int) int {
+	if up <= 0 || down <= 0 {
+		return 0
+	}
+	return 2 * up * down / (up + down)
+}
+
 // autotune measures the best warm-up survivors and rebuilds the selector over
 // them with their real capacities. On any failure to measure anything it leaves
 // the selector as it is (the nominal capacities keep working, just unadapted).
@@ -194,7 +205,7 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 		}
 		caps[keyOf(r.p)] = r.pc
 		np := r.p
-		np.Cap = max(r.pc.upMSS(), 0) + max(r.pc.downMSS(), 0) // bytes one exchange can move, both ways
+		np.Cap = balancedCap(r.pc.upMSS(), r.pc.downMSS())
 		tuned = append(tuned, np)
 		if c.logf != nil {
 			c.logf("dns autotune: %-22s rr=%-3d %-3s carries up %3dB down %4dB (rtt %v)", r.p.Resolver, r.p.RRType, r.p.Transport, r.pc.upMSS(), r.pc.downMSS(), r.pc.rtt.Round(time.Millisecond))

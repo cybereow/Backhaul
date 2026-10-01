@@ -32,6 +32,19 @@ func TestReplyBudgetFitsEveryCodec(t *testing.T) {
 		for _, qlen := range []int{30, 120, 250} {
 			name := longName(qlen)
 			n := maxReplyPayload(c, name, 1232)
+			// a resolver that advertises no EDNS only takes 512 bytes: that budget must fit too
+			if n512 := maxReplyPayload(c, name, 512); n512 > n {
+				t.Errorf("%s: 512-byte budget %d above the 1232 one %d", c.name(), n512, n)
+			} else if rrs, err := c.answer(name, make([]byte, n512)); err == nil {
+				m := new(dns.Msg)
+				m.SetQuestion(name, c.qtype())
+				m.Answer = rrs
+				m.Compress = true
+				m.SetEdns0(512, false)
+				if m.Len() > 512 {
+					t.Errorf("%s qname %d: 512-byte reply is %d bytes", c.name(), qlen, m.Len())
+				}
+			}
 			rrs, err := c.answer(name, make([]byte, n))
 			if err != nil {
 				t.Fatalf("%s: %v", c.name(), err)

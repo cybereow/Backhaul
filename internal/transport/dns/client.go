@@ -130,9 +130,14 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	if n < 1 {
 		n = 1
 	}
+	c.target.Store(int32(n))
 	for i := 0; i < n; i++ {
 		c.wg.Add(1)
-		go c.loop(i == 0)
+		go c.loop(i)
+	}
+	if n > minWorkers {
+		c.wg.Add(1)
+		go c.shape(n)
 	}
 
 	return c, nil
@@ -278,7 +283,10 @@ type clientConn struct {
 	hedge       bool                 // hedging enabled
 	maxHedge    int32                // cap on extra in-flight exchanges
 	hedges      atomic.Int32         // extra exchanges currently in flight
-	srtt        time.Duration        // smoothed RTT of answered exchanges (capped), sets the hedge delay
+	target      atomic.Int32         // workers currently allowed to run (shaping)
+	winOK       atomic.Int32         // exchange outcomes in the current shaping window
+	winFail     atomic.Int32
+	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
 	nextLog     time.Time
 	lastOK      time.Time // last successful exchange (outage detection)
 	outage      time.Duration
@@ -287,8 +295,9 @@ type clientConn struct {
 
 // loop is one exchange worker. The primary keeps polling while idle; helpers
 // only run while there is data to move.
-func (c *clientConn) loop(primary bool) {
+func (c *clientConn) loop(idx int) {
 	defer c.wg.Done()
+	primary := idx == 0
 
 	timer := time.NewTimer(0) // Start immediately
 	defer timer.Stop()
@@ -299,6 +308,10 @@ func (c *clientConn) loop(primary bool) {
 			return
 		case <-timer.C:
 			if !primary {
+				if int32(idx) >= c.target.Load() {
+					timer.Reset(pollFast) // shaped out: the resolvers are being asked to carry less
+					continue
+				}
 				c.mu.Lock()
 				busy := c.ep.Pending() > 0 || c.recentRX() || c.ep.PeerWnd() == 0
 				c.mu.Unlock()
@@ -403,6 +416,7 @@ func (c *clientConn) exchange() {
 	now = time.Now()
 	c.mu.Lock()
 	if stage == StageOK {
+		c.winOK.Add(1)
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
 		if !c.established {
 			c.progressAt = now
@@ -452,6 +466,7 @@ func (c *clientConn) exchange() {
 			}
 		}
 	} else {
+		c.winFail.Add(1)
 		// No reply at all counts as a failure too: otherwise a profile the path
 		// silently drops would never be disabled and would eat every Nth exchange.
 		c.mgr.Observe(now, prof, false, 0)

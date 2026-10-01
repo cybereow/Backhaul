@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	"github.com/miekg/dns"
-	"github.com/musix/backhaul/internal/transport/dns/rel"
 	"github.com/sirupsen/logrus"
 )
 
@@ -188,10 +187,14 @@ func (r *Responder) answer(q dns.Question, inTCP bool, udpSz int) ([]dns.RR, err
 	// framing costs). A resolver that advertises no EDNS gets the conservative
 	// segment size.
 	if r.Handler != nil {
-		budget := 1 + rel.HeaderLen + conservativeSegment
-		if udpSz >= 1232 {
-			budget = maxReplyPayload(c, q.Name, 1232) - envelopeOverhead
+		// The asker's own limit: its advertised EDNS size (at most 1232 is used), or
+		// the classic 512 when it advertises none. Replies that would not fit are
+		// never sent: a conforming resolver would discard an oversized datagram.
+		size := 512
+		if udpSz > 512 {
+			size = min(udpSz, 1232)
 		}
+		budget := maxReplyPayload(c, q.Name, size) - envelopeOverhead
 		if respLen > budget {
 			respLen = budget
 		}
@@ -248,11 +251,6 @@ func stripPort(addr string) string {
 	}
 	return strings.TrimSpace(addr)
 }
-
-// conservativeSegment is the server->client segment size used when the asking
-// resolver advertises no usable EDNS size: base32 of it plus a worst-case
-// question still fits a 1232-byte message.
-const conservativeSegment = 400
 
 // udpSize is the UDP payload size the asker advertises (0 without EDNS).
 func udpSize(req *dns.Msg) int {

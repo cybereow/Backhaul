@@ -151,13 +151,14 @@ func runStream(ctx context.Context, pr *Prober, params SoakParams, s SoakStream,
 				if dl, ok := ctx.Deadline(); a.stage != StageOK && (ctx.Err() != nil || (ok && !time.Now().Before(dl))) {
 					return // deadline hit mid-flight; don't record a phantom failure
 				}
-				bad := a.stage == StageOK && a.err != ""
 				// A reply shorter than requested (the responder caps at the codec's
-				// capacity) did not carry the requested size: not a success.
+				// capacity) did not carry the requested size: not a success, and the
+				// truncation/capacity failure the integrity counter documents.
 				short := a.stage == StageOK && a.err == "" && (a.qBytes < pr.effectiveQLen() || a.respBytes < s.RespSize)
 				if short {
 					a.err = "short payload"
 				}
+				bad := a.stage == StageOK && a.err != ""
 				st.add(event{
 					at:   time.Now(),
 					ok:   a.stage == StageOK && a.err == "",

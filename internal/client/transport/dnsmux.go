@@ -137,8 +137,10 @@ func (c *DnsMuxTransport) tunnelLoop() {
 	defer c.wg.Done()
 	refresh := false
 	for c.ctx.Err() == nil {
-		c.runTunnel(refresh)
-		refresh = true // anything that ended a tunnel invalidates a cached resolver set
+		// A tunnel that was up and then failed invalidates the cached resolver set; a
+		// failure before it ever came up (wrong token, handshake trouble) says nothing
+		// about the resolvers and must not repeat the sweep.
+		refresh = c.runTunnel(refresh)
 		if !c.sleep(c.config.RetryInterval) {
 			return
 		}
@@ -152,7 +154,7 @@ const dnsMaxInflight = 32 * 1024
 // dnsAuthTimeout bounds the token handshake on a fresh tunnel conn.
 const dnsAuthTimeout = 60 * time.Second
 
-func (c *DnsMuxTransport) runTunnel(refresh bool) {
+func (c *DnsMuxTransport) runTunnel(refresh bool) (wasUp bool) {
 	// Spread workers over several profiles: one resolver/record type collapses
 	// well before the path does when it carries every in-flight query.
 	topK := c.config.Workers / 3
@@ -241,6 +243,7 @@ func (c *DnsMuxTransport) runTunnel(refresh bool) {
 	c.live.Add(1)
 	c.config.TunnelStatus = "Connected (DNSMUX)"
 	c.logger.Info("dnsmux: tunnel established")
+	wasUp = true
 	defer func() {
 		// With a pool, only the last live tunnel going away means disconnected.
 		if c.live.Add(-1) == 0 {

@@ -48,12 +48,12 @@ func (pc profCaps) downMSS() int { return pc.down - 1 - rel.HeaderLen }
 // probeUp sends diagnostic queries carrying n data bytes and reports whether the
 // responder received all n (the QNAME survived the path).
 func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Duration, bool) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
-	if !c.acquireProbe(ctx) {
+	if !c.acquireProbe(ctx) { // wait for a slot first: the timeout covers the query, not the queue
 		return 0, false
 	}
 	defer c.slots.Add(-1)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	data := make([]byte, n)
 	data[4] = FlagProbe // sid 0, probe flag: answered in diagnostic mode, never a session
 	for i := sessionFrame; i < n; i++ {
@@ -67,12 +67,12 @@ func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Du
 
 // probeDown requests a reply of size bytes and returns how many arrived intact.
 func (c *clientConn) probeDown(ctx context.Context, p sel.Profile, size int) (time.Duration, int) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
-	defer cancel()
 	if !c.acquireProbe(ctx) {
 		return 0, 0
 	}
 	defer c.slots.Add(-1)
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	var nonce uint64
 	t0 := time.Now()
 	resp, _, _, _, stage, _ := exchangeVia(c.pool, ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, size,
@@ -325,9 +325,24 @@ func (c *clientConn) failover(maxQ int) {
 				allowedPool = append(allowedPool, p)
 			}
 		}
-		if len(allowedPool) > 0 {
-			pool = allowedPool
+		if len(allowedPool) == 0 {
+			// the deny moved to the types this snapshot holds: the profiles that were
+			// held back (and are allowed now) are the pool; if there are none, give up
+			var still []sel.Profile
+			for _, p := range c.denyHeld {
+				if typeIn(c.denied, p.RRType) {
+					still = append(still, p)
+				} else {
+					allowedPool = append(allowedPool, p)
+				}
+			}
+			c.denyHeld = still
+			if len(allowedPool) == 0 {
+				c.mu.Unlock()
+				return
+			}
 		}
+		pool = allowedPool
 		c.allProfiles = pool
 		c.mgr = sel.New(c.selCfg, pool) // a selector that knows the whole pool, so the warm-up can score it
 		c.mu.Unlock()

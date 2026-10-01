@@ -198,11 +198,10 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 				}
 				ok := false
 				if fails < warmFailStop {
-					ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
-					if !c.acquireProbe(ctx) {
-						cancel()
+					if !c.acquireProbe(c.ctx) { // wait for a slot first: the timeout covers the query, not the queue
 						return
 					}
+					ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
 					t0 := time.Now()
 					_, _, _, _, stage, _ := Exchange(ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, respSize, func(uint64) []byte { return []byte{0} }, c.timeout)
 					cancel()

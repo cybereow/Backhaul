@@ -101,6 +101,10 @@ func (s *Server) Start() {
 		}
 		dnsMuxServer := transport.NewDnsMuxServer(s.ctx, &transport.DnsMuxConfig{
 			Domain:           s.config.DNSDomain,
+			MaxWorkers:       s.config.DNSMaxWorkers,
+			DenyTypes:        s.config.DNSDenyRecordTypes,
+			NoHedge:          s.config.DNSForceNoHedge,
+			IdlePollMS:       s.config.DNSIdlePollMS,
 			Key:              dnsKey,
 			Listen:           dnsListen,
 			Token:            s.config.Token,

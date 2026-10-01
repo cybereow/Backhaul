@@ -17,6 +17,12 @@ dns_domain = "ttt.example.com" # sub-zone delegated to this host
 dns_listen = "0.0.0.0:53"      # authoritative responder (UDP+TCP)
 # dns_key = ""                 # per-query MAC secret; defaults to token (set a different one)
 ports = ["8080=127.0.0.1:80"]  # local listener = target the CLIENT dials
+# Control channel: limits every client picks up by itself within ~30 s (you cannot reach the
+# clients, so this is how you steer them). All optional.
+# dns_max_workers = 8              # cap on in-flight DNS queries per client tunnel
+# dns_deny_record_types = ["NULL"] # record types clients must not use
+# dns_force_no_hedge = false       # tell clients to turn hedging off
+# dns_idle_poll_ms = 1000          # idle polling interval clients should use (lower server/resolver load)
 log_level = "info"
 
 # ---- client ----

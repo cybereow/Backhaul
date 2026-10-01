@@ -863,15 +863,14 @@ func TestWorkerShapingFollowsTheFailureRatio(t *testing.T) {
 
 func TestHedgesFollowTheShapedTarget(t *testing.T) {
 	c := &clientConn{maxHedge: 16, ctx: context.Background()}
-	c.cond = sync.NewCond(&c.mu)
-	c.ep = rel.New(rel.Config{})
-	c.ep.Write([]byte("pending")) // data waiting: hedging is allowed
 	c.target.Store(4)
 	c.hedges.Store(4) // already at the shaped budget
-	started := c.hedges.Load()
-	c.startHedge()
-	if c.hedges.Load() != started {
-		t.Fatalf("hedges exceeded the shaped target: %d in flight with target 4", c.hedges.Load())
+	if c.acquireHedge() {
+		t.Fatalf("hedge granted beyond the shaped target: %d in flight with target 4", c.hedges.Load())
+	}
+	c.hedges.Store(2)
+	if !c.acquireHedge() || c.hedges.Load() != 3 {
+		t.Fatal("hedge within budget refused")
 	}
 }
 
@@ -969,5 +968,135 @@ func TestDownstreamBlackholeEndsTheCarrier(t *testing.T) {
 		}
 	case <-time.After(25 * time.Second):
 		t.Fatal("download-only stream stayed attached to a carrier whose data replies are dropped")
+	}
+}
+
+// pingPong does n request/response exchanges of 64 bytes over one tunnel and
+// returns the total time: the interactive latency a TLS/Reality handshake feels.
+func pingPong(t *testing.T, noHedge bool, n int) time.Duration {
+	t.Helper()
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	srv.relCfg = rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A resolver that sits on 20% of the queries for 1.8s BEFORE they reach the
+	// server (what the tcpdump on the real server showed): the stall is on the way in.
+	var rmu sync.Mutex
+	rng := rand.New(rand.NewSource(5))
+	ds := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		rmu.Lock()
+		stall := rng.Float64() < 0.2
+		rmu.Unlock()
+		if stall {
+			time.Sleep(1800 * time.Millisecond)
+		}
+		srv.responder.handle(w, req)
+	})}
+	go func() { _ = ds.ActivateAndServe() }()
+	defer ds.Shutdown()
+	defer srv.Close()
+	go func() {
+		c, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Workers: 4, NoHedge: noHedge, NoAutotune: true, Timeout: 4 * time.Second,
+		Profiles: []sel.Profile{{Resolver: pc.LocalAddr().String(), RRType: 16, Transport: "udp", Cap: 700}},
+		Rel:      rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	msg, back := payload(1, 64), make([]byte, 64)
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		if _, err := cli.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(cli, back); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return time.Since(start)
+}
+
+func TestDuplicateHedgeCutsInteractiveLatency(t *testing.T) {
+	// A wall-clock comparison over random stalls: a slow CI box with few lucky
+	// stalls can show no gain in one go, so it may retry (hedging must win in at
+	// least one of up to three tries; locally it wins by 2-5x every time).
+	for try := 1; try <= 3; try++ {
+		// two runs of each, summed: one unlucky run must not decide the outcome
+		plain := pingPong(t, true, 16) + pingPong(t, true, 16)
+		hedged := pingPong(t, false, 16) + pingPong(t, false, 16)
+		t.Logf("try %d: 2x16 request/response round trips, 20%% of queries held 1.8s on the way in: no hedging %v, duplicate hedging %v", try, plain, hedged)
+		if hedged <= plain*90/100 {
+			return
+		}
+	}
+	t.Error("duplicate hedging never cut latency in 3 tries")
+}
+
+// holeListener hands the FIRST accepted TCP conn to nobody (a conn the resolver
+// silently dropped: queries on it vanish) and serves the rest normally.
+type holeListener struct {
+	net.Listener
+	once sync.Once
+	dead chan net.Conn
+}
+
+func (l *holeListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		first := false
+		l.once.Do(func() { first = true })
+		if first {
+			l.dead <- c // keep it open and silent
+			continue
+		}
+		return c, nil
+	}
+}
+
+func TestPooledDeadTCPConnDoesNotCostTheFullTimeout(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hl := &holeListener{Listener: ln, dead: make(chan net.Conn, 1)}
+	ds := &dns.Server{Listener: hl, Handler: dns.HandlerFunc(srv.responder.handle)}
+	go func() { _ = ds.ActivateAndServe() }()
+	defer ds.Shutdown()
+	addr := ln.Addr().String()
+
+	pool := newConnPool()
+	cl := &dns.Client{Net: "tcp", Timeout: 8 * time.Second}
+	dead, err := cl.DialContext(context.Background(), addr) // lands in the black hole
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool.put(addr, dead)
+
+	start := time.Now()
+	_, _, _, _, stage, err := exchangeVia(pool, context.Background(), domain, []byte(key), addr, dns.TypeTXT, "tcp", true, 64,
+		func(uint64) []byte { return []byte{0} }, 8*time.Second)
+	if stage != StageOK {
+		t.Fatalf("exchange failed: stage=%v err=%v", stage, err)
+	}
+	if el := time.Since(start); el > 3*time.Second {
+		t.Fatalf("a dead pooled conn cost %v (timeout is 8s): the retry on a fresh conn did not happen promptly", el)
 	}
 }

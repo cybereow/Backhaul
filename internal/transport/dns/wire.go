@@ -20,8 +20,10 @@ import (
 )
 
 const (
-	magicQuery = 0xB6 // marks a backhaul-dns v2 query
-	magicResp  = 0xB4 // v2 reply; the low bit carries inTCP
+	// v3: the rel window is in 16-byte units. The magics changed with it, so an older
+	// peer rejects the packets loudly instead of misreading the window by 16x.
+	magicQuery = 0xB7 // marks a backhaul-dns v3 query
+	magicResp  = 0xB2 // v3 reply; the low bit carries inTCP
 	macLen     = 10   // truncated HMAC-SHA256 (80 bits)
 
 	maxLabel = 63 // RFC 1035 label octet limit
@@ -30,6 +32,8 @@ const (
 	FlagFIN      = 1 << 0
 	FlagRST      = 1 << 1
 	FlagSYN      = 1 << 2 // first exchange(s) of a session, until the first reply arrives
+	FlagCtrlReq  = 1 << 3 // query: send me the server's control block
+	FlagCtrl     = 1 << 4 // reply: a control block precedes the packet
 	FlagProbe    = 1 << 7 // capacity probe: answered in diagnostic mode (QSeen + pattern reply), never a session
 )
 

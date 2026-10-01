@@ -24,17 +24,22 @@ import (
 // resulting tunnel conns, opens smux streams on them and forwards local ports,
 // exactly like tcpmux.
 type DnsMuxConfig struct {
-	Domain           string
-	Key              string
-	Listen           string
-	Token            string
-	Ports            []string
-	Nodelay          bool
-	Sniffer          bool
-	WebPort          int
-	SnifferLog       string
-	TunnelStatus     string
-	ProxyProtocol    bool
+	Domain        string
+	Key           string
+	Listen        string
+	Token         string
+	Ports         []string
+	Nodelay       bool
+	Sniffer       bool
+	WebPort       int
+	SnifferLog    string
+	TunnelStatus  string
+	ProxyProtocol bool
+	// Control channel limits published to clients (see dnsx.Control).
+	MaxWorkers       int
+	DenyTypes        []string
+	NoHedge          bool
+	IdlePollMS       int
 	MuxVersion       int
 	MaxFrameSize     int
 	MaxReceiveBuffer int
@@ -74,6 +79,9 @@ func NewDnsMuxServer(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 	// The carrier has its own liveness handling (RST / idle timeout).
 	sc.KeepAliveInterval = 30 * time.Second
 	sc.KeepAliveTimeout = 10 * time.Minute
+	// A stream's flow-control window is its smux buffer: window = rate x RTT, and the
+	// RTT here is seconds, so the default 64 KB would cap one download at tens of KB/s.
+	sc.MaxStreamBuffer = 1 << 20
 	if config.MuxVersion > 0 {
 		sc.Version = config.MuxVersion
 	}
@@ -110,7 +118,15 @@ func (s *DnsMuxTransport) Start() {
 	srv := dnsx.NewServer(s.config.Domain, s.config.Key, s.logger)
 	// Real DNS round trips take 0.1-1.5s and vary widely; a 300ms minimum RTO
 	// would retransmit most segments spuriously and waste the scarce capacity.
-	srv.SetRel(rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: 32 * 1024})
+	deny, err := dnsx.ControlTypeCodes(s.config.DenyTypes)
+	if err != nil {
+		s.logger.Fatalf("dnsmux: dns_deny_record_types: %v", err)
+	}
+	srv.SetControl(dnsx.Control{
+		MaxWorkers: s.config.MaxWorkers, DenyTypes: deny, NoHedge: s.config.NoHedge,
+		IdlePoll: time.Duration(s.config.IdlePollMS) * time.Millisecond,
+	})
+	srv.SetRel(rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: 512 * 1024, RecvBuf: 1 << 20, SendBuf: 1 << 20})
 	go func() {
 		<-s.ctx.Done()
 		srv.Close()

@@ -9,8 +9,13 @@ import (
 )
 
 const (
-	poolMaxIdle = 32               // idle conns kept per resolver
-	poolMaxAge  = 15 * time.Second // resolvers close idle TCP conns after a few seconds; do not reuse stale ones
+	poolMaxIdle = 32              // idle conns kept per resolver
+	poolMaxAge  = 6 * time.Second // resolvers drop idle TCP conns after a few seconds, often silently; do not reuse old ones
+	// pooledTimeout bounds an attempt on a REUSED conn. A conn the resolver dropped
+	// without a RST swallows the query and the caller would wait the whole exchange
+	// timeout (seconds) before retrying; a reused conn that has not answered in this
+	// long is treated as dead and the query goes out on a fresh one.
+	pooledTimeout = 1200 * time.Millisecond
 )
 
 // connPool keeps idle TCP conns to resolvers so a query does not pay a TCP
@@ -70,12 +75,20 @@ func (p *connPool) closeAll() {
 // retried once on a fresh one. Failed conns are closed, good ones go back.
 func (p *connPool) exchange(ctx context.Context, client *dns.Client, msg *dns.Msg, addr string) (*dns.Msg, time.Duration, error) {
 	if c := p.get(addr); c != nil {
-		reply, rtt, err := client.ExchangeWithConnContext(ctx, msg, c)
+		// Cap the reused conn's attempt, but leave the fresh retry at least as much
+		// time as this one gets (half of what is left when that is less).
+		wait := pooledTimeout
+		if dl, ok := ctx.Deadline(); ok {
+			wait = min(wait, time.Until(dl)/2)
+		}
+		pctx, cancel := context.WithTimeout(ctx, wait)
+		reply, rtt, err := client.ExchangeWithConnContext(pctx, msg, c)
+		cancel()
 		if err == nil {
 			p.put(addr, c)
 			return reply, rtt, nil
 		}
-		c.Close()
+		c.Close() // dead, or too slow to trust: fall through to a fresh conn
 	}
 	c, err := client.DialContext(ctx, addr)
 	if err != nil {

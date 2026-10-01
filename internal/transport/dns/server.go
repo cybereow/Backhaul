@@ -32,6 +32,9 @@ type Server struct {
 	// before the first query arrives.
 	relCfg rel.Config
 
+	ctlMu sync.Mutex
+	ctl   []byte // length-prefixed control block (nil: none)
+
 	mu       sync.Mutex
 	sessions map[uint32]*serverSession
 	acceptCh chan net.Conn
@@ -158,7 +161,11 @@ func (s *Server) handle(sid uint32, flags byte, in []byte, maxResp int) ([]byte,
 	}
 	s.mu.Unlock()
 
-	return ss.exchange(now, flags, pk, maxResp)
+	var ctl []byte
+	if flags&FlagCtrlReq != 0 {
+		ctl = s.ctlBlock() // only clients that ask get it: an older client would misparse the prefix
+	}
+	return ss.exchange(now, flags, pk, maxResp, ctl)
 }
 
 // serverSession is one carrier connection on the inside; it implements net.Conn.
@@ -203,7 +210,7 @@ func (ss *serverSession) fail(err error) {
 	ss.mu.Unlock()
 }
 
-func (ss *serverSession) exchange(now time.Time, flags byte, pk rel.Packet, maxResp int) ([]byte, byte) {
+func (ss *serverSession) exchange(now time.Time, flags byte, pk rel.Packet, maxResp int, ctl []byte) ([]byte, byte) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	ss.last = now
@@ -217,7 +224,7 @@ func (ss *serverSession) exchange(now time.Time, flags byte, pk rel.Packet, maxR
 	// that fits an empty poll can overflow the client's EDNS size when the query
 	// carried data - and a retransmission can never be shrunk, so it would fail
 	// forever. Cap every segment to what fits even beside a maximum-size QNAME.
-	if mss := maxResp - rel.HeaderLen; mss > 0 {
+	if mss := maxResp - rel.HeaderLen - len(ctl); mss > 0 {
 		if mss > maxSegment {
 			mss = maxSegment
 		}
@@ -229,6 +236,10 @@ func (ss *serverSession) exchange(now time.Time, flags byte, pk rel.Packet, maxR
 	var outFlags byte
 	if ss.closed && ss.ep.Pending() == 0 {
 		outFlags |= FlagFIN
+	}
+	if len(ctl) > 0 {
+		outFlags |= FlagCtrl
+		return append(append([]byte(nil), ctl...), out.Marshal()...), outFlags
 	}
 	return out.Marshal(), outFlags
 }

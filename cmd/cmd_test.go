@@ -217,3 +217,28 @@ func TestValidateDNSMuxRejectsUnknownRecordTypes(t *testing.T) {
 		t.Errorf("valid (case-insensitive) record types rejected: %v", err)
 	}
 }
+
+func TestValidateDNSMuxServerControl(t *testing.T) {
+	srv := &config.Config{Server: config.ServerConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
+	if err := validateDNSMux(srv, "server"); err != nil {
+		t.Fatalf("no control set: %v", err)
+	}
+	srv.Server.DNSDenyRecordTypes = []string{"null", "NOPE"}
+	if validateDNSMux(srv, "server") == nil {
+		t.Error("unknown deny record type accepted")
+	}
+	srv.Server.DNSDenyRecordTypes = []string{"null"}
+	srv.Server.DNSMaxWorkers = 300
+	if validateDNSMux(srv, "server") == nil {
+		t.Error("dns_max_workers above 255 accepted")
+	}
+	srv.Server.DNSMaxWorkers = 8
+	srv.Server.DNSIdlePollMS = 30000
+	if validateDNSMux(srv, "server") == nil {
+		t.Error("dns_idle_poll_ms above 25500 accepted")
+	}
+	srv.Server.DNSIdlePollMS = 1000
+	if err := validateDNSMux(srv, "server"); err != nil {
+		t.Errorf("valid control settings rejected: %v", err)
+	}
+}

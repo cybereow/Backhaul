@@ -48,6 +48,10 @@ func (pc profCaps) downMSS() int { return pc.down - 1 - rel.HeaderLen }
 // probeUp sends diagnostic queries carrying n data bytes and reports whether the
 // responder received all n (the QNAME survived the path).
 func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Duration, bool) {
+	if c.isDenied(p.RRType) || !c.acquireProbe(ctx) { // wait for a slot first: the timeout covers the query, not the queue
+		return 0, false
+	}
+	defer c.slots.Add(-1)
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	data := make([]byte, n)
@@ -63,6 +67,10 @@ func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Du
 
 // probeDown requests a reply of size bytes and returns how many arrived intact.
 func (c *clientConn) probeDown(ctx context.Context, p sel.Profile, size int) (time.Duration, int) {
+	if c.isDenied(p.RRType) || !c.acquireProbe(ctx) {
+		return 0, 0
+	}
+	defer c.slots.Add(-1)
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
 	var nonce uint64
@@ -155,14 +163,22 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 		p sel.Profile
 		s float64
 	}
+	allCand := append([]sel.Profile(nil), c.allProfiles...)
 	var ranked []scored
 	for _, p := range c.allProfiles {
+		if typeIn(c.denied, p.RRType) {
+			continue
+		}
 		if s := c.mgr.Score(p, now); s > 0 {
 			ranked = append(ranked, scored{p, s})
 		}
 	}
 	c.mu.Unlock()
 	sort.Slice(ranked, func(i, j int) bool { return ranked[i].s > ranked[j].s })
+
+	// Measure at least twice as many profiles as the selector shares load over, so
+	// a many-worker tunnel spreads over many resolvers.
+	top := max(autotuneTop, 2*selCfg.TopK)
 
 	// Cover every resolver first (its best profile), then fill by rank, so the
 	// measured set keeps the diversity discovery found.
@@ -175,12 +191,12 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 		cands = append(cands, p)
 	}
 	for _, r := range ranked {
-		if perRes[r.p.Resolver] == 0 && len(cands) < autotuneTop {
+		if perRes[r.p.Resolver] == 0 && len(cands) < top {
 			take(r.p)
 		}
 	}
 	for _, r := range ranked {
-		if len(cands) >= autotuneTop {
+		if len(cands) >= top {
 			break
 		}
 		if !chosen[keyOf(r.p)] && perRes[r.p.Resolver] < autotunePerResolve {
@@ -225,27 +241,132 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	if len(tuned) == 0 {
 		return
 	}
-	// Warm survivors that were not measured stay available (nominal sizes, never
-	// worse than before autotune): if the measured resolvers later fail, sel can
-	// still fail over to the others instead of the carrier reaching its outage limit.
-	unmeasured := map[profKey]bool{}
-	for _, r := range ranked {
-		if k := keyOf(r.p); !chosen[k] {
-			tuned = append(tuned, r.p)
-			unmeasured[k] = true
+	// Warm survivors that were not measured are NOT put in the selector: with
+	// nominal capacities they would outrank the measured profiles, and sel would
+	// keep sampling them (dead ones cost a 2s timeout each, which showed up as
+	// latency spikes and made the shaper cut workers). They wait as standby: if
+	// every measured profile fails, the carrier measures the standby set instead
+	// (see failover) rather than reaching its outage limit.
+	// (A candidate whose measurement failed transiently waits here too, so it can
+	// be retried by a later failover instead of vanishing.)
+	// It is built from the whole candidate set, not only the ones that scored: a
+	// profile that failed warm-up (a resolver having a bad minute) must stay
+	// retryable by a later failover.
+	var standby []sel.Profile
+	for _, p := range allCand {
+		if _, measured := caps[keyOf(p)]; !measured {
+			standby = append(standby, p)
 		}
 	}
+	c.mu.Lock()
+	// A control block may have denied a type while this ran: apply the CURRENT deny
+	// list to the result (denied profiles wait in denyHeld, never dropped).
+	var allowed []sel.Profile
+	for _, np := range tuned {
+		if typeIn(c.denied, np.RRType) {
+			if !containsProfile(c.denyHeld, np) {
+				c.denyHeld = append(c.denyHeld, np)
+			}
+		} else {
+			allowed = append(allowed, np)
+		}
+	}
+	if len(allowed) == 0 {
+		c.mu.Unlock()
+		return // everything measured is denied now: keep the current (allowed) selector
+	}
+	tuned = allowed
 	mgr := sel.New(selCfg, tuned)
 	for _, np := range tuned {
-		if unmeasured[keyOf(np)] {
-			continue // left unproven: sel samples it on its own schedule
-		}
 		for i := 0; i < warmSamples; i++ { // measured, so proven: seed the selector with what we saw
 			mgr.Observe(time.Now(), np, true, caps[keyOf(np)].rtt)
 		}
 	}
-	c.mu.Lock()
+	c.standby = standby
 	c.mgr = mgr
 	c.caps = caps
+	c.profiles = tuned // later denies rebuild the selector from the tuned set
 	c.mu.Unlock()
+}
+
+// failover runs when every measured profile has failed: it measures the standby
+// survivors (and re-tests the old set, which may have recovered) and swaps in
+// whatever works. At most one runs at a time, and not more often than every 20s.
+func (c *clientConn) failover(maxQ int) {
+	c.mu.Lock()
+	if c.failingOver || time.Since(c.lastFailover) < 20*time.Second || len(c.standby) == 0 && len(c.profiles) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.failingOver = true
+	var pool []sel.Profile
+	for _, p := range append(append([]sel.Profile(nil), c.standby...), c.profiles...) {
+		if !typeIn(c.denied, p.RRType) { // the server's deny list outlives a failover
+			pool = append(pool, p)
+		} else {
+			if !containsProfile(c.denyHeld, p) {
+				c.denyHeld = append(c.denyHeld, p) // kept so a later lifted deny can bring it back
+			}
+		}
+	}
+	c.mu.Unlock()
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			c.failingOver, c.lastFailover = false, time.Now()
+			c.mu.Unlock()
+		}()
+		c.mu.Lock()
+		// A control block may have denied a type since the pool was snapshotted.
+		var allowedPool []sel.Profile
+		for _, p := range pool {
+			if typeIn(c.denied, p.RRType) {
+				if !containsProfile(c.denyHeld, p) {
+					c.denyHeld = append(c.denyHeld, p)
+				}
+			} else {
+				allowedPool = append(allowedPool, p)
+			}
+		}
+		if len(allowedPool) == 0 {
+			// the deny moved to the types this snapshot holds: the profiles that were
+			// held back (and are allowed now) are the pool; if there are none, give up
+			var still []sel.Profile
+			for _, p := range c.denyHeld {
+				if typeIn(c.denied, p.RRType) {
+					still = append(still, p)
+				} else {
+					allowedPool = append(allowedPool, p)
+				}
+			}
+			c.denyHeld = still
+			if len(allowedPool) == 0 {
+				c.mu.Unlock()
+				return
+			}
+		}
+		// profiles a control update released since the snapshot belong in the pool too
+		for _, p := range append(append([]sel.Profile(nil), c.profiles...), c.standby...) {
+			if !typeIn(c.denied, p.RRType) && !containsProfile(allowedPool, p) {
+				allowedPool = append(allowedPool, p)
+			}
+		}
+		pool = allowedPool
+		c.allProfiles = pool
+		c.mgr = sel.New(c.selCfg, pool) // a selector that knows the whole pool, so the warm-up can score it
+		c.mu.Unlock()
+		c.warmup(pool)
+		if c.ctx.Err() == nil {
+			c.autotune(c.ctx, c.selCfg, maxQ)
+		}
+	}()
+}
+
+func containsProfile(l []sel.Profile, p sel.Profile) bool {
+	for _, x := range l {
+		if keyOf(x) == keyOf(p) {
+			return true
+		}
+	}
+	return false
 }

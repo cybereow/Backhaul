@@ -97,7 +97,10 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	c.cond = sync.NewCond(&c.mu)
 	c.logf = p.Logf
 	c.pool = newConnPool()
-	c.hedge = !p.NoHedge
+	c.noHedgeCfg = p.NoHedge
+	c.hedge.Store(!p.NoHedge)
+	c.selCfg = p.Sel
+	c.profiles = p.Profiles
 	c.outage = p.OutageLimit
 	if c.outage <= 0 {
 		c.outage = outageLimit
@@ -116,7 +119,9 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	}()
 
 	c.allProfiles = p.Profiles
+	c.maxQ = maxQ
 	c.baseMSS = mss
+	c.bootstrapControl() // learn the server's worker cap / deny list before any bulk probing
 	c.warmup(p.Profiles)
 	if !p.NoAutotune {
 		c.autotune(c.ctx, p.Sel, maxQ)
@@ -124,7 +129,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	// The session must really come up: a few attempts (one lost query is normal),
 	// then give up instead of returning a connection no server ever answered.
 	for try := 0; try < dialAttempts && c.ctx.Err() == nil; try++ {
-		c.exchange()
+		c.exchange(false)
 		c.mu.Lock()
 		up, err := c.established, c.err
 		c.mu.Unlock()
@@ -173,6 +178,27 @@ const (
 // session) so sel starts with real numbers instead of exploring one slow,
 // possibly dead profile per exchange. A profile that fails warmFailStop times in
 // a row is marked failed at once.
+// bootstrapControl makes up to two plain exchanges just to receive the server's
+// control block (worker cap, denied types), so the startup probes already obey it.
+func (c *clientConn) bootstrapControl() {
+	for try := 0; try < 2 && c.ctx.Err() == nil; try++ {
+		c.exchange(false)
+		c.mu.Lock()
+		got := !c.lastCtrlReq.IsZero()
+		c.mu.Unlock()
+		if got {
+			return
+		}
+	}
+}
+
+// isDenied reports whether the server forbade this record type.
+func (c *clientConn) isDenied(rr uint16) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return typeIn(c.denied, rr)
+}
+
 func (c *clientConn) warmup(profiles []sel.Profile) {
 	profiles = interleave(profiles)
 	sem := make(chan struct{}, warmConcurrency)
@@ -189,15 +215,19 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 			respSize := livenessReply
 			fails := 0
 			for i := 0; i < warmSamples; i++ {
-				if c.ctx.Err() != nil {
+				if c.ctx.Err() != nil || c.isDenied(p.RRType) { // a control block may have denied it meanwhile
 					return
 				}
 				ok := false
 				if fails < warmFailStop {
+					if !c.acquireProbe(c.ctx) { // wait for a slot first: the timeout covers the query, not the queue
+						return
+					}
 					ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
 					t0 := time.Now()
 					_, _, _, _, stage, _ := Exchange(ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, respSize, func(uint64) []byte { return []byte{0} }, c.timeout)
 					cancel()
+					c.slots.Add(-1)
 					ok = stage == StageOK
 					c.mu.Lock()
 					c.mgr.Observe(time.Now(), p, ok, time.Since(t0))
@@ -290,27 +320,41 @@ type clientConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
-	lastRX      time.Time // when data (or an advancing ACK) last arrived
-	progressAt  time.Time // last time the stream moved (or had nothing to move): outage detection
-	rxProgress  time.Time // last time downstream bytes arrived or the server had none outstanding
-	rxBehind    bool      // the server's last packet pointed past what we have received
-	logf        func(string, ...any)
-	stats       map[sel.Profile]*profStat
-	pool        *connPool
-	allProfiles []sel.Profile        // every candidate profile (autotune ranks these)
-	caps        map[profKey]profCaps // measured per-profile capacities (nil: use nominal)
-	baseMSS     int                  // client segment size for profiles without measured caps
-	hedge       bool                 // hedging enabled
-	maxHedge    int32                // cap on extra in-flight exchanges
-	hedges      atomic.Int32         // extra exchanges currently in flight
-	target      atomic.Int32         // workers currently allowed to run (shaping)
-	winOK       atomic.Int32         // exchange outcomes in the current shaping window
-	winFail     atomic.Int32
-	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
-	nextLog     time.Time
-	lastOK      time.Time // last successful exchange (outage detection)
-	outage      time.Duration
-	established bool // first reply seen: stop sending SYN
+	lastRX       time.Time // when data (or an advancing ACK) last arrived
+	progressAt   time.Time // last time the stream moved (or had nothing to move): outage detection
+	rxProgress   time.Time // last time downstream bytes arrived or the server had none outstanding
+	rxBehind     bool      // the server's last packet pointed past what we have received
+	logf         func(string, ...any)
+	stats        map[sel.Profile]*profStat
+	pool         *connPool
+	allProfiles  []sel.Profile        // every candidate profile (autotune ranks these)
+	caps         map[profKey]profCaps // measured per-profile capacities (nil: use nominal)
+	baseMSS      int                  // client segment size for profiles without measured caps
+	hedge        atomic.Bool          // hedging enabled (the server's control block can turn it off)
+	noHedgeCfg   bool                 // hedging disabled by the caller
+	maxHedge     int32                // cap on extra in-flight exchanges
+	hedges       atomic.Int32         // extra exchanges currently in flight
+	slots        atomic.Int32         // exchanges + hedges in flight; bounded by the server's cap (takeSlot)
+	target       atomic.Int32         // workers currently allowed to run (shaping)
+	ctrlCap      atomic.Int32         // server's MaxWorkers (0: none)
+	idlePoll     atomic.Int64         // server's idle polling interval in ns (0: default)
+	selCfg       sel.Config
+	profiles     []sel.Profile // current candidate set (a deny rebuilds the selector from it)
+	denied       []uint16      // record types the server told us not to use
+	denyHeld     []sel.Profile // profiles of denied types, set aside (not dropped) until the deny is lifted
+	lastCtrlReq  time.Time     // last control block actually received
+	lastCtrlTry  time.Time     // last time we asked for one
+	standby      []sel.Profile // warm survivors autotune did not measure (failover pool)
+	failingOver  bool
+	lastFailover time.Time
+	maxQ         int
+	winOK        atomic.Int32 // exchange outcomes in the current shaping window
+	winFail      atomic.Int32
+	psrtt        map[sel.Profile]time.Duration // smoothed RTT of answered exchanges per profile (capped): sets its hedge delay
+	nextLog      time.Time
+	lastOK       time.Time // last successful exchange (outage detection)
+	outage       time.Duration
+	established  bool // first reply seen: stop sending SYN
 }
 
 // loop is one exchange worker. The primary keeps polling while idle; helpers
@@ -328,7 +372,7 @@ func (c *clientConn) loop(idx int) {
 			return
 		case <-timer.C:
 			if !primary {
-				if int32(idx) >= c.target.Load() {
+				if int32(idx) >= c.effTarget() {
 					timer.Reset(pollFast) // shaped out: the resolvers are being asked to carry less
 					continue
 				}
@@ -340,7 +384,11 @@ func (c *clientConn) loop(idx int) {
 					continue
 				}
 			}
-			c.exchange()
+			if !c.takeSlot() { // the server's cap is full
+				timer.Reset(pollFast)
+				continue
+			}
+			c.exchange(true)
 
 			c.mu.Lock()
 			pending := c.ep.Pending()
@@ -351,13 +399,16 @@ func (c *clientConn) loop(idx int) {
 			if recent || pending > 0 || peerWnd == 0 {
 				timer.Reset(1 * time.Microsecond)
 			} else {
-				timer.Reset(pollIdle)
+				timer.Reset(c.idleInterval())
 			}
 		}
 	}
 }
 
-func (c *clientConn) exchange() {
+// exchange runs one poll. With slotHeld the caller reserved a slot (takeSlot) and
+// the primary network attempt releases it when that attempt really ends, not when
+// exchange returns: a hedge can answer first while the primary is still in flight.
+func (c *clientConn) exchange(slotHeld bool) {
 	now := time.Now()
 
 	c.mu.Lock()
@@ -388,6 +439,10 @@ func (c *clientConn) exchange() {
 	if !c.established {
 		flags |= FlagSYN
 	}
+	if now.Sub(c.lastCtrlReq) > controlPullEvery && now.Sub(c.lastCtrlTry) > 2*time.Second {
+		flags |= FlagCtrlReq // asked again until a block arrives: a lost first exchange must not cost 30 s
+		c.lastCtrlTry = now
+	}
 	c.mu.Unlock()
 	if isFIN {
 		flags |= FlagFIN
@@ -406,34 +461,74 @@ func (c *clientConn) exchange() {
 	// one is not: cutting it off early throws away a reply that was on its way.
 	to := c.timeout
 
-	ctx, cancel := context.WithTimeout(c.ctx, to)
-	defer cancel()
-
 	t0 := time.Now()
 	type netResult struct {
+		prof  sel.Profile
 		data  []byte
 		rttMs int64
 		stage Stage
 	}
-	resCh := make(chan netResult, 1)
+	resCh := make(chan netResult, 2)
+	// Every attempt has its own full timeout (a hedge started late must not inherit
+	// the primary's nearly spent deadline) and outlives this call: cancelling on
+	// return would abort the slower copy and score a healthy profile as failing.
+	send := func(p sel.Profile, rs int) {
+		ctx, cancel := context.WithTimeout(c.ctx, to)
+		defer cancel()
+		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, rs, qDataFunc, to)
+		resCh <- netResult{p, d, ms, st}
+	}
 	go func() {
-		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
-		resCh <- netResult{d, ms, st}
+		send(prof, respSize)
+		if slotHeld {
+			c.slots.Add(-1)
+		}
 	}()
+
+	dup := false
 	var res netResult
-	if c.hedge {
+	if c.hedge.Load() {
 		select {
 		case res = <-resCh:
-		case <-time.After(c.hedgeDelay()):
-			c.startHedge()
+		case <-time.After(c.hedgeDelay(prof)):
+			// Still unanswered after a few typical round trips: a resolver is sitting
+			// on the query. Send the SAME packet again through another profile (rel
+			// ignores whichever copy arrives second), so a stall costs one hedge
+			// delay instead of a full stall plus a retransmission timeout.
+			if c.hedgeWorthIt() && c.acquireHedge() {
+				dup = true
+				p2, rs2 := c.pickOther(prof, segMSS)
+				go func() {
+					defer c.hedges.Add(-1)
+					defer c.slots.Add(-1)
+					send(p2, rs2)
+				}()
+			}
 			res = <-resCh
 		}
 	} else {
 		res = <-resCh
 	}
-	respData, rttMs, stage := res.data, res.rttMs, res.stage
+	c.process(res.prof, res.stage, res.data, res.rttMs, isFIN, t0)
+	if dup {
+		// The slower copy still carries a reply (data, an ACK); fold it in too.
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			select {
+			case r := <-resCh:
+				c.process(r.prof, r.stage, r.data, r.rttMs, isFIN, t0) // a FIN delivered by the slower copy still counts (finOnce dedupes)
+			case <-c.ctx.Done():
+			}
+		}()
+	}
+}
 
-	now = time.Now()
+// process folds one exchange's outcome into the connection: selector stats, the
+// reply's REL packet, control block, flags and the outage checks. Called once per
+// reply, including the replies of hedged duplicates.
+func (c *clientConn) process(prof sel.Profile, stage Stage, respData []byte, rttMs int64, isFIN bool, t0 time.Time) {
+	now := time.Now()
 	c.mu.Lock()
 	if stage == StageOK {
 		c.winOK.Add(1)
@@ -447,10 +542,13 @@ func (c *clientConn) exchange() {
 		// Track typical (not stalled) round trips: cap so a 2s stall cannot push
 		// the hedge delay up to where hedging stops helping.
 		rt := min(time.Duration(rttMs)*time.Millisecond, hedgeMaxDelay)
-		if c.srtt == 0 {
-			c.srtt = rt
+		if c.psrtt == nil {
+			c.psrtt = map[sel.Profile]time.Duration{}
+		}
+		if old := c.psrtt[prof]; old == 0 {
+			c.psrtt[prof] = rt
 		} else {
-			c.srtt = (7*c.srtt + rt) / 8
+			c.psrtt[prof] = (7*old + rt) / 8
 		}
 		if isFIN {
 			c.finOnce.Do(func() { close(c.finDone) })
@@ -469,7 +567,17 @@ func (c *clientConn) exchange() {
 					}
 					c.notifyAll()
 				}
-				p, err := rel.Unmarshal(respData[1:])
+				body := respData[1:]
+				if flags&FlagCtrl != 0 && len(body) >= 1 && len(body) >= 1+int(body[0]) {
+					n := int(body[0])
+					if ctl, err := ParseControl(body[1 : 1+n]); err == nil {
+						c.mu.Unlock() // applyControl takes mu itself
+						c.applyControl(ctl)
+						c.mu.Lock()
+					}
+					body = body[1+n:]
+				}
+				p, err := rel.Unmarshal(body)
 				if err == nil {
 					pendingBefore := c.ep.Pending()
 					rn0 := c.ep.RcvNxt()
@@ -501,8 +609,14 @@ func (c *clientConn) exchange() {
 		// No reply at all counts as a failure too: otherwise a profile the path
 		// silently drops would never be disabled and would eat every Nth exchange.
 		c.mgr.Observe(now, prof, false, 0)
+		if c.mgr.NoneUsable(now) { // checked after recording this failure, so the last profile counts
+			defer c.failover(c.maxQ) // everything measured is failing: look for another way through
+		}
 	}
 	c.record(now, prof, stage == StageOK, now.Sub(t0))
+	if c.logf != nil && (stage != StageOK || now.Sub(t0) > 1500*time.Millisecond) {
+		c.logf("dns slow/failed exchange: %s rr=%d %s stage=%v took %v", prof.Resolver, prof.RRType, prof.Transport, stage, now.Sub(t0).Round(time.Millisecond))
+	}
 
 	// Every resolver/profile has been failing for outageLimit: the tunnel is dead
 	// for practical purposes. End it so the owner can reconnect and re-discover
@@ -532,44 +646,98 @@ func (c *clientConn) exchange() {
 }
 
 const (
-	hedgeMinDelay = 250 * time.Millisecond
-	hedgeMaxDelay = 1200 * time.Millisecond
+	hedgeMinDelay = 400 * time.Millisecond
+	hedgeMaxDelay = 1500 * time.Millisecond
 )
 
 // hedgeDelay is how long an exchange may run before a helper is started: a few
 // typical round trips, clamped.
-func (c *clientConn) hedgeDelay() time.Duration {
+// The delay follows the profile being used: a TCP profile that normally answers in
+// 600ms must not be "stalled" at 300ms, or every exchange would be duplicated and
+// the doubled load would throttle the very path hedging is meant to protect.
+func (c *clientConn) hedgeDelay(p sel.Profile) time.Duration {
 	c.mu.Lock()
-	d := 3 * c.srtt
+	d := 3 * c.psrtt[p]
 	c.mu.Unlock()
 	if d == 0 {
-		d = 400 * time.Millisecond
+		d = 3 * hedgeMinDelay // nothing measured yet: wait longer
 	}
 	return min(max(d, hedgeMinDelay), hedgeMaxDelay)
 }
 
-// startHedge runs one extra exchange in the background when there is data to
-// move and the extra-exchange budget allows. Each extra exchange carries its own
-// packet and processes its own reply, so nothing is duplicated or wasted; it just
-// keeps the pipe full while a stalled exchange is still waiting.
-func (c *clientConn) startHedge() {
+// hedgeWorthIt: duplicating a stalled poll that has nothing to carry or wait for
+// only adds load; hedge when there is data to move or a reply being waited for.
+func (c *clientConn) hedgeWorthIt() bool {
 	c.mu.Lock()
-	busy := c.ep.Pending() > 0 || c.recentRX()
-	c.mu.Unlock()
-	if !busy || c.ctx.Err() != nil {
-		return
+	defer c.mu.Unlock()
+	return c.ep.Pending() > 0 || c.recentRX() || !c.established
+}
+
+// acquireHedge takes one unit of the hedge budget (bounded by the current shaped
+// worker target, so hedges never pile load on a throttled path) when hedging is
+// allowed; the caller releases it with c.hedges.Add(-1).
+func (c *clientConn) acquireHedge() bool {
+	if c.ctx.Err() != nil {
+		return false
 	}
-	limit := min(c.maxHedge, max(c.target.Load(), 1)) // hedges count against the shaped budget too
-	if c.hedges.Add(1) > limit {
+	limit := min(c.maxHedge, max(c.effTarget(), 1))
+	if c.hedges.Add(1) > limit || !c.takeSlot() {
 		c.hedges.Add(-1)
-		return
+		return false
 	}
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		defer c.hedges.Add(-1)
-		c.exchange()
-	}()
+	return true
+}
+
+// acquireProbe waits for a slot for a warm-up/measurement probe, so probing during
+// a failover obeys the server's worker cap like any other exchange. The caller
+// releases it with c.slots.Add(-1). False when ctx ended first.
+func (c *clientConn) acquireProbe(ctx context.Context) bool {
+	for !c.takeSlot() {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	return true
+}
+
+// takeSlot reserves one in-flight exchange (worker or hedge) against the server's
+// worker cap. One atomic counter serves both kinds, so they cannot race past it.
+// The caller releases it with c.slots.Add(-1).
+func (c *clientConn) takeSlot() bool {
+	n := c.slots.Add(1)
+	if cp := c.ctrlCap.Load(); cp > 0 && n > cp {
+		c.slots.Add(-1)
+		return false
+	}
+	return true
+}
+
+// pickOther returns a profile (and its reply size) for a duplicate, preferring a
+// different resolver than the original's. The duplicate is the same packet, so the
+// profile must carry segMSS upstream; if none does, it falls back to orig.
+func (c *clientConn) pickOther(orig sel.Profile, segMSS int) (sel.Profile, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	fits := func(p sel.Profile) bool {
+		if pc, ok := c.caps[keyOf(p)]; ok {
+			return pc.upMSS() >= segMSS
+		}
+		return c.baseMSS >= segMSS
+	}
+	p := orig
+	for i := 0; i < 4; i++ {
+		if q := c.mgr.Pick(time.Now()); fits(q) && (q.Resolver != orig.Resolver || i == 3) {
+			p = q
+			break
+		}
+	}
+	rs := carrierRespSize(p.Cap)
+	if pc, ok := c.caps[keyOf(p)]; ok {
+		rs = pc.down
+	}
+	return p, rs
 }
 
 // recentRX reports whether data arrived within rxWindow. It is a time window, not

@@ -1,0 +1,251 @@
+package dnsx
+
+import (
+	"context"
+	"io"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/miekg/dns"
+	"github.com/musix/backhaul/internal/transport/dns/sel"
+)
+
+func TestControlRoundTrip(t *testing.T) {
+	in := Control{MaxWorkers: 6, DenyTypes: []uint16{dns.TypeNULL, dns.TypePTR}, NoHedge: true, IdlePoll: 1500 * time.Millisecond}
+	got, err := ParseControl(in.Marshal())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MaxWorkers != 6 || !got.NoHedge || got.IdlePoll != 1500*time.Millisecond || !sameTypes(got.DenyTypes, in.DenyTypes) {
+		t.Fatalf("round trip changed the control block: %+v -> %+v", in, got)
+	}
+	if !reflect.DeepEqual(Control{}.Marshal()[1:], []byte{0, 0, 0, 0}) {
+		t.Error("the zero control block must mean no opinion")
+	}
+	bad := in.Marshal()
+	bad[0] = 99
+	if _, err := ParseControl(bad); err == nil {
+		t.Error("an unknown control version must be rejected, not half-applied")
+	}
+	if _, err := ParseControl(in.Marshal()[:3]); err == nil {
+		t.Error("a short control block was accepted")
+	}
+	if _, err := ControlTypeCodes([]string{"txt", "bogus"}); err == nil {
+		t.Error("an unknown record type name was accepted")
+	}
+}
+
+// The server publishes a control block; a running client picks it up and obeys it:
+// capped workers, a denied record type is dropped from the selector, hedging off.
+func TestClientObeysServerControl(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	srv.SetControl(Control{MaxWorkers: 2, DenyTypes: []uint16{dns.TypeMX}, NoHedge: true, IdlePoll: 700 * time.Millisecond})
+
+	go func() {
+		c, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Workers: 8, NoAutotune: true, Timeout: time.Second,
+		Profiles: []sel.Profile{
+			{Resolver: addr, RRType: dns.TypeTXT, Transport: "udp", Cap: 700},
+			{Resolver: addr, RRType: dns.TypeMX, Transport: "udp", Cap: 150},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	c := cli.(*clientConn)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for c.ctrlCap.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c.ctrlCap.Load() != 2 {
+		t.Fatalf("worker cap from the server not applied: %d", c.ctrlCap.Load())
+	}
+	if c.hedge.Load() {
+		t.Error("server asked for no hedging but it is still on")
+	}
+	if c.idleInterval() != 700*time.Millisecond {
+		t.Errorf("idle poll %v, want 700ms", c.idleInterval())
+	}
+	if c.effTarget() != 2 {
+		t.Errorf("effective workers %d with a server cap of 2 (self target %d)", c.effTarget(), c.target.Load())
+	}
+	c.mu.Lock()
+	for _, p := range c.mgr.Active() {
+		if p.RRType == dns.TypeMX {
+			t.Error("a denied record type is still active in the selector")
+		}
+	}
+	denied := append([]uint16(nil), c.denied...)
+	c.mu.Unlock()
+	if !typeIn(denied, dns.TypeMX) {
+		t.Errorf("deny list not stored: %v", denied)
+	}
+}
+
+// Denying every type must not leave the client with nothing to try.
+func TestControlNeverDeniesEverything(t *testing.T) {
+	c := &clientConn{profiles: []sel.Profile{{Resolver: "1.1.1.1:53", RRType: dns.TypeTXT, Transport: "udp", Cap: 700}}}
+	c.mgr = sel.New(sel.Config{}, c.profiles)
+	before := c.mgr
+	c.applyControl(Control{DenyTypes: []uint16{dns.TypeTXT}})
+	if c.mgr != before {
+		t.Error("the selector was replaced by an empty one")
+	}
+	if len(c.denied) != 0 {
+		t.Errorf("an all-denied list was stored: %v", c.denied)
+	}
+}
+
+// A change made on the server while clients are running reaches them: the client
+// asks again after controlPullEvery, with no restart.
+func TestControlChangeReachesARunningClient(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	srv.SetControl(Control{MaxWorkers: 8})
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Workers: 16, NoAutotune: true, Timeout: time.Second,
+		Profiles: []sel.Profile{{Resolver: addr, RRType: dns.TypeTXT, Transport: "udp", Cap: 700}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	c := cli.(*clientConn)
+	if c.ctrlCap.Load() != 8 {
+		t.Fatalf("initial control block not applied: %d", c.ctrlCap.Load())
+	}
+
+	srv.SetControl(Control{MaxWorkers: 3}) // the operator tightens the limit
+	c.mu.Lock()
+	c.lastCtrlReq = time.Now().Add(-2 * controlPullEvery) // the next exchange is due to ask again
+	c.mu.Unlock()
+	deadline := time.Now().Add(5 * time.Second)
+	for c.ctrlCap.Load() != 3 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if c.ctrlCap.Load() != 3 {
+		t.Fatalf("the changed limit never reached the running client: %d", c.ctrlCap.Load())
+	}
+}
+
+// Unmeasured warm survivors must not sit in the selector (nominal capacities would
+// outrank measured profiles and dead ones would cost 2s timeouts): they wait as
+// standby, and a total failure of the measured set triggers a failover measurement.
+func TestStandbyProfilesStayOutOfTheSelector(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	var profiles []sel.Profile
+	for _, t := range []uint16{dns.TypeTXT, dns.TypeMX, dns.TypeA, dns.TypeAAAA} {
+		profiles = append(profiles, sel.Profile{Resolver: addr, RRType: t, Transport: "udp", Cap: 300})
+	}
+	cli, err := Dial(context.Background(), DialParams{Domain: domain, Key: key, Timeout: time.Second, Profiles: profiles, Sel: sel.Config{TopK: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	c := cli.(*clientConn)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, sp := range c.standby {
+		for _, p := range c.profiles {
+			if keyOf(sp) == keyOf(p) {
+				t.Errorf("standby profile %+v is also in the selector", sp)
+			}
+		}
+	}
+	if len(c.profiles) == 0 {
+		t.Fatal("no measured profiles")
+	}
+}
+
+// Workers and hedges share one slot counter bounded by the server's cap.
+func TestServerCapBoundsWorkersAndHedgesTogether(t *testing.T) {
+	c := &clientConn{maxHedge: 16, ctx: context.Background()}
+	c.target.Store(8)
+	c.ctrlCap.Store(2)
+	if !c.takeSlot() || !c.takeSlot() {
+		t.Fatal("slots within the cap refused")
+	}
+	if c.takeSlot() {
+		t.Error("a worker got a slot beyond the cap")
+	}
+	if c.acquireHedge() {
+		t.Error("a hedge got a slot beyond the cap")
+	}
+	c.slots.Add(-1)
+	if !c.acquireHedge() {
+		t.Error("a hedge refused although a slot is free")
+	}
+}
+
+// A denied record type is set aside, not forgotten: lifting the deny brings it back.
+func TestLiftedDenyRestoresProfiles(t *testing.T) {
+	txt := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeTXT, Transport: "udp", Cap: 700}
+	mx := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeMX, Transport: "udp", Cap: 150}
+	c := &clientConn{profiles: []sel.Profile{txt, mx}}
+	c.mgr = sel.New(sel.Config{}, c.profiles)
+	c.applyControl(Control{DenyTypes: []uint16{dns.TypeMX}})
+	if len(c.profiles) != 1 || len(c.denyHeld) != 1 {
+		t.Fatalf("deny not applied: profiles=%d held=%d", len(c.profiles), len(c.denyHeld))
+	}
+	c.applyControl(Control{})
+	if len(c.profiles) != 2 || len(c.denyHeld) != 0 {
+		t.Fatalf("lifted deny did not restore the profile: profiles=%d held=%d", len(c.profiles), len(c.denyHeld))
+	}
+}
+
+// Denying every MEASURED type is fine when a warmed standby path of another type
+// can take over.
+func TestDenyPromotesStandby(t *testing.T) {
+	txt := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeTXT, Transport: "udp", Cap: 700}
+	mx := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeMX, Transport: "udp", Cap: 150}
+	c := &clientConn{profiles: []sel.Profile{txt}, standby: []sel.Profile{mx}}
+	c.mgr = sel.New(sel.Config{}, c.profiles)
+	c.applyControl(Control{DenyTypes: []uint16{dns.TypeTXT}})
+	if len(c.profiles) != 1 || c.profiles[0].RRType != dns.TypeMX || len(c.standby) != 0 || len(c.denyHeld) != 1 {
+		t.Fatalf("standby not promoted: profiles=%+v standby=%+v held=%+v", c.profiles, c.standby, c.denyHeld)
+	}
+}
+
+// Probes during a failover obey the server's worker cap.
+func TestProbesObeyTheWorkerCap(t *testing.T) {
+	c := &clientConn{}
+	c.ctrlCap.Store(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if !c.acquireProbe(ctx) {
+		t.Fatal("first probe refused")
+	}
+	if c.acquireProbe(ctx) {
+		t.Fatal("a second probe ran beyond a cap of 1")
+	}
+}

@@ -83,6 +83,16 @@ func validateDNSMux(cfg *config.Config, configType string) error {
 		if cfg.Server.DNSDomain == "" {
 			return fmt.Errorf("server 'dns_domain' is required for the dnsmux transport")
 		}
+		if _, err := dnsx.ControlTypeCodes(cfg.Server.DNSDenyRecordTypes); err != nil {
+			return fmt.Errorf("server 'dns_deny_record_types': %w", err)
+		}
+		if w := cfg.Server.DNSMaxWorkers; w < 0 || w > 255 {
+			return fmt.Errorf("server 'dns_max_workers' must be 0..255 (it is %d)", w)
+		}
+		// 100 ms units on the wire; below the server's 20 s stale-session limit
+		if ms := cfg.Server.DNSIdlePollMS; ms != 0 && (ms < 100 || ms > 10000 || ms%100 != 0) {
+			return fmt.Errorf("server 'dns_idle_poll_ms' must be 0 or a multiple of 100 in 100..10000 (it is %d)", ms)
+		}
 	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
 		if cfg.Client.DNSDomain == "" {
 			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")

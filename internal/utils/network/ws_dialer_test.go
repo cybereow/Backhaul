@@ -21,8 +21,14 @@ func TestWebSocketDialer_Success(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
 		assert.Equal(t, "test-agent", r.Header.Get("User-Agent"))
-		assert.NotEmpty(t, r.Header.Get("X-User-Id"))
+		assert.Empty(t, r.Header.Get("X-User-Id"), "no custom id header: no browser sends one")
 		assert.True(t, strings.HasPrefix(r.URL.Path, "/testpath/"))
+		// Browser-shaped upgrade headers.
+		assert.Equal(t, "http://"+r.Host, r.Header.Get("Origin"))
+		assert.NotEmpty(t, r.Header.Get("Accept-Language"))
+		assert.NotEmpty(t, r.Header.Get("Accept-Encoding"))
+		assert.Equal(t, "no-cache", r.Header.Get("Cache-Control"))
+		assert.Equal(t, "no-cache", r.Header.Get("Pragma"))
 
 		_, _, _, err := ws.UpgradeHTTP(r, w)
 		require.NoError(t, err)

@@ -157,6 +157,7 @@ func (c *Client) Start() {
 			Path:                 c.config.Path,
 			TLSVerify:            c.config.TLSVerify,
 			WSFraming:            c.config.MuxWSFraming,
+			StealthHandshake:     c.config.MuxStealthHandshake,
 		}
 		if c.config.Transport == config.WSSMUX && !c.config.TLSVerify {
 			c.logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")

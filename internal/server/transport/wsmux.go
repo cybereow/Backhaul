@@ -770,7 +770,10 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			// reads. Refuse it up front, after the authorization checks above
 			// so unauthorized and decoy behaviour is unchanged, and say how to
 			// fix it.
-			if s.config.WSFraming && !network.OffersMuxSubprotocol(r.Header) {
+			// The peer may offer the legacy subprotocol or the token-derived one;
+			// echo whichever it offered.
+			muxProto, offersMux := network.MatchMuxSubprotocol(r.Header, s.config.Token)
+			if s.config.WSFraming && !offersMux {
 				s.logger.Warnf("rejecting %s upgrade from %s: it does not offer the %s subprotocol (this server has mux_ws_framing on); upgrade the client, or set mux_ws_framing=false on both ends", r.URL.Path, r.RemoteAddr, network.MuxSubprotocol)
 				http.Error(w, "standards-framed mux required: upgrade the client, or set mux_ws_framing=false on both ends", http.StatusBadRequest)
 				return
@@ -780,7 +783,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			// checked after the framing one so each mismatch reports its own fix.
 			// It also runs after authorization, so unauthorized and decoy
 			// behaviour is unchanged. The header is separate from the subprotocol.
-			if s.config.HalfClose && !network.OffersCapability(r.Header, network.CapHalfCloseV1) {
+			if s.config.HalfClose && !network.OffersHalfClose(r.Header, s.config.Token) {
 				s.logger.Warnf("rejecting %s upgrade from %s: it does not offer the %s capability (this server has mux_half_close on); upgrade the client, or set mux_half_close=false", r.URL.Path, r.RemoteAddr, network.CapHalfCloseV1)
 				http.Error(w, "half-close capability required: upgrade the client, or set mux_half_close=false on the server", http.StatusBadRequest)
 				return
@@ -799,17 +802,17 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			upgrader := ws.HTTPUpgrader{}
 			if s.config.WSFraming {
 				// Echo the token in the 101 response.
-				upgrader.Protocol = func(p string) bool { return p == network.MuxSubprotocol }
+				upgrader.Protocol = func(p string) bool { return p == muxProto }
 			}
 			netConn, brw, hs, err := upgrader.Upgrade(r, w)
 			if err != nil {
 				s.logger.Errorf("failed to upgrade connection from %s: %v", r.RemoteAddr, err)
 				return
 			}
-			if s.config.WSFraming && hs.Protocol != network.MuxSubprotocol {
+			if s.config.WSFraming && hs.Protocol != muxProto {
 				// Cannot happen after the check above; never continue in a mode
 				// the peer was not told about.
-				s.logger.Errorf("upgrade from %s did not select %s, closing", r.RemoteAddr, network.MuxSubprotocol)
+				s.logger.Errorf("upgrade from %s did not select the mux subprotocol, closing", r.RemoteAddr)
 				netConn.Close()
 				return
 			}

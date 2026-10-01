@@ -140,6 +140,23 @@ func TestWSMuxFramingMatrix(t *testing.T) {
 		lcEcho(t, user, "and again")
 	})
 
+	t.Run("stealth client and framed server round-trip with token-derived names", func(t *testing.T) {
+		h := newLCHarness(t, framedServer)
+		opts := []network.DialOption{network.WithMuxFraming(), network.WithHalfCloseOffer(), network.WithStealthHandshake()}
+		ctl, err := h.dialWith("/channel", opts...)
+		if err != nil {
+			t.Fatalf("stealth control dial: %v", err)
+		}
+		_ = ctl
+		for i := 0; i < 2; i++ {
+			conn, err := h.dialWith("/tunnel", opts...)
+			if err != nil {
+				t.Fatalf("stealth tunnel dial: %v", err)
+			}
+			_ = conn
+		}
+	})
+
 	t.Run("legacy client and legacy server still round-trip", func(t *testing.T) {
 		h := newLCHarness(t)
 		h.control()

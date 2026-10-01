@@ -300,3 +300,33 @@ func TestValidateHalfClose(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadConfigMuxStealthHandshake: mux_stealth_handshake is on when the key is
+// omitted and an explicit false is honored (client only; servers accept both).
+func TestLoadConfigMuxStealthHandshake(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		toml string
+		want bool
+	}{
+		{"omitted", "[client]\ntransport = \"wsmux\"\n", true},
+		{"empty config", "", true},
+		{"explicit false", "[client]\nmux_stealth_handshake = false\n", false},
+		{"explicit true", "[client]\nmux_stealth_handshake = true\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfig(path)
+			if err != nil {
+				t.Fatalf("loadConfig: %v", err)
+			}
+			applyDefaults(cfg)
+			if cfg.Client.MuxStealthHandshake != tc.want {
+				t.Errorf("client mux_stealth_handshake = %v, want %v", cfg.Client.MuxStealthHandshake, tc.want)
+			}
+		})
+	}
+}

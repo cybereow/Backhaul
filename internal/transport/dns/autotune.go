@@ -247,5 +247,6 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	c.mu.Lock()
 	c.mgr = mgr
 	c.caps = caps
+	c.profiles = tuned // later denies rebuild the selector from the tuned set
 	c.mu.Unlock()
 }

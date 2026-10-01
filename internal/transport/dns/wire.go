@@ -30,6 +30,8 @@ const (
 	FlagFIN      = 1 << 0
 	FlagRST      = 1 << 1
 	FlagSYN      = 1 << 2 // first exchange(s) of a session, until the first reply arrives
+	FlagCtrlReq  = 1 << 3 // query: send me the server's control block
+	FlagCtrl     = 1 << 4 // reply: a control block precedes the packet
 	FlagProbe    = 1 << 7 // capacity probe: answered in diagnostic mode (QSeen + pattern reply), never a session
 )
 

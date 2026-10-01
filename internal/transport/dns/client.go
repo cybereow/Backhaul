@@ -97,7 +97,10 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	c.cond = sync.NewCond(&c.mu)
 	c.logf = p.Logf
 	c.pool = newConnPool()
-	c.hedge = !p.NoHedge
+	c.noHedgeCfg = p.NoHedge
+	c.hedge.Store(!p.NoHedge)
+	c.selCfg = p.Sel
+	c.profiles = p.Profiles
 	c.outage = p.OutageLimit
 	if c.outage <= 0 {
 		c.outage = outageLimit
@@ -300,11 +303,18 @@ type clientConn struct {
 	allProfiles []sel.Profile        // every candidate profile (autotune ranks these)
 	caps        map[profKey]profCaps // measured per-profile capacities (nil: use nominal)
 	baseMSS     int                  // client segment size for profiles without measured caps
-	hedge       bool                 // hedging enabled
+	hedge       atomic.Bool          // hedging enabled (the server's control block can turn it off)
+	noHedgeCfg  bool                 // hedging disabled by the caller
 	maxHedge    int32                // cap on extra in-flight exchanges
 	hedges      atomic.Int32         // extra exchanges currently in flight
 	target      atomic.Int32         // workers currently allowed to run (shaping)
-	winOK       atomic.Int32         // exchange outcomes in the current shaping window
+	ctrlCap     atomic.Int32         // server's MaxWorkers (0: none)
+	idlePoll    atomic.Int64         // server's idle polling interval in ns (0: default)
+	selCfg      sel.Config
+	profiles    []sel.Profile // current candidate set (a deny rebuilds the selector from it)
+	denied      []uint16      // record types the server told us not to use
+	lastCtrlReq time.Time
+	winOK       atomic.Int32 // exchange outcomes in the current shaping window
 	winFail     atomic.Int32
 	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
 	nextLog     time.Time
@@ -328,7 +338,7 @@ func (c *clientConn) loop(idx int) {
 			return
 		case <-timer.C:
 			if !primary {
-				if int32(idx) >= c.target.Load() {
+				if int32(idx) >= c.effTarget() {
 					timer.Reset(pollFast) // shaped out: the resolvers are being asked to carry less
 					continue
 				}
@@ -351,7 +361,7 @@ func (c *clientConn) loop(idx int) {
 			if recent || pending > 0 || peerWnd == 0 {
 				timer.Reset(1 * time.Microsecond)
 			} else {
-				timer.Reset(pollIdle)
+				timer.Reset(c.idleInterval())
 			}
 		}
 	}
@@ -388,6 +398,10 @@ func (c *clientConn) exchange() {
 	if !c.established {
 		flags |= FlagSYN
 	}
+	if now.Sub(c.lastCtrlReq) > controlPullEvery {
+		flags |= FlagCtrlReq
+		c.lastCtrlReq = now
+	}
 	c.mu.Unlock()
 	if isFIN {
 		flags |= FlagFIN
@@ -421,7 +435,7 @@ func (c *clientConn) exchange() {
 		resCh <- netResult{d, ms, st}
 	}()
 	var res netResult
-	if c.hedge {
+	if c.hedge.Load() {
 		select {
 		case res = <-resCh:
 		case <-time.After(c.hedgeDelay()):
@@ -469,7 +483,17 @@ func (c *clientConn) exchange() {
 					}
 					c.notifyAll()
 				}
-				p, err := rel.Unmarshal(respData[1:])
+				body := respData[1:]
+				if flags&FlagCtrl != 0 && len(body) >= 1 && len(body) >= 1+int(body[0]) {
+					n := int(body[0])
+					if ctl, err := ParseControl(body[1 : 1+n]); err == nil {
+						c.mu.Unlock() // applyControl takes mu itself
+						c.applyControl(ctl)
+						c.mu.Lock()
+					}
+					body = body[1+n:]
+				}
+				p, err := rel.Unmarshal(body)
 				if err == nil {
 					pendingBefore := c.ep.Pending()
 					rn0 := c.ep.RcvNxt()
@@ -559,7 +583,7 @@ func (c *clientConn) startHedge() {
 	if !busy || c.ctx.Err() != nil {
 		return
 	}
-	limit := min(c.maxHedge, max(c.target.Load(), 1)) // hedges count against the shaped budget too
+	limit := min(c.maxHedge, max(c.effTarget(), 1)) // hedges count against the shaped budget too
 	if c.hedges.Add(1) > limit {
 		c.hedges.Add(-1)
 		return

@@ -57,10 +57,16 @@ type ServerConfig struct {
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
-	DNSDomain            string        `toml:"dns_domain"`   // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
-	DNSKey               string        `toml:"dns_key"`      // dnsmux: shared secret for the per-query MAC; falls back to token
-	DNSListen            string        `toml:"dns_listen"`   // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
-	MaxConnAge           int           `toml:"max_conn_age"` // seconds. Retire a pool connection once it reaches this age, draining the streams still running on it first, so a CDN/LB max-age reset never lands on a connection we are still using. 0 (default) disables rotation - the right value depends on the CDN in front of the server, so it must be set deliberately.
+	DNSDomain            string        `toml:"dns_domain"` // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
+	// Control channel (dnsmux): limits the server publishes to every client, which picks them up on its own
+	// within ~30s. The only way to steer a client you cannot reach.
+	DNSMaxWorkers      int      `toml:"dns_max_workers"`       // cap on in-flight DNS queries per client tunnel (0: no cap, max 255)
+	DNSDenyRecordTypes []string `toml:"dns_deny_record_types"` // record types clients must not use, e.g. ["NULL"]
+	DNSForceNoHedge    bool     `toml:"dns_force_no_hedge"`    // tell clients to disable hedging
+	DNSIdlePollMS      int      `toml:"dns_idle_poll_ms"`      // idle polling interval clients should use (0: their default; 100 ms steps, max 25500)
+	DNSKey             string   `toml:"dns_key"`               // dnsmux: shared secret for the per-query MAC; falls back to token
+	DNSListen          string   `toml:"dns_listen"`            // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
+	MaxConnAge         int      `toml:"max_conn_age"`          // seconds. Retire a pool connection once it reaches this age, draining the streams still running on it first, so a CDN/LB max-age reset never lands on a connection we are still using. 0 (default) disables rotation - the right value depends on the CDN in front of the server, so it must be set deliberately.
 }
 
 // ClientConfig represents the configuration for the client.

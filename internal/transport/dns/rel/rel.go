@@ -18,6 +18,7 @@ package rel
 import (
 	"encoding/binary"
 	"errors"
+	"sort"
 	"time"
 )
 
@@ -29,7 +30,7 @@ const HeaderLen = 14
 type Packet struct {
 	Seq uint32 // stream offset of Data[0] in the sender's byte stream
 	Ack uint32 // next byte the sender expects from the peer (cumulative)
-	Wnd uint16 // sender's free receive space in bytes, clamped to 65535
+	Wnd uint32 // sender's free receive space in bytes; on the wire in wndUnit-byte units (max 65535*wndUnit)
 	// SackOff/SackLen describe the first block of out-of-order bytes the sender
 	// holds: [Ack+SackOff, Ack+SackOff+SackLen). Zero length means none. It lets
 	// the peer skip retransmitting what already arrived behind a gap.
@@ -42,7 +43,7 @@ func (p Packet) Marshal() []byte {
 	b := make([]byte, HeaderLen+len(p.Data))
 	binary.BigEndian.PutUint32(b[0:], p.Seq)
 	binary.BigEndian.PutUint32(b[4:], p.Ack)
-	binary.BigEndian.PutUint16(b[8:], p.Wnd)
+	binary.BigEndian.PutUint16(b[8:], uint16(min(p.Wnd/wndUnit, 65535)))
 	binary.BigEndian.PutUint16(b[10:], p.SackOff)
 	binary.BigEndian.PutUint16(b[12:], p.SackLen)
 	copy(b[HeaderLen:], p.Data)
@@ -58,7 +59,7 @@ func Unmarshal(b []byte) (Packet, error) {
 	return Packet{
 		Seq:     binary.BigEndian.Uint32(b[0:]),
 		Ack:     binary.BigEndian.Uint32(b[4:]),
-		Wnd:     binary.BigEndian.Uint16(b[8:]),
+		Wnd:     uint32(binary.BigEndian.Uint16(b[8:])) * wndUnit,
 		SackOff: binary.BigEndian.Uint16(b[10:]),
 		SackLen: binary.BigEndian.Uint16(b[12:]),
 		Data:    append([]byte(nil), b[HeaderLen:]...),
@@ -126,6 +127,7 @@ type Endpoint struct {
 	rcvNxt uint32
 	rcvBuf []byte            // in-order, not yet Read
 	ooo    map[uint32][]byte // out-of-order segments by seq
+	oooSeq []uint32          // the keys of ooo in sequence order: sack and drain walk a run, not the whole map
 
 	Sent int // segments transmitted (incl. retransmits)
 	Retx int // retransmitted segments
@@ -200,15 +202,19 @@ func (e *Endpoint) inflightBytes() int {
 	return n
 }
 
-func (e *Endpoint) window() uint16 {
+// wndUnit is the granularity of the advertised window: a 16-bit field in 16-byte
+// units covers a megabyte, which a high-latency path needs (window = rate x RTT).
+const wndUnit = 16
+
+func (e *Endpoint) window() uint32 {
 	w := e.cfg.RecvBuf - len(e.rcvBuf)
 	if w < 0 {
 		w = 0
 	}
-	if w > 65535 {
-		w = 65535
+	if w > 65535*wndUnit {
+		w = 65535 * wndUnit
 	}
-	return uint16(w)
+	return uint32(w)
 }
 
 func (e *Endpoint) rto() time.Duration {
@@ -371,22 +377,17 @@ func (e *Endpoint) applySack(p Packet) {
 // sackBlock returns the first run of buffered out-of-order bytes relative to the
 // cumulative ACK point, or zeros when there is none.
 func (e *Endpoint) sackBlock() (off, n uint16) {
-	first, found := uint32(0), false
-	for k := range e.ooo {
-		if after(k, e.rcvNxt) && (!found || after(first, k)) {
-			first, found = k, true
-		}
-	}
-	if !found {
+	if len(e.oooSeq) == 0 {
 		return 0, 0
 	}
+	first := e.oooSeq[0] // always ahead of rcvNxt: rx drains everything else
 	end := first + uint32(len(e.ooo[first]))
-	for grew := true; grew; {
-		grew = false
-		for k, v := range e.ooo {
-			if kEnd := k + uint32(len(v)); !after(k, end) && after(kEnd, end) {
-				end, grew = kEnd, true
-			}
+	for _, k := range e.oooSeq[1:] {
+		if after(k, end) || end-first >= 0xffff {
+			break
+		}
+		if kEnd := k + uint32(len(e.ooo[k])); after(kEnd, end) {
+			end = kEnd
 		}
 	}
 	o, l := first-e.rcvNxt, end-first
@@ -416,6 +417,10 @@ func (e *Endpoint) rx(seq uint32, d []byte) {
 	if seq != e.rcvNxt {
 		if _, dup := e.ooo[seq]; !dup {
 			e.ooo[seq] = append([]byte(nil), d...)
+			at := sort.Search(len(e.oooSeq), func(i int) bool { return !after(seq, e.oooSeq[i]) })
+			e.oooSeq = append(e.oooSeq, 0)
+			copy(e.oooSeq[at+1:], e.oooSeq[at:])
+			e.oooSeq[at] = seq
 		}
 		return
 	}
@@ -423,18 +428,14 @@ func (e *Endpoint) rx(seq uint32, d []byte) {
 	e.rcvNxt += uint32(len(d))
 
 	// Drain buffered segments that are now contiguous (or overlap what we have).
-	for progress := true; progress; {
-		progress = false
-		for k, v := range e.ooo {
-			if after(k, e.rcvNxt) {
-				continue
-			}
-			delete(e.ooo, k)
-			if kend := k + uint32(len(v)); after(kend, e.rcvNxt) {
-				e.rcvBuf = append(e.rcvBuf, v[e.rcvNxt-k:]...)
-				e.rcvNxt = kend
-				progress = true
-			}
+	for len(e.oooSeq) > 0 && !after(e.oooSeq[0], e.rcvNxt) {
+		k := e.oooSeq[0]
+		v := e.ooo[k]
+		e.oooSeq = e.oooSeq[1:]
+		delete(e.ooo, k)
+		if kend := k + uint32(len(v)); after(kend, e.rcvNxt) {
+			e.rcvBuf = append(e.rcvBuf, v[e.rcvNxt-k:]...)
+			e.rcvNxt = kend
 		}
 	}
 }

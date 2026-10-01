@@ -164,6 +164,10 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	c.mu.Unlock()
 	sort.Slice(ranked, func(i, j int) bool { return ranked[i].s > ranked[j].s })
 
+	// Measure at least twice as many profiles as the selector shares load over, so
+	// a many-worker tunnel spreads over many resolvers.
+	top := max(autotuneTop, 2*selCfg.TopK)
+
 	// Cover every resolver first (its best profile), then fill by rank, so the
 	// measured set keeps the diversity discovery found.
 	perRes := map[string]int{}
@@ -175,12 +179,12 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 		cands = append(cands, p)
 	}
 	for _, r := range ranked {
-		if perRes[r.p.Resolver] == 0 && len(cands) < autotuneTop {
+		if perRes[r.p.Resolver] == 0 && len(cands) < top {
 			take(r.p)
 		}
 	}
 	for _, r := range ranked {
-		if len(cands) >= autotuneTop {
+		if len(cands) >= top {
 			break
 		}
 		if !chosen[keyOf(r.p)] && perRes[r.p.Resolver] < autotunePerResolve {

@@ -71,6 +71,9 @@ func NewDnsMuxClient(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 	// The carrier has its own liveness handling (RST / idle timeout).
 	sc.KeepAliveInterval = 30 * time.Second
 	sc.KeepAliveTimeout = 10 * time.Minute
+	// A stream's flow-control window is its smux buffer: window = rate x RTT, and the
+	// RTT here is seconds, so the default 64 KB would cap one download at tens of KB/s.
+	sc.MaxStreamBuffer = 1 << 20
 	if config.MuxVersion > 0 {
 		sc.Version = config.MuxVersion
 	}
@@ -149,7 +152,7 @@ func (c *DnsMuxTransport) tunnelLoop() {
 
 // dnsMaxInflight is the unacked-byte window of the carrier (the default, 8 MSS,
 // would cap a stream at a few hundred bytes in flight however many workers run).
-const dnsMaxInflight = 32 * 1024
+const dnsMaxInflight = 512 * 1024
 
 // dnsAuthTimeout bounds the token handshake on a fresh tunnel conn.
 const dnsAuthTimeout = 60 * time.Second
@@ -161,8 +164,8 @@ func (c *DnsMuxTransport) runTunnel(refresh bool) (wasUp bool) {
 	if topK < 2 {
 		topK = 2
 	}
-	if topK > 8 {
-		topK = 8
+	if topK > 128 { // many workers need many resolvers: each one only carries so many queries a second
+		topK = 128
 	}
 
 	resolvers := dnsx.ExpandResolvers(c.config.Resolvers)
@@ -212,7 +215,7 @@ func (c *DnsMuxTransport) runTunnel(refresh bool) (wasUp bool) {
 		Timeout:  c.config.Timeout,
 		Workers:  c.config.Workers,
 		NoHedge:  c.config.NoHedge,
-		Rel:      rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: dnsMaxInflight}, // see the server side: real DNS RTTs are slow and jittery
+		Rel:      rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: dnsMaxInflight, RecvBuf: 1 << 20, SendBuf: 1 << 20}, // see the server side: real DNS RTTs are slow and jittery
 		Sel:      sel.Config{TopK: topK, SpreadFloor: 0.3},
 		Logf:     c.logger.Debugf,
 	})

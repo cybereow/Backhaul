@@ -96,6 +96,17 @@ type stat struct {
 	lastUsed      time.Time
 }
 
+const (
+	reselectEvery  = 20 * time.Millisecond  // the active set is a slow decision; a few ms of lag costs nothing
+	probeScanEvery = 100 * time.Millisecond // how often the candidate list is rebuilt
+	probeQueueLen  = 32
+)
+
+type probeCand struct {
+	p    Profile
+	tier int
+}
+
 // Manager chooses profiles. Switches counts active-set changes (for tests and
 // observability); a flapping selector shows up as a large number here.
 type Manager struct {
@@ -106,6 +117,9 @@ type Manager struct {
 	chal      Profile
 	chalSince time.Time
 	n, rr     int
+	lastSel   time.Time   // last full reselect: Pick runs per exchange, ranking every profile each time does not scale
+	probeQ    []probeCand // probe candidates in order, rebuilt at most every probeScanEvery
+	probeAt   time.Time
 
 	Switches int
 }
@@ -261,43 +275,78 @@ func (m *Manager) reselect(now time.Time) {
 	}
 }
 
-// probeTarget picks a non-active profile worth sampling: tier 0 unproven,
-// tier 1 disabled and due for a re-check, tier 2 the stalest enabled one.
-func (m *Manager) probeTarget(now time.Time) (p Profile, tier int, ok bool) {
-	best := -1
-	var bestKey time.Time
-	for _, c := range m.ps {
-		if m.isActive(c) {
+// probeTier says how worth probing c is: tier 0 unproven, tier 1 disabled and due
+// for a re-check, tier 2 the stalest enabled one; ok is false for a profile that
+// is disabled and not due yet.
+func (m *Manager) probeTier(c Profile, now time.Time) (tier int, ok bool) {
+	s := m.st[c]
+	m.decay(s, now)
+	switch {
+	case m.disabled(s):
+		if now.Before(s.disabledUntil) {
+			return 0, false
+		}
+		return 1, true
+	case s.w < m.cfg.MinWeight:
+		return 0, true
+	}
+	return 2, true
+}
+
+// peekProbe returns the next non-active profile worth sampling without consuming
+// it. The ordered candidate list is rebuilt at most every probeScanEvery, so a
+// busy tunnel does not rank every profile on every exchange.
+func (m *Manager) peekProbe(now time.Time) (c probeCand, ok bool) {
+	for len(m.probeQ) > 0 {
+		f := m.probeQ[0]
+		if t, valid := m.probeTier(f.p, now); valid && !m.isActive(f.p) {
+			f.tier = t
+			return f, true
+		}
+		m.probeQ = m.probeQ[1:]
+	}
+	if !m.probeAt.IsZero() && now.Sub(m.probeAt) < probeScanEvery {
+		return probeCand{}, false
+	}
+	m.probeAt = now
+	var all []probeCand
+	for _, p := range m.ps {
+		if m.isActive(p) {
 			continue
 		}
-		s := m.st[c]
-		m.decay(s, now)
-		t := 2
-		switch {
-		case m.disabled(s):
-			if now.Before(s.disabledUntil) {
-				continue
-			}
-			t = 1
-		case s.w < m.cfg.MinWeight:
-			t = 0
-		}
-		if best == -1 || t < best || (t == best && s.lastUsed.Before(bestKey)) {
-			p, best, bestKey = c, t, s.lastUsed
+		if t, valid := m.probeTier(p, now); valid {
+			all = append(all, probeCand{p, t})
 		}
 	}
-	return p, best, best != -1
+	sort.SliceStable(all, func(i, j int) bool {
+		if all[i].tier != all[j].tier {
+			return all[i].tier < all[j].tier
+		}
+		return m.st[all[i].p].lastUsed.Before(m.st[all[j].p].lastUsed)
+	})
+	if len(all) > probeQueueLen {
+		all = all[:probeQueueLen]
+	}
+	m.probeQ = all
+	if len(all) == 0 {
+		return probeCand{}, false
+	}
+	return all[0], true
 }
 
 // Pick returns the profile for the next exchange.
 func (m *Manager) Pick(now time.Time) Profile {
 	m.n++
-	m.reselect(now)
+	if len(m.active) == 0 || m.lastSel.IsZero() || now.Before(m.lastSel) || now.Sub(m.lastSel) >= reselectEvery {
+		m.reselect(now)
+		m.lastSel = now
+	}
 
-	if p, tier, ok := m.probeTarget(now); ok &&
-		(len(m.active) == 0 || (tier == 0 && m.n%2 == 0) || m.n%m.cfg.ProbeEvery == 0) {
-		m.st[p].lastUsed = now
-		return p
+	if c, ok := m.peekProbe(now); ok &&
+		(len(m.active) == 0 || (c.tier == 0 && m.n%2 == 0) || m.n%m.cfg.ProbeEvery == 0) {
+		m.probeQ = m.probeQ[1:]
+		m.st[c.p].lastUsed = now
+		return c.p
 	}
 	if len(m.active) > 0 {
 		p := m.active[m.rr%len(m.active)]

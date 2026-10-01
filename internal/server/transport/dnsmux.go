@@ -79,6 +79,9 @@ func NewDnsMuxServer(parentCtx context.Context, config *DnsMuxConfig, logger *lo
 	// The carrier has its own liveness handling (RST / idle timeout).
 	sc.KeepAliveInterval = 30 * time.Second
 	sc.KeepAliveTimeout = 10 * time.Minute
+	// A stream's flow-control window is its smux buffer: window = rate x RTT, and the
+	// RTT here is seconds, so the default 64 KB would cap one download at tens of KB/s.
+	sc.MaxStreamBuffer = 1 << 20
 	if config.MuxVersion > 0 {
 		sc.Version = config.MuxVersion
 	}
@@ -123,7 +126,7 @@ func (s *DnsMuxTransport) Start() {
 		MaxWorkers: s.config.MaxWorkers, DenyTypes: deny, NoHedge: s.config.NoHedge,
 		IdlePoll: time.Duration(s.config.IdlePollMS) * time.Millisecond,
 	})
-	srv.SetRel(rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: 32 * 1024})
+	srv.SetRel(rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: 512 * 1024, RecvBuf: 1 << 20, SendBuf: 1 << 20})
 	go func() {
 		<-s.ctx.Done()
 		srv.Close()

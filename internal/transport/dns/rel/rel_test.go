@@ -284,7 +284,7 @@ func TestSackSkipsHeldSegments(t *testing.T) {
 }
 
 func TestPacketRoundTrip(t *testing.T) {
-	in := Packet{Seq: 0xfffffff0, Ack: 7, Wnd: 1234, SackOff: 300, SackLen: 500, Data: []byte("hello")}
+	in := Packet{Seq: 0xfffffff0, Ack: 7, Wnd: 1232, SackOff: 300, SackLen: 500, Data: []byte("hello")}
 	out, err := Unmarshal(in.Marshal())
 	if err != nil || out.Seq != in.Seq || out.Ack != in.Ack || out.Wnd != in.Wnd || out.SackOff != in.SackOff || out.SackLen != in.SackLen || string(out.Data) != "hello" {
 		t.Fatalf("round-trip mismatch: %+v err=%v", out, err)

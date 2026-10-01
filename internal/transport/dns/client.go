@@ -308,15 +308,15 @@ type clientConn struct {
 	noHedgeCfg   bool                 // hedging disabled by the caller
 	maxHedge     int32                // cap on extra in-flight exchanges
 	hedges       atomic.Int32         // extra exchanges currently in flight
-	inflight     atomic.Int32 // ordinary exchanges running now
+	inflight     atomic.Int32         // ordinary exchanges running now
 	target       atomic.Int32         // workers currently allowed to run (shaping)
 	ctrlCap      atomic.Int32         // server's MaxWorkers (0: none)
 	idlePoll     atomic.Int64         // server's idle polling interval in ns (0: default)
 	selCfg       sel.Config
 	profiles     []sel.Profile // current candidate set (a deny rebuilds the selector from it)
 	denied       []uint16      // record types the server told us not to use
-	lastCtrlReq  time.Time // last control block actually received
-	lastCtrlTry  time.Time // last time we asked for one
+	lastCtrlReq  time.Time     // last control block actually received
+	lastCtrlTry  time.Time     // last time we asked for one
 	standby      []sel.Profile // warm survivors autotune did not measure (failover pool)
 	failingOver  bool
 	lastFailover time.Time

@@ -308,7 +308,7 @@ type clientConn struct {
 	noHedgeCfg   bool                 // hedging disabled by the caller
 	maxHedge     int32                // cap on extra in-flight exchanges
 	hedges       atomic.Int32         // extra exchanges currently in flight
-	inflight     atomic.Int32         // ordinary exchanges running now
+	slots        atomic.Int32         // exchanges + hedges in flight; bounded by the server's cap (takeSlot)
 	target       atomic.Int32         // workers currently allowed to run (shaping)
 	ctrlCap      atomic.Int32         // server's MaxWorkers (0: none)
 	idlePoll     atomic.Int64         // server's idle polling interval in ns (0: default)
@@ -345,7 +345,7 @@ func (c *clientConn) loop(idx int) {
 			return
 		case <-timer.C:
 			if !primary {
-				if int32(idx) >= c.workerLimit() {
+				if int32(idx) >= c.effTarget() {
 					timer.Reset(pollFast) // shaped out: the resolvers are being asked to carry less
 					continue
 				}
@@ -357,7 +357,12 @@ func (c *clientConn) loop(idx int) {
 					continue
 				}
 			}
+			if !c.takeSlot() { // the server's cap is full
+				timer.Reset(pollFast)
+				continue
+			}
 			c.exchange()
+			c.slots.Add(-1)
 
 			c.mu.Lock()
 			pending := c.ep.Pending()
@@ -375,8 +380,6 @@ func (c *clientConn) loop(idx int) {
 }
 
 func (c *clientConn) exchange() {
-	c.inflight.Add(1)
-	defer c.inflight.Add(-1)
 	now := time.Now()
 
 	c.mu.Lock()
@@ -429,11 +432,6 @@ func (c *clientConn) exchange() {
 	// one is not: cutting it off early throws away a reply that was on its way.
 	to := c.timeout
 
-	// The context outlives this call when a duplicate is in flight: cancelling it
-	// on return would abort the slower copy mid-flight and score a healthy profile
-	// as failing.
-	ctx, cancel := context.WithTimeout(c.ctx, to)
-
 	t0 := time.Now()
 	type netResult struct {
 		prof  sel.Profile
@@ -442,7 +440,12 @@ func (c *clientConn) exchange() {
 		stage Stage
 	}
 	resCh := make(chan netResult, 2)
+	// Every attempt has its own full timeout (a hedge started late must not inherit
+	// the primary's nearly spent deadline) and outlives this call: cancelling on
+	// return would abort the slower copy and score a healthy profile as failing.
 	send := func(p sel.Profile, rs int) {
+		ctx, cancel := context.WithTimeout(c.ctx, to)
+		defer cancel()
 		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, rs, qDataFunc, to)
 		resCh <- netResult{p, d, ms, st}
 	}
@@ -463,6 +466,7 @@ func (c *clientConn) exchange() {
 				p2, rs2 := c.pickOther(prof, segMSS)
 				go func() {
 					defer c.hedges.Add(-1)
+					defer c.slots.Add(-1)
 					send(p2, rs2)
 				}()
 			}
@@ -472,14 +476,11 @@ func (c *clientConn) exchange() {
 		res = <-resCh
 	}
 	c.process(res.prof, res.stage, res.data, res.rttMs, isFIN, t0)
-	if !dup {
-		cancel()
-	} else {
+	if dup {
 		// The slower copy still carries a reply (data, an ACK); fold it in too.
 		c.wg.Add(1)
 		go func() {
 			defer c.wg.Done()
-			defer cancel()
 			select {
 			case r := <-resCh:
 				c.process(r.prof, r.stage, r.data, r.rttMs, false, t0)
@@ -646,10 +647,20 @@ func (c *clientConn) acquireHedge() bool {
 		return false
 	}
 	limit := min(c.maxHedge, max(c.effTarget(), 1))
-	n := c.hedges.Add(1)
-	// the server's cap is a total: a hedge needs a free slot beside the exchanges in flight
-	if n > limit || c.ctrlCap.Load() > 0 && c.inflight.Load()+n > c.ctrlCap.Load() {
+	if c.hedges.Add(1) > limit || !c.takeSlot() {
 		c.hedges.Add(-1)
+		return false
+	}
+	return true
+}
+
+// takeSlot reserves one in-flight exchange (worker or hedge) against the server's
+// worker cap. One atomic counter serves both kinds, so they cannot race past it.
+// The caller releases it with c.slots.Add(-1).
+func (c *clientConn) takeSlot() bool {
+	n := c.slots.Add(1)
+	if cp := c.ctrlCap.Load(); cp > 0 && n > cp {
+		c.slots.Add(-1)
 		return false
 	}
 	return true

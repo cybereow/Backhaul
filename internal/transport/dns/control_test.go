@@ -186,3 +186,23 @@ func TestStandbyProfilesStayOutOfTheSelector(t *testing.T) {
 		t.Fatal("no measured profiles")
 	}
 }
+
+// Workers and hedges share one slot counter bounded by the server's cap.
+func TestServerCapBoundsWorkersAndHedgesTogether(t *testing.T) {
+	c := &clientConn{maxHedge: 16, ctx: context.Background()}
+	c.target.Store(8)
+	c.ctrlCap.Store(2)
+	if !c.takeSlot() || !c.takeSlot() {
+		t.Fatal("slots within the cap refused")
+	}
+	if c.takeSlot() {
+		t.Error("a worker got a slot beyond the cap")
+	}
+	if c.acquireHedge() {
+		t.Error("a hedge got a slot beyond the cap")
+	}
+	c.slots.Add(-1)
+	if !c.acquireHedge() {
+		t.Error("a hedge refused although a slot is free")
+	}
+}

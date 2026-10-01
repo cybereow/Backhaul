@@ -171,16 +171,6 @@ func (c *clientConn) effTarget() int32 {
 	return t
 }
 
-// workerLimit is how many workers may run: effTarget, less the hedges in flight
-// when the server capped the total.
-func (c *clientConn) workerLimit() int32 {
-	t := c.effTarget()
-	if c.ctrlCap.Load() > 0 {
-		t = max(t-c.hedges.Load(), 1)
-	}
-	return t
-}
-
 // idleInterval is the polling interval when there is nothing to move.
 func (c *clientConn) idleInterval() time.Duration {
 	if d := time.Duration(c.idlePoll.Load()); d > 0 {

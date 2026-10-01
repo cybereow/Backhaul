@@ -163,6 +163,7 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 		p sel.Profile
 		s float64
 	}
+	allCand := append([]sel.Profile(nil), c.allProfiles...)
 	var ranked []scored
 	for _, p := range c.allProfiles {
 		if s := c.mgr.Score(p, now); s > 0 {
@@ -245,10 +246,13 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	// (see failover) rather than reaching its outage limit.
 	// (A candidate whose measurement failed transiently waits here too, so it can
 	// be retried by a later failover instead of vanishing.)
+	// It is built from the whole candidate set, not only the ones that scored: a
+	// profile that failed warm-up (a resolver having a bad minute) must stay
+	// retryable by a later failover.
 	var standby []sel.Profile
-	for _, r := range ranked {
-		if _, measured := caps[keyOf(r.p)]; !measured {
-			standby = append(standby, r.p)
+	for _, p := range allCand {
+		if _, measured := caps[keyOf(p)]; !measured {
+			standby = append(standby, p)
 		}
 	}
 	c.mu.Lock()
@@ -310,6 +314,20 @@ func (c *clientConn) failover(maxQ int) {
 			c.mu.Unlock()
 		}()
 		c.mu.Lock()
+		// A control block may have denied a type since the pool was snapshotted.
+		var allowedPool []sel.Profile
+		for _, p := range pool {
+			if typeIn(c.denied, p.RRType) {
+				if !containsProfile(c.denyHeld, p) {
+					c.denyHeld = append(c.denyHeld, p)
+				}
+			} else {
+				allowedPool = append(allowedPool, p)
+			}
+		}
+		if len(allowedPool) > 0 {
+			pool = allowedPool
+		}
 		c.allProfiles = pool
 		c.mgr = sel.New(c.selCfg, pool) // a selector that knows the whole pool, so the warm-up can score it
 		c.mu.Unlock()

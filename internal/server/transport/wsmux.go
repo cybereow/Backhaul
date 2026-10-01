@@ -340,6 +340,7 @@ type WsMuxConfig struct {
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
+	MaxDrain             time.Duration // longest a retired connection waits for its streams to finish before it is closed (0 = unbounded)
 	PromoteBytes         uint64        // bytes transferred before upgrading to a striped connection
 	SO_RCVBUF            int           // socket receive buffer forced on the server's accepted tunnel legs (0 = OS default)
 	SO_SNDBUF            int           // socket send buffer forced on the server's accepted tunnel legs (0 = OS default)

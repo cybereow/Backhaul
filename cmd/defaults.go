@@ -151,6 +151,11 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Server.MaxConnAge < 0 {
 		cfg.Server.MaxConnAge = 0
 	}
+	// Drain cap likewise stays unbounded unless set: closing a retired
+	// connection cuts the long-lived flows still on it.
+	if cfg.Server.MaxDrain < 0 {
+		cfg.Server.MaxDrain = 0
+	}
 
 	// Stripe factor - how many pooled connections a single flow is split
 	// across. 1 (the default) leaves the original one-flow-one-connection

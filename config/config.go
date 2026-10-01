@@ -61,6 +61,7 @@ type ServerConfig struct {
 	DNSKey               string        `toml:"dns_key"`      // dnsmux: shared secret for the per-query MAC; falls back to token
 	DNSListen            string        `toml:"dns_listen"`   // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
 	MaxConnAge           int           `toml:"max_conn_age"` // seconds. Retire a pool connection once it reaches this age, draining the streams still running on it first, so a CDN/LB max-age reset never lands on a connection we are still using. 0 (default) disables rotation - the right value depends on the CDN in front of the server, so it must be set deliberately.
+	MaxDrain             int           `toml:"max_drain"`    // seconds. Longest a retired pool connection (see max_conn_age) waits for its remaining streams to finish before it is closed anyway. Only applies after the replacement is up, so it never shrinks the pool. 0 = wait indefinitely (default).
 }
 
 // ClientConfig represents the configuration for the client.

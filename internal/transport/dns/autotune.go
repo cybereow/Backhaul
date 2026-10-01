@@ -225,28 +225,57 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	if len(tuned) == 0 {
 		return
 	}
-	// Warm survivors that were not measured stay available (nominal sizes, never
-	// worse than before autotune): if the measured resolvers later fail, sel can
-	// still fail over to the others instead of the carrier reaching its outage limit.
-	unmeasured := map[profKey]bool{}
+	// Warm survivors that were not measured are NOT put in the selector: with
+	// nominal capacities they would outrank the measured profiles, and sel would
+	// keep sampling them (dead ones cost a 2s timeout each, which showed up as
+	// latency spikes and made the shaper cut workers). They wait as standby: if
+	// every measured profile fails, the carrier measures the standby set instead
+	// (see failover) rather than reaching its outage limit.
+	var standby []sel.Profile
 	for _, r := range ranked {
-		if k := keyOf(r.p); !chosen[k] {
-			tuned = append(tuned, r.p)
-			unmeasured[k] = true
+		if !chosen[keyOf(r.p)] {
+			standby = append(standby, r.p)
 		}
 	}
 	mgr := sel.New(selCfg, tuned)
 	for _, np := range tuned {
-		if unmeasured[keyOf(np)] {
-			continue // left unproven: sel samples it on its own schedule
-		}
 		for i := 0; i < warmSamples; i++ { // measured, so proven: seed the selector with what we saw
 			mgr.Observe(time.Now(), np, true, caps[keyOf(np)].rtt)
 		}
 	}
+	c.standby = standby
 	c.mu.Lock()
 	c.mgr = mgr
 	c.caps = caps
 	c.profiles = tuned // later denies rebuild the selector from the tuned set
 	c.mu.Unlock()
+}
+
+// failover runs when every measured profile has failed: it measures the standby
+// survivors (and re-tests the old set, which may have recovered) and swaps in
+// whatever works. At most one runs at a time, and not more often than every 20s.
+func (c *clientConn) failover(maxQ int) {
+	c.mu.Lock()
+	if c.failingOver || time.Since(c.lastFailover) < 20*time.Second || len(c.standby) == 0 && len(c.profiles) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	c.failingOver = true
+	pool := append(append([]sel.Profile(nil), c.standby...), c.profiles...)
+	c.mu.Unlock()
+	go func() {
+		defer func() {
+			c.mu.Lock()
+			c.failingOver, c.lastFailover = false, time.Now()
+			c.mu.Unlock()
+		}()
+		c.mu.Lock()
+		c.allProfiles = pool
+		c.mgr = sel.New(c.selCfg, pool) // a selector that knows the whole pool, so the warm-up can score it
+		c.mu.Unlock()
+		c.warmup(pool)
+		if c.ctx.Err() == nil {
+			c.autotune(c.ctx, c.selCfg, maxQ)
+		}
+	}()
 }

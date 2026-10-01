@@ -119,6 +119,7 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	}()
 
 	c.allProfiles = p.Profiles
+	c.maxQ = maxQ
 	c.baseMSS = mss
 	c.warmup(p.Profiles)
 	if !p.NoAutotune {
@@ -293,34 +294,38 @@ type clientConn struct {
 	localAddr  net.Addr
 	remoteAddr net.Addr
 
-	lastRX      time.Time // when data (or an advancing ACK) last arrived
-	progressAt  time.Time // last time the stream moved (or had nothing to move): outage detection
-	rxProgress  time.Time // last time downstream bytes arrived or the server had none outstanding
-	rxBehind    bool      // the server's last packet pointed past what we have received
-	logf        func(string, ...any)
-	stats       map[sel.Profile]*profStat
-	pool        *connPool
-	allProfiles []sel.Profile        // every candidate profile (autotune ranks these)
-	caps        map[profKey]profCaps // measured per-profile capacities (nil: use nominal)
-	baseMSS     int                  // client segment size for profiles without measured caps
-	hedge       atomic.Bool          // hedging enabled (the server's control block can turn it off)
-	noHedgeCfg  bool                 // hedging disabled by the caller
-	maxHedge    int32                // cap on extra in-flight exchanges
-	hedges      atomic.Int32         // extra exchanges currently in flight
-	target      atomic.Int32         // workers currently allowed to run (shaping)
-	ctrlCap     atomic.Int32         // server's MaxWorkers (0: none)
-	idlePoll    atomic.Int64         // server's idle polling interval in ns (0: default)
-	selCfg      sel.Config
-	profiles    []sel.Profile // current candidate set (a deny rebuilds the selector from it)
-	denied      []uint16      // record types the server told us not to use
-	lastCtrlReq time.Time
-	winOK       atomic.Int32 // exchange outcomes in the current shaping window
-	winFail     atomic.Int32
-	srtt        time.Duration // smoothed RTT of answered exchanges (capped), sets the hedge delay
-	nextLog     time.Time
-	lastOK      time.Time // last successful exchange (outage detection)
-	outage      time.Duration
-	established bool // first reply seen: stop sending SYN
+	lastRX       time.Time // when data (or an advancing ACK) last arrived
+	progressAt   time.Time // last time the stream moved (or had nothing to move): outage detection
+	rxProgress   time.Time // last time downstream bytes arrived or the server had none outstanding
+	rxBehind     bool      // the server's last packet pointed past what we have received
+	logf         func(string, ...any)
+	stats        map[sel.Profile]*profStat
+	pool         *connPool
+	allProfiles  []sel.Profile        // every candidate profile (autotune ranks these)
+	caps         map[profKey]profCaps // measured per-profile capacities (nil: use nominal)
+	baseMSS      int                  // client segment size for profiles without measured caps
+	hedge        atomic.Bool          // hedging enabled (the server's control block can turn it off)
+	noHedgeCfg   bool                 // hedging disabled by the caller
+	maxHedge     int32                // cap on extra in-flight exchanges
+	hedges       atomic.Int32         // extra exchanges currently in flight
+	target       atomic.Int32         // workers currently allowed to run (shaping)
+	ctrlCap      atomic.Int32         // server's MaxWorkers (0: none)
+	idlePoll     atomic.Int64         // server's idle polling interval in ns (0: default)
+	selCfg       sel.Config
+	profiles     []sel.Profile // current candidate set (a deny rebuilds the selector from it)
+	denied       []uint16      // record types the server told us not to use
+	lastCtrlReq  time.Time
+	standby      []sel.Profile // warm survivors autotune did not measure (failover pool)
+	failingOver  bool
+	lastFailover time.Time
+	maxQ         int
+	winOK        atomic.Int32 // exchange outcomes in the current shaping window
+	winFail      atomic.Int32
+	psrtt        map[sel.Profile]time.Duration // smoothed RTT of answered exchanges per profile (capped): sets its hedge delay
+	nextLog      time.Time
+	lastOK       time.Time // last successful exchange (outage detection)
+	outage       time.Duration
+	established  bool // first reply seen: stop sending SYN
 }
 
 // loop is one exchange worker. The primary keeps polling while idle; helpers
@@ -420,34 +425,71 @@ func (c *clientConn) exchange() {
 	// one is not: cutting it off early throws away a reply that was on its way.
 	to := c.timeout
 
+	// The context outlives this call when a duplicate is in flight: cancelling it
+	// on return would abort the slower copy mid-flight and score a healthy profile
+	// as failing.
 	ctx, cancel := context.WithTimeout(c.ctx, to)
-	defer cancel()
 
 	t0 := time.Now()
 	type netResult struct {
+		prof  sel.Profile
 		data  []byte
 		rttMs int64
 		stage Stage
 	}
-	resCh := make(chan netResult, 1)
-	go func() {
-		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, prof.Resolver, prof.RRType, prof.Transport, true, respSize, qDataFunc, to)
-		resCh <- netResult{d, ms, st}
-	}()
+	resCh := make(chan netResult, 2)
+	send := func(p sel.Profile, rs int) {
+		d, _, _, ms, st, _ := exchangeVia(c.pool, ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, rs, qDataFunc, to)
+		resCh <- netResult{p, d, ms, st}
+	}
+	go send(prof, respSize)
+
+	dup := false
 	var res netResult
 	if c.hedge.Load() {
 		select {
 		case res = <-resCh:
-		case <-time.After(c.hedgeDelay()):
-			c.startHedge()
+		case <-time.After(c.hedgeDelay(prof)):
+			// Still unanswered after a few typical round trips: a resolver is sitting
+			// on the query. Send the SAME packet again through another profile (rel
+			// ignores whichever copy arrives second), so a stall costs one hedge
+			// delay instead of a full stall plus a retransmission timeout.
+			if c.hedgeWorthIt() && c.acquireHedge() {
+				dup = true
+				p2, rs2 := c.pickOther(prof)
+				go func() {
+					defer c.hedges.Add(-1)
+					send(p2, rs2)
+				}()
+			}
 			res = <-resCh
 		}
 	} else {
 		res = <-resCh
 	}
-	respData, rttMs, stage := res.data, res.rttMs, res.stage
+	c.process(res.prof, res.stage, res.data, res.rttMs, isFIN, t0)
+	if !dup {
+		cancel()
+	} else {
+		// The slower copy still carries a reply (data, an ACK); fold it in too.
+		c.wg.Add(1)
+		go func() {
+			defer c.wg.Done()
+			defer cancel()
+			select {
+			case r := <-resCh:
+				c.process(r.prof, r.stage, r.data, r.rttMs, false, t0)
+			case <-c.ctx.Done():
+			}
+		}()
+	}
+}
 
-	now = time.Now()
+// process folds one exchange's outcome into the connection: selector stats, the
+// reply's REL packet, control block, flags and the outage checks. Called once per
+// reply, including the replies of hedged duplicates.
+func (c *clientConn) process(prof sel.Profile, stage Stage, respData []byte, rttMs int64, isFIN bool, t0 time.Time) {
+	now := time.Now()
 	c.mu.Lock()
 	if stage == StageOK {
 		c.winOK.Add(1)
@@ -461,10 +503,13 @@ func (c *clientConn) exchange() {
 		// Track typical (not stalled) round trips: cap so a 2s stall cannot push
 		// the hedge delay up to where hedging stops helping.
 		rt := min(time.Duration(rttMs)*time.Millisecond, hedgeMaxDelay)
-		if c.srtt == 0 {
-			c.srtt = rt
+		if c.psrtt == nil {
+			c.psrtt = map[sel.Profile]time.Duration{}
+		}
+		if old := c.psrtt[prof]; old == 0 {
+			c.psrtt[prof] = rt
 		} else {
-			c.srtt = (7*c.srtt + rt) / 8
+			c.psrtt[prof] = (7*old + rt) / 8
 		}
 		if isFIN {
 			c.finOnce.Do(func() { close(c.finDone) })
@@ -522,11 +567,17 @@ func (c *clientConn) exchange() {
 		}
 	} else {
 		c.winFail.Add(1)
+		if len(c.mgr.Active()) == 0 {
+			defer c.failover(c.maxQ) // everything measured is failing: look for another way through
+		}
 		// No reply at all counts as a failure too: otherwise a profile the path
 		// silently drops would never be disabled and would eat every Nth exchange.
 		c.mgr.Observe(now, prof, false, 0)
 	}
 	c.record(now, prof, stage == StageOK, now.Sub(t0))
+	if c.logf != nil && (stage != StageOK || now.Sub(t0) > 1500*time.Millisecond) {
+		c.logf("dns slow/failed exchange: %s rr=%d %s stage=%v took %v", prof.Resolver, prof.RRType, prof.Transport, stage, now.Sub(t0).Round(time.Millisecond))
+	}
 
 	// Every resolver/profile has been failing for outageLimit: the tunnel is dead
 	// for practical purposes. End it so the owner can reconnect and re-discover
@@ -556,44 +607,62 @@ func (c *clientConn) exchange() {
 }
 
 const (
-	hedgeMinDelay = 250 * time.Millisecond
-	hedgeMaxDelay = 1200 * time.Millisecond
+	hedgeMinDelay = 400 * time.Millisecond
+	hedgeMaxDelay = 1500 * time.Millisecond
 )
 
 // hedgeDelay is how long an exchange may run before a helper is started: a few
 // typical round trips, clamped.
-func (c *clientConn) hedgeDelay() time.Duration {
+// The delay follows the profile being used: a TCP profile that normally answers in
+// 600ms must not be "stalled" at 300ms, or every exchange would be duplicated and
+// the doubled load would throttle the very path hedging is meant to protect.
+func (c *clientConn) hedgeDelay(p sel.Profile) time.Duration {
 	c.mu.Lock()
-	d := 3 * c.srtt
+	d := 3 * c.psrtt[p]
 	c.mu.Unlock()
 	if d == 0 {
-		d = 400 * time.Millisecond
+		d = 3 * hedgeMinDelay // nothing measured yet: wait longer
 	}
 	return min(max(d, hedgeMinDelay), hedgeMaxDelay)
 }
 
-// startHedge runs one extra exchange in the background when there is data to
-// move and the extra-exchange budget allows. Each extra exchange carries its own
-// packet and processes its own reply, so nothing is duplicated or wasted; it just
-// keeps the pipe full while a stalled exchange is still waiting.
-func (c *clientConn) startHedge() {
+// hedgeWorthIt: duplicating a stalled poll that has nothing to carry or wait for
+// only adds load; hedge when there is data to move or a reply being waited for.
+func (c *clientConn) hedgeWorthIt() bool {
 	c.mu.Lock()
-	busy := c.ep.Pending() > 0 || c.recentRX()
-	c.mu.Unlock()
-	if !busy || c.ctx.Err() != nil {
-		return
+	defer c.mu.Unlock()
+	return c.ep.Pending() > 0 || c.recentRX() || !c.established
+}
+
+// acquireHedge takes one unit of the hedge budget (bounded by the current shaped
+// worker target, so hedges never pile load on a throttled path) when hedging is
+// allowed; the caller releases it with c.hedges.Add(-1).
+func (c *clientConn) acquireHedge() bool {
+	if c.ctx.Err() != nil {
+		return false
 	}
-	limit := min(c.maxHedge, max(c.effTarget(), 1)) // hedges count against the shaped budget too
+	limit := min(c.maxHedge, max(c.effTarget(), 1))
 	if c.hedges.Add(1) > limit {
 		c.hedges.Add(-1)
-		return
+		return false
 	}
-	c.wg.Add(1)
-	go func() {
-		defer c.wg.Done()
-		defer c.hedges.Add(-1)
-		c.exchange()
-	}()
+	return true
+}
+
+// pickOther returns a profile (and its reply size) for a duplicate, preferring a
+// different resolver than the original's.
+func (c *clientConn) pickOther(orig sel.Profile) (sel.Profile, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	p := c.mgr.Pick(time.Now())
+	for i := 0; i < 3 && p.Resolver == orig.Resolver; i++ {
+		p = c.mgr.Pick(time.Now())
+	}
+	rs := carrierRespSize(p.Cap)
+	if pc, ok := c.caps[keyOf(p)]; ok {
+		rs = pc.down
+	}
+	return p, rs
 }
 
 // recentRX reports whether data arrived within rxWindow. It is a time window, not

@@ -147,3 +147,39 @@ func TestControlChangeReachesARunningClient(t *testing.T) {
 		t.Fatalf("the changed limit never reached the running client: %d", c.ctrlCap.Load())
 	}
 }
+
+// Unmeasured warm survivors must not sit in the selector (nominal capacities would
+// outrank measured profiles and dead ones would cost 2s timeouts): they wait as
+// standby, and a total failure of the measured set triggers a failover measurement.
+func TestStandbyProfilesStayOutOfTheSelector(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	var profiles []sel.Profile
+	for _, t := range []uint16{dns.TypeTXT, dns.TypeMX, dns.TypeA, dns.TypeAAAA} {
+		profiles = append(profiles, sel.Profile{Resolver: addr, RRType: t, Transport: "udp", Cap: 300})
+	}
+	cli, err := Dial(context.Background(), DialParams{Domain: domain, Key: key, Timeout: time.Second, Profiles: profiles, Sel: sel.Config{TopK: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	c := cli.(*clientConn)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, sp := range c.standby {
+		for _, p := range c.profiles {
+			if keyOf(sp) == keyOf(p) {
+				t.Errorf("standby profile %+v is also in the selector", sp)
+			}
+		}
+	}
+	if len(c.profiles) == 0 {
+		t.Fatal("no measured profiles")
+	}
+}

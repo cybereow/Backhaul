@@ -222,3 +222,30 @@ func TestLiftedDenyRestoresProfiles(t *testing.T) {
 		t.Fatalf("lifted deny did not restore the profile: profiles=%d held=%d", len(c.profiles), len(c.denyHeld))
 	}
 }
+
+// Denying every MEASURED type is fine when a warmed standby path of another type
+// can take over.
+func TestDenyPromotesStandby(t *testing.T) {
+	txt := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeTXT, Transport: "udp", Cap: 700}
+	mx := sel.Profile{Resolver: "1.1.1.1:53", RRType: dns.TypeMX, Transport: "udp", Cap: 150}
+	c := &clientConn{profiles: []sel.Profile{txt}, standby: []sel.Profile{mx}}
+	c.mgr = sel.New(sel.Config{}, c.profiles)
+	c.applyControl(Control{DenyTypes: []uint16{dns.TypeTXT}})
+	if len(c.profiles) != 1 || c.profiles[0].RRType != dns.TypeMX || len(c.standby) != 0 || len(c.denyHeld) != 1 {
+		t.Fatalf("standby not promoted: profiles=%+v standby=%+v held=%+v", c.profiles, c.standby, c.denyHeld)
+	}
+}
+
+// Probes during a failover obey the server's worker cap.
+func TestProbesObeyTheWorkerCap(t *testing.T) {
+	c := &clientConn{}
+	c.ctrlCap.Store(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if !c.acquireProbe(ctx) {
+		t.Fatal("first probe refused")
+	}
+	if c.acquireProbe(ctx) {
+		t.Fatal("a second probe ran beyond a cap of 1")
+	}
+}

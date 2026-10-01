@@ -121,7 +121,21 @@ func (c *clientConn) applyControl(ctl Control) {
 				keep = append(keep, p)
 			}
 		}
+		var stillStandby []sel.Profile
+		if len(keep) == 0 {
+			// nothing measured is allowed: warmed standby paths of other types take over
+			for _, p := range c.standby {
+				if typeIn(ctl.DenyTypes, p.RRType) {
+					held = append(held, p)
+				} else {
+					keep = append(keep, p)
+				}
+			}
+		} else {
+			stillStandby = c.standby
+		}
 		if len(keep) > 0 { // a deny list that leaves nothing to try is ignored as a whole
+			c.standby = stillStandby
 			c.denied = append([]uint16(nil), ctl.DenyTypes...)
 			c.denyHeld, c.profiles = held, keep
 			mgr := sel.New(c.selCfg, keep)

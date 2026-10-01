@@ -199,9 +199,14 @@ func (c *clientConn) warmup(profiles []sel.Profile) {
 				ok := false
 				if fails < warmFailStop {
 					ctx, cancel := context.WithTimeout(c.ctx, c.timeout)
+					if !c.acquireProbe(ctx) {
+						cancel()
+						return
+					}
 					t0 := time.Now()
 					_, _, _, _, stage, _ := Exchange(ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, respSize, func(uint64) []byte { return []byte{0} }, c.timeout)
 					cancel()
+					c.slots.Add(-1)
 					ok = stage == StageOK
 					c.mu.Lock()
 					c.mgr.Observe(time.Now(), p, ok, time.Since(t0))
@@ -658,6 +663,20 @@ func (c *clientConn) acquireHedge() bool {
 	if c.hedges.Add(1) > limit || !c.takeSlot() {
 		c.hedges.Add(-1)
 		return false
+	}
+	return true
+}
+
+// acquireProbe waits for a slot for a warm-up/measurement probe, so probing during
+// a failover obeys the server's worker cap like any other exchange. The caller
+// releases it with c.slots.Add(-1). False when ctx ended first.
+func (c *clientConn) acquireProbe(ctx context.Context) bool {
+	for !c.takeSlot() {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	return true
 }

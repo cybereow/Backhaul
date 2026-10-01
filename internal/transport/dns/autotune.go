@@ -50,6 +50,10 @@ func (pc profCaps) downMSS() int { return pc.down - 1 - rel.HeaderLen }
 func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Duration, bool) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	if !c.acquireProbe(ctx) {
+		return 0, false
+	}
+	defer c.slots.Add(-1)
 	data := make([]byte, n)
 	data[4] = FlagProbe // sid 0, probe flag: answered in diagnostic mode, never a session
 	for i := sessionFrame; i < n; i++ {
@@ -65,6 +69,10 @@ func (c *clientConn) probeUp(ctx context.Context, p sel.Profile, n int) (time.Du
 func (c *clientConn) probeDown(ctx context.Context, p sel.Profile, size int) (time.Duration, int) {
 	ctx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	if !c.acquireProbe(ctx) {
+		return 0, 0
+	}
+	defer c.slots.Add(-1)
 	var nonce uint64
 	t0 := time.Now()
 	resp, _, _, _, stage, _ := exchangeVia(c.pool, ctx, c.domain, c.key, p.Resolver, p.RRType, p.Transport, true, size,
@@ -235,9 +243,11 @@ func (c *clientConn) autotune(ctx context.Context, selCfg sel.Config, maxQ int) 
 	// latency spikes and made the shaper cut workers). They wait as standby: if
 	// every measured profile fails, the carrier measures the standby set instead
 	// (see failover) rather than reaching its outage limit.
+	// (A candidate whose measurement failed transiently waits here too, so it can
+	// be retried by a later failover instead of vanishing.)
 	var standby []sel.Profile
 	for _, r := range ranked {
-		if !chosen[keyOf(r.p)] {
+		if _, measured := caps[keyOf(r.p)]; !measured {
 			standby = append(standby, r.p)
 		}
 	}

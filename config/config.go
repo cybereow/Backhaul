@@ -11,6 +11,7 @@ const (
 	WSMUX  TransportType = "wsmux"
 	WSSMUX TransportType = "wssmux"
 	UDP    TransportType = "udp"
+	DNSMUX TransportType = "dnsmux"
 )
 
 // ServerConfig represents the configuration for the server.
@@ -56,6 +57,9 @@ type ServerConfig struct {
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
+	DNSDomain            string        `toml:"dns_domain"`   // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
+	DNSKey               string        `toml:"dns_key"`      // dnsmux: shared secret for the per-query MAC; falls back to token
+	DNSListen            string        `toml:"dns_listen"`   // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
 	MaxConnAge           int           `toml:"max_conn_age"` // seconds. Retire a pool connection once it reaches this age, draining the streams still running on it first, so a CDN/LB max-age reset never lands on a connection we are still using. 0 (default) disables rotation - the right value depends on the CDN in front of the server, so it must be set deliberately.
 }
 
@@ -93,11 +97,101 @@ type ClientConfig struct {
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
 	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: see the server option; must match it. Enabled by default; a server that does not confirm backhaul-mux-v1 is a hard error, never a silent fallback to raw. Ignored by other transports.
 	Path                 string        `toml:"path"`
-	TLSVerify            bool          `toml:"tls_verify"` // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
+	DNSDomain            string        `toml:"dns_domain"`
+	DNSKey               string        `toml:"dns_key"`
+	DNSResolvers         []string      `toml:"dns_resolvers"`      // dnsmux: recursive resolvers to query (never the authoritative server directly); empty or "auto" = built-in list, tested at startup
+	DNSRecordTypes       []string      `toml:"dns_record_types"`   // dnsmux: limit the RR types tried (default all); the best one is auto-selected
+	DNSTimeoutMS         int           `toml:"dns_timeout_ms"`     // dnsmux: per-query timeout (default 2000)
+	DNSResolverCIDRs     []string      `toml:"dns_resolver_cidrs"` // dnsmux: extra candidate resolvers as CIDRs/IPs to test at startup (rate-limited, max 4096 addresses)
+	DNSResolverCache     string        `toml:"dns_resolver_cache"` // dnsmux: file caching the discovered best resolvers (reused for 30 minutes)
+	DNSNoHedge           bool          `toml:"dns_no_hedge"`       // dnsmux: disable hedging (extra exchange when one stalls)
+	DNSWorkers           int           `toml:"dns_workers"`        // dnsmux: DNS queries in flight per tunnel connection (default 16)
+	TLSVerify            bool          `toml:"tls_verify"`         // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
+}
+
+// ProbeConfig configures the DNS reachability/capacity prober (Phase 1 of the
+// DNS transport). It is deliberately separate from ServerConfig/ClientConfig and
+// only read by the `-probe` subcommand, so it touches none of the existing
+// transports. See internal/transport/dns and the design doc §8 step 1.
+type ProbeConfig struct {
+	// Role selects what this process does: "prober" (outside client, sends
+	// queries through recursive resolvers) or "responder" (inside authoritative
+	// server for Domain). Default "prober".
+	Role string `toml:"role"`
+
+	// Domain is the tunnel domain both sides own, e.g. "t.example.com". The
+	// responder is authoritative for it; the prober encodes payload into QNAMEs
+	// under it. Required.
+	Domain string `toml:"domain"`
+
+	// Key is a shared secret used only to derive a per-query MAC (HMAC-SHA256)
+	// over the nonce+payload, so the token itself never appears on the wire and
+	// only a matching peer's response is accepted. Required; must match on both
+	// sides.
+	Key string `toml:"key"`
+
+	// Resolvers is the prober's candidate recursive resolvers ("ip:port", :53
+	// assumed). The prober queries ONLY these plus the system resolver; it never
+	// dials the authoritative server directly. Required for the prober role.
+	Resolvers []string `toml:"resolvers"`
+
+	// RecordTypes limits the probed RR families (e.g. ["TXT","NULL","A"]). Empty
+	// means all built-in candidates: TXT, NULL, A, AAAA, CNAME, MX, SRV, PTR.
+	RecordTypes []string `toml:"record_types"`
+
+	// QueryBudget / ResponseBudget are the payload sizes (bytes) the prober asks
+	// to carry each way, to measure real capacity rather than advertised limits.
+	// 0 picks conservative defaults.
+	QueryBudget    int `toml:"query_budget"`
+	ResponseBudget int `toml:"response_budget"`
+
+	// ResponseSizes sweeps several requested response payload sizes (bytes) per
+	// profile to find the capacity ceiling. Empty falls back to ResponseBudget.
+	ResponseSizes []int `toml:"response_sizes"`
+
+	// Repeat runs each profile this many times so the report reflects stability
+	// (success rate + RTT percentiles), not a single lucky/unlucky sample. 0→1.
+	Repeat int `toml:"repeat"`
+
+	// SoakDurationMin and SoakMaxInflight configure role="soak": a sustained
+	// bidirectional path test over resolvers×record_types (transport forced TCP
+	// outside), ramping the in-flight window per stream from 1 to SoakMaxInflight
+	// across the run. Defaults: 20 min, 4.
+	SoakDurationMin int `toml:"soak_duration_min"`
+	SoakMaxInflight int `toml:"soak_max_inflight"`
+	// SoakNoRamp runs all SoakMaxInflight workers from the start (fixed load) so
+	// several runs can be compared at different concurrencies.
+	SoakNoRamp bool `toml:"soak_no_ramp"`
+
+	// EDNS selects the EDNS(0) mode to probe: "off", "on", or "both" (default).
+	// EDNS is hop-by-hop, so advertising a size is not proof of MTU.
+	EDNS string `toml:"edns"`
+
+	// UseTCP also probes the client-to-resolver hop over TCP (in addition to
+	// UDP). TCP success to the resolver does not prove TCP resolver->authoritative.
+	UseTCP bool `toml:"use_tcp"`
+
+	// Concurrency and PacingMS bound how fast profiles are probed. Conservative
+	// defaults; a weak path is not helped by a flood.
+	Concurrency int `toml:"concurrency"`
+	PacingMS    int `toml:"pacing_ms"`
+
+	// TimeoutMS is the per-query wait before a profile is recorded as failing at
+	// stage "unknown" (no reply != query never arrived).
+	TimeoutMS int `toml:"timeout_ms"`
+
+	// ResponderListen is the inside responder's UDP+TCP listen address, e.g.
+	// "0.0.0.0:53". Required for the responder role.
+	ResponderListen string `toml:"responder_listen"`
+
+	// ReportJSON, if set, writes the per-profile report to this file as JSON in
+	// addition to the log.
+	ReportJSON string `toml:"report_json"`
 }
 
 // Config represents the complete configuration, including both server and client settings.
 type Config struct {
-	Server ServerConfig `toml:"server"`
-	Client ClientConfig `toml:"client"`
+	Server   ServerConfig `toml:"server"`
+	Client   ClientConfig `toml:"client"`
+	DNSProbe ProbeConfig  `toml:"dns_probe"`
 }

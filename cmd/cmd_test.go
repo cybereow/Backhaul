@@ -169,3 +169,51 @@ func TestValidateStripeConfigAcceptsAppliedDefaults(t *testing.T) {
 		t.Errorf("normalized client stripe config rejected: %v", err)
 	}
 }
+
+func TestValidateDNSMux(t *testing.T) {
+	srv := &config.Config{Server: config.ServerConfig{Transport: config.DNSMUX}}
+	if validateDNSMux(srv, "server") == nil {
+		t.Error("server without dns_domain accepted")
+	}
+	srv.Server.DNSDomain = "t.example.com"
+	if err := validateDNSMux(srv, "server"); err != nil {
+		t.Errorf("valid server rejected: %v", err)
+	}
+
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
+	// dns_resolvers is optional: empty means auto-discovery.
+	if err := validateDNSMux(cli, "client"); err != nil {
+		t.Errorf("client without dns_resolvers rejected: %v", err)
+	}
+	cli.Client.DNSDomain = ""
+	if validateDNSMux(cli, "client") == nil {
+		t.Error("client without dns_domain accepted")
+	}
+
+	other := &config.Config{Server: config.ServerConfig{Transport: config.TCP}}
+	if err := validateDNSMux(other, "server"); err != nil {
+		t.Errorf("non-dnsmux transport affected: %v", err)
+	}
+}
+
+func TestDetectConfigTypeDNSMux(t *testing.T) {
+	srv := &config.Config{Server: config.ServerConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
+	if got := detectConfigType(srv); got != "server" {
+		t.Errorf("dnsmux server detected as %q", got)
+	}
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com"}}
+	if got := detectConfigType(cli); got != "client" {
+		t.Errorf("dnsmux client detected as %q", got)
+	}
+}
+
+func TestValidateDNSMuxRejectsUnknownRecordTypes(t *testing.T) {
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com", DNSRecordTypes: []string{"TXT", "TXTT"}}}
+	if validateDNSMux(cli, "client") == nil {
+		t.Error("a misspelled record type was accepted")
+	}
+	cli.Client.DNSRecordTypes = []string{"txt", "MX"}
+	if err := validateDNSMux(cli, "client"); err != nil {
+		t.Errorf("valid (case-insensitive) record types rejected: %v", err)
+	}
+}

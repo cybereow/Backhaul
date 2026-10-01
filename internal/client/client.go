@@ -98,6 +98,39 @@ func (c *Client) Start() {
 		tcpMuxClient := transport.NewMuxClient(c.ctx, tcpMuxConfig, c.logger)
 		go tcpMuxClient.Start()
 
+	case config.DNSMUX:
+		dnsKey := c.config.DNSKey
+		if dnsKey == "" {
+			dnsKey = c.config.Token
+		}
+		dnsMuxClient := transport.NewDnsMuxClient(c.ctx, &transport.DnsMuxConfig{
+			Domain:           c.config.DNSDomain,
+			Key:              dnsKey,
+			Resolvers:        c.config.DNSResolvers,
+			RecordTypes:      c.config.DNSRecordTypes,
+			ResolverCIDRs:    c.config.DNSResolverCIDRs,
+			ResolverCache:    c.config.DNSResolverCache,
+			Timeout:          time.Duration(c.config.DNSTimeoutMS) * time.Millisecond,
+			Workers:          c.config.DNSWorkers,
+			NoHedge:          c.config.DNSNoHedge,
+			Token:            c.config.Token,
+			RetryInterval:    time.Duration(c.config.RetryInterval) * time.Second,
+			DialTimeOut:      time.Duration(c.config.DialTimeout) * time.Second,
+			KeepAlive:        time.Duration(c.config.Keepalive) * time.Second,
+			ConnPoolSize:     c.config.ConnectionPool,
+			MuxVersion:       c.config.MuxVersion,
+			MaxFrameSize:     c.config.MaxFrameSize,
+			MaxReceiveBuffer: c.config.MaxReceiveBuffer,
+			MaxStreamBuffer:  c.config.MaxStreamBuffer,
+			Sniffer:          c.config.Sniffer,
+			WebPort:          c.config.WebPort,
+			SnifferLog:       c.config.SnifferLog,
+			MSS:              c.config.MSS,
+			SO_RCVBUF:        c.config.SO_RCVBUF,
+			SO_SNDBUF:        c.config.SO_SNDBUF,
+		}, c.logger)
+		go dnsMuxClient.Start()
+
 	case config.WS, config.WSS:
 		WsConfig := &transport.WsConfig{
 			RemoteAddr:     c.config.RemoteAddr,

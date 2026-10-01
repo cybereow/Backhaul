@@ -8,6 +8,7 @@ import (
 	"github.com/musix/backhaul/internal/client"
 
 	"github.com/musix/backhaul/internal/server"
+	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/utils"
 
 	"github.com/BurntSushi/toml"
@@ -26,6 +27,13 @@ func detectConfigType(cfg *config.Config) string {
 	case cfg.Server.BindAddr != "":
 		return "server"
 	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
+		return "client"
+	// dnsmux has no bind_addr/remote_addr: the server is identified by the
+	// domain it is authoritative for, the client by the domain it tunnels through
+	// (dns_resolvers is optional: empty means auto-discover).
+	case cfg.Server.Transport == config.DNSMUX && cfg.Server.DNSDomain != "":
+		return "server"
+	case cfg.Client.Transport == config.DNSMUX && cfg.Client.DNSDomain != "":
 		return "client"
 	default:
 		return ""
@@ -63,6 +71,25 @@ func validateStripeConfig(role string, factor, parity int) error {
 	// before it is checked.
 	if parity > maxStripeTotal-factor {
 		return fmt.Errorf("%s 'mux_stripe' + 'mux_stripe_parity' must be <= %d (they are %d + %d): Reed-Solomon allows 256 total shards, but the stripe header carries the count in a single byte", role, maxStripeTotal, factor, parity)
+	}
+	return nil
+}
+
+// validateDNSMux checks the keys the dnsmux transport cannot run without. It
+// does nothing for any other transport.
+func validateDNSMux(cfg *config.Config, configType string) error {
+	switch {
+	case configType == "server" && cfg.Server.Transport == config.DNSMUX:
+		if cfg.Server.DNSDomain == "" {
+			return fmt.Errorf("server 'dns_domain' is required for the dnsmux transport")
+		}
+	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
+		if cfg.Client.DNSDomain == "" {
+			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")
+		}
+		if err := dnsx.ValidateRecordTypes(cfg.Client.DNSDomain, cfg.Client.DNSRecordTypes); err != nil {
+			return fmt.Errorf("client 'dns_record_types': %w", err)
+		}
 	}
 	return nil
 }
@@ -124,6 +151,9 @@ func Run(configPath string, ctx context.Context) {
 	}
 
 	if err := validateHalfClose(cfg, configType); err != nil {
+		logger.Fatalf("%v", err)
+	}
+	if err := validateDNSMux(cfg, configType); err != nil {
 		logger.Fatalf("%v", err)
 	}
 

@@ -215,5 +215,10 @@ func loadConfig(configPath string) (*config.Config, error) {
 		cfg.Client.MuxWSFraming = true
 	}
 
+	// Token-derived handshake names are on unless turned off, like framing.
+	if !meta.IsDefined("client", "mux_stealth_handshake") {
+		cfg.Client.MuxStealthHandshake = true
+	}
+
 	return &cfg, nil
 }

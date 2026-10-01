@@ -47,12 +47,17 @@ func OffersCapability(h http.Header, token string) bool {
 // plain ws/wss handshake, byte for byte.
 type DialOption func(*dialOptions)
 
-type dialOptions struct{ muxFraming, offerHalfClose bool }
+type dialOptions struct{ muxFraming, offerHalfClose, stealth bool }
 
 // WithMuxFraming offers MuxSubprotocol in the upgrade request and requires the
 // server to echo it; otherwise the dial fails with ErrMuxFramingNotNegotiated.
 // Only the wsmux/wssmux endpoints use it.
 func WithMuxFraming() DialOption { return func(o *dialOptions) { o.muxFraming = true } }
+
+// WithStealthHandshake replaces the project-named handshake strings (the
+// backhaul-mux-v1 subprotocol and the X-Backhaul-Cap header) with values derived
+// from the auth token; see stealth.go. The server accepts both forms.
+func WithStealthHandshake() DialOption { return func(o *dialOptions) { o.stealth = true } }
 
 // WithHalfCloseOffer adds the CapHeader: CapHalfCloseV1 capability offer to the
 // upgrade request. It is independent of WithMuxFraming (the subprotocol): each
@@ -73,7 +78,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 
 	for i := 0; i < retries; i++ {
 		// Attempt to dial the WebSocket
-		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, userAgent, mode, SO_RCVBUF, SO_SNDBUF, mss, tlsVerify, o.muxFraming, o.offerHalfClose)
+		tunnelWSConn, err = attemptDialWebSocket(ctx, addr, edgeIP, path, timeout, keepalive, nodelay, token, userAgent, mode, SO_RCVBUF, SO_SNDBUF, mss, tlsVerify, o.muxFraming, o.offerHalfClose, o.stealth)
 		if err == nil {
 			// If successful, return the connection
 			return tunnelWSConn, nil
@@ -106,7 +111,7 @@ func WebSocketDialer(ctx context.Context, addr string, edgeIP string, path strin
 	return nil, err
 }
 
-func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool, muxFraming bool, offerHalfClose bool) (*WebSocketConn, error) {
+func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path string, timeout time.Duration, keepalive time.Duration, nodelay bool, token string, userAgent string, mode config.TransportType, SO_RCVBUF int, SO_SNDBUF int, mss int, tlsVerify bool, muxFraming bool, offerHalfClose bool, stealth bool) (*WebSocketConn, error) {
 	// Generate a random X-user-id
 	n, err := rand.Int(rand.Reader, big.NewInt(1<<31))
 	if err != nil {
@@ -114,13 +119,27 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 	}
 	randomUserID := int32(n.Int64())
 
-	// Setup headers with authorization and X-user-id
+	// Authorization plus the headers a browser's WebSocket upgrade carries. No
+	// custom X-User-Id: no browser sends one, and the random id already rides in
+	// the tunnel path below.
 	headers := http.Header{}
 	headers.Add("Authorization", fmt.Sprintf("Bearer %v", token))
-	headers.Add("X-User-Id", fmt.Sprintf("%d", randomUserID))
 	headers.Add("User-Agent", userAgent)
+	headers.Add("Origin", originFor(mode, addr))
+	headers.Add("Accept-Language", "en-US,en;q=0.9")
+	headers.Add("Accept-Encoding", "gzip, deflate, br, zstd")
+	headers.Add("Cache-Control", "no-cache")
+	headers.Add("Pragma", "no-cache")
 	if offerHalfClose {
-		headers.Add(CapHeader, CapHalfCloseV1)
+		if stealth {
+			v, err := stealthCapValue(token)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate capability value: %w", err)
+			}
+			headers.Add(stealthCapHeader, v)
+		} else {
+			headers.Add(CapHeader, CapHalfCloseV1)
+		}
 	}
 
 	var wsURL string
@@ -183,8 +202,12 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		}
 	}
 
+	muxProto := MuxSubprotocol
+	if stealth {
+		muxProto = StealthMuxSubprotocol(token)
+	}
 	if muxFraming {
-		dialer.Protocols = []string{MuxSubprotocol}
+		dialer.Protocols = []string{muxProto}
 	}
 
 	// Dial to the WebSocket server
@@ -196,7 +219,7 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		}
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
-	if muxFraming && hs.Protocol != MuxSubprotocol {
+	if muxFraming && hs.Protocol != muxProto {
 		// The upgrade succeeded but the server (an old build, or one running
 		// legacy raw mode) did not echo the token. Its post-upgrade bytes would
 		// be raw smux, so proceeding would corrupt the stream: fail loudly.
@@ -204,4 +227,25 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 		return nil, fmt.Errorf("websocket dial failed: %w", ErrMuxFramingNotNegotiated)
 	}
 	return NewWebSocketConn(conn, ws.StateClientSide, br), nil
+}
+
+// originFor is the Origin a browser page served from addr would send: the page
+// scheme (http for ws, https for wss) and the host, with the port only when it
+// is not the scheme's default.
+func originFor(mode config.TransportType, addr string) string {
+	scheme, defPort := "http", "80"
+	if mode == config.WSS || mode == config.WSSMUX {
+		scheme, defPort = "https", "443"
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return scheme + "://" + addr
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port == defPort {
+		return scheme + "://" + host
+	}
+	return scheme + "://" + host + ":" + port
 }

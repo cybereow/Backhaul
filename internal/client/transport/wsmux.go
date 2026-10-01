@@ -354,6 +354,7 @@ type WsMuxConfig struct {
 	SO_SNDBUF            int
 	MSS                  int
 	TLSVerify            bool // wssmux: verify the server certificate during the TLS handshake
+	StealthHandshake     bool // mux_stealth_handshake: token-derived subprotocol/capability names instead of the project-named ones; the server accepts both
 	WSFraming            bool // mux_ws_framing: standards-framed legs, fail loudly if the server does not confirm backhaul-mux-v1; false = legacy raw
 }
 
@@ -407,6 +408,9 @@ func NewWSMuxClient(parentCtx context.Context, config *WsMuxConfig, logger *logr
 // know it ignores the header, one with mux_half_close=true requires it.
 func (c *WsMuxTransport) dialOptions() []network.DialOption {
 	opts := []network.DialOption{network.WithHalfCloseOffer()}
+	if c.config.StealthHandshake {
+		opts = append(opts, network.WithStealthHandshake())
+	}
 	if c.config.WSFraming {
 		opts = append(opts, network.WithMuxFraming())
 	}

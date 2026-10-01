@@ -95,7 +95,8 @@ type ClientConfig struct {
 	MSS                  int           `toml:"mss"`
 	SO_RCVBUF            int           `toml:"so_rcvbuf"`
 	SO_SNDBUF            int           `toml:"so_sndbuf"`
-	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: see the server option; must match it. Enabled by default; a server that does not confirm backhaul-mux-v1 is a hard error, never a silent fallback to raw. Ignored by other transports.
+	MuxWSFraming         bool          `toml:"mux_ws_framing"`        // wsmux/wssmux: see the server option; must match it. Enabled by default; a server that does not confirm backhaul-mux-v1 is a hard error, never a silent fallback to raw. Ignored by other transports.
+	MuxStealthHandshake  bool          `toml:"mux_stealth_handshake"` // wsmux/wssmux: derive the framing subprotocol and the half-close capability from the auth token instead of the project-named backhaul-mux-v1 / X-Backhaul-Cap, so no handshake string names the project. Enabled by default; servers accept both forms, so upgrade servers before clients, or set false to keep the legacy names. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	DNSDomain            string        `toml:"dns_domain"`
 	DNSKey               string        `toml:"dns_key"`

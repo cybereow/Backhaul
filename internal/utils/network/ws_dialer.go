@@ -176,7 +176,7 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 				if err != nil {
 					return nil, err
 				}
-				return conn, nil
+				return &orderedUpgradeConn{Conn: conn}, nil
 			},
 		}
 	case config.WSS, config.WSSMUX:
@@ -197,7 +197,11 @@ func attemptDialWebSocket(ctx context.Context, addr string, edgeIP string, path 
 				// self-signed certs at the cost of exposing the token to an
 				// on-path MITM. This is standard certificate-chain/hostname
 				// verification, not certificate pinning.
-				return UtlsDialTLS(ctx, edgeIP, sniHost, !tlsVerify, []string{"http/1.1"}, timeout, keepalive, nodelay, SO_RCVBUF, SO_SNDBUF, mss)
+				conn, err := UtlsDialTLS(ctx, edgeIP, sniHost, !tlsVerify, []string{"http/1.1"}, timeout, keepalive, nodelay, SO_RCVBUF, SO_SNDBUF, mss)
+				if err != nil {
+					return nil, err
+				}
+				return &orderedUpgradeConn{Conn: conn}, nil
 			},
 		}
 	}

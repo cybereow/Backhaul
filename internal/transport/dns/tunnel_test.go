@@ -881,3 +881,49 @@ func TestSoakCountsBadPeerAsIntegrityFailure(t *testing.T) {
 		t.Fatalf("IntegrityFails=%d, want 1", r.IntegrityFails)
 	}
 }
+
+func TestDialFailsWhenNoServerAnswers(t *testing.T) {
+	dead, _ := net.ListenPacket("udp", "127.0.0.1:0")
+	addr := dead.LocalAddr().String()
+	dead.Close()
+	start := time.Now()
+	_, err := Dial(context.Background(), DialParams{
+		Domain: "t.example.com", Key: "k", Timeout: 300 * time.Millisecond, NoAutotune: true,
+		Profiles: []sel.Profile{{Resolver: addr, RRType: 16, Transport: "udp", Cap: 700}},
+	})
+	if err == nil {
+		t.Fatal("Dial succeeded although nothing answered")
+	}
+	if el := time.Since(start); el > 15*time.Second {
+		t.Fatalf("Dial took %v to give up", el)
+	}
+}
+
+func TestZeroWindowIsNotAnOutage(t *testing.T) {
+	srv := NewServer("t.example.com", "k", newTestLogger())
+	defer srv.Close()
+	addr, stop, err := newTestResolver(srv.responder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	conn := make(chan net.Conn, 1)
+	go func() { c, _ := srv.Accept(); conn <- c }() // accepted but never read: its receive buffer fills up
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: "t.example.com", Key: "k", Timeout: time.Second, OutageLimit: 2 * time.Second, NoAutotune: true,
+		Profiles: []sel.Profile{{Resolver: addr, RRType: 16, Transport: "udp", Cap: 700}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	go func() { _, _ = cli.Write(payload(3, 300*1024)) }() // far more than the peer will accept
+	time.Sleep(8 * time.Second)                            // 4x the outage limit
+	c := cli.(*clientConn)
+	c.mu.Lock()
+	err = c.err
+	c.mu.Unlock()
+	if err != nil {
+		t.Fatalf("backpressure from a slow reader ended the carrier: %v", err)
+	}
+}

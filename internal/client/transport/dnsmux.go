@@ -324,7 +324,7 @@ func (d *discoveryShare) get(refresh bool, run func(refresh bool) ([]string, err
 	if len(d.result) > 0 && (!d.pending || time.Since(d.at) < refreshMinAge) {
 		return append([]string(nil), d.result...), nil
 	}
-	res, err := run(refresh)
+	res, err := run(d.pending) // the effective request: a stored refresh must bypass the resolver cache too
 	if err != nil {
 		return nil, err
 	}

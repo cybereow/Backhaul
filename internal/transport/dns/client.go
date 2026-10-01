@@ -18,6 +18,7 @@ import (
 
 const (
 	outageLimit  = 90 * time.Second // sustained total failure after which the carrier is torn down
+	dialAttempts = 3                // startup exchanges before Dial gives up
 	closeGrace   = 3 * time.Second  // max wait for the FIN exchange in Close
 	rxWindow     = time.Second      // how long receive activity keeps helper workers polling
 	minClientMSS = 16               // below this the tunnel is not worth running
@@ -120,10 +121,27 @@ func Dial(ctx context.Context, p DialParams) (net.Conn, error) {
 	if !p.NoAutotune {
 		c.autotune(c.ctx, p.Sel, maxQ)
 	}
-	c.exchange()
-	if c.err != nil {
+	// The session must really come up: a few attempts (one lost query is normal),
+	// then give up instead of returning a connection no server ever answered.
+	for try := 0; try < dialAttempts && c.ctx.Err() == nil; try++ {
+		c.exchange()
+		c.mu.Lock()
+		up, err := c.established, c.err
+		c.mu.Unlock()
+		if err != nil {
+			c.cancel()
+			return nil, err
+		}
+		if up {
+			break
+		}
+	}
+	c.mu.Lock()
+	up := c.established
+	c.mu.Unlock()
+	if !up {
 		c.cancel()
-		return nil, c.err
+		return nil, errors.New("dnsx: no server answered through any resolver")
 	}
 
 	n := p.Workers
@@ -481,6 +499,9 @@ func (c *clientConn) exchange() {
 	// never gets through. So the stream must also make progress while data waits.
 	if c.established && c.err == nil {
 		dead := stage != StageOK && now.Sub(c.lastOK) > c.outage
+		if c.ep.PeerWnd() == 0 {
+			c.progressAt = now // the peer is applying backpressure: waiting is legitimate, not a stall
+		}
 		stuck := c.ep.Pending() > 0 && now.Sub(c.progressAt) > c.outage
 		if dead || stuck {
 			why := "no resolver answered"

@@ -544,7 +544,7 @@ func (c *WsMuxTransport) channelDialer() {
 			ep := c.nextEndpoint()
 			tunnelWSConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 3, 0, 0, 0, c.config.TLSVerify, c.dialOptions()...)
 			if err != nil {
-				c.logger.Errorf("control channel dialer: %v", err)
+				c.logger.Errorf("control channel dialer: %v (endpoint %s)", err, ep.addr)
 				select {
 				case <-ctx.Done():
 					return
@@ -889,7 +889,7 @@ func (c *WsMuxTransport) reconnectControl(old *network.WebSocketConn, oldDone <-
 			return
 		}
 
-		c.logger.Errorf("control channel re-dial: %v", err)
+		c.logger.Errorf("control channel re-dial: %v (endpoint %s)", err, ep.addr)
 
 		if time.Now().After(deadline) {
 			c.logger.Warn("control channel could not be re-established within the grace window, falling back to a full restart")
@@ -922,7 +922,7 @@ func (c *WsMuxTransport) tunnelDialer() {
 	tunnelWSConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify, c.dialOptions()...)
 	if err != nil {
 		atomic.AddInt32(&c.pendingDials, -1)
-		c.logger.Errorf("tunnel server dialer: %v", err)
+		c.logger.Errorf("tunnel server dialer: %v (endpoint %s)", err, ep.addr)
 
 		return
 	}

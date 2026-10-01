@@ -159,8 +159,22 @@ func (s *WsMuxTransport) requestReplacement() {
 // retiring connection takes no new streams and stays up until its last one
 // ends. That buys such a flow the whole window up to the CDN's hard limit; the
 // limit itself is not something client-side code can extend.
+//
+// max_drain bounds that wait: once it elapses the session is given up on and the
+// caller closes it, cutting whatever streams are still on it. It only ever runs
+// after the replacement has joined the pool, so it never shrinks the pool - a
+// failed replacement dial keeps the aging session in service (awaitReplacement)
+// and never reaches here.
 func (s *WsMuxTransport) retireSession(session *smux.Session) {
 	s.logger.Debugf("retiring pool session at max_conn_age, %d live stream(s) to drain", session.NumStreams())
+
+	// A nil channel (max_drain = 0) blocks forever in the select: drain unbounded.
+	var deadline <-chan time.Time
+	if s.config.MaxDrain > 0 {
+		t := time.NewTimer(s.config.MaxDrain)
+		defer t.Stop()
+		deadline = t.C
+	}
 
 	// ponytail: poll for drain rather than wiring per-stream completion
 	// signalling; a 1s tick is plenty for a connection on its way out.
@@ -177,6 +191,9 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 		}
 		select {
 		case <-s.ctx.Done():
+			return
+		case <-deadline:
+			s.logger.Debugf("retired pool session still has %d stream(s) after max_drain (%s), closing", session.NumStreams(), s.config.MaxDrain)
 			return
 		case <-ticker.C:
 		}

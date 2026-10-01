@@ -278,6 +278,9 @@ func (s *DnsMuxTransport) acceptLocal(l net.Listener, remote string) {
 		if conn == nil {
 			return
 		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(s.config.Nodelay) // honour the configured Nagle behaviour like the other transports
+		}
 		go s.forward(conn, remote)
 	}
 }

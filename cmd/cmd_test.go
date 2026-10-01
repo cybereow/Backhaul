@@ -206,3 +206,14 @@ func TestDetectConfigTypeDNSMux(t *testing.T) {
 		t.Errorf("dnsmux client detected as %q", got)
 	}
 }
+
+func TestValidateDNSMuxRejectsUnknownRecordTypes(t *testing.T) {
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNSMUX, DNSDomain: "t.example.com", DNSRecordTypes: []string{"TXT", "TXTT"}}}
+	if validateDNSMux(cli, "client") == nil {
+		t.Error("a misspelled record type was accepted")
+	}
+	cli.Client.DNSRecordTypes = []string{"txt", "MX"}
+	if err := validateDNSMux(cli, "client"); err != nil {
+		t.Errorf("valid (case-insensitive) record types rejected: %v", err)
+	}
+}

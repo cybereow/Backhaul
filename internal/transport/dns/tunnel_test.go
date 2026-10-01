@@ -927,3 +927,47 @@ func TestZeroWindowIsNotAnOutage(t *testing.T) {
 		t.Fatalf("backpressure from a slow reader ended the carrier: %v", err)
 	}
 }
+
+// A path that answers small empty replies but drops the larger data replies must
+// not keep a download-only stream attached: the server's empty packets show it
+// has bytes outstanding that never arrive.
+func TestDownstreamBlackholeEndsTheCarrier(t *testing.T) {
+	const domain, key = "t.example.com", "k"
+	srv := NewServer(domain, key, newTestLogger())
+	defer srv.Close()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// replies bigger than 200 bytes vanish; empty ones pass
+	ds := &dns.Server{PacketConn: &sizeLimitConn{PacketConn: pc, maxReply: 200}, Handler: dns.HandlerFunc(srv.responder.handle)}
+	go func() { _ = ds.ActivateAndServe() }()
+	defer ds.Shutdown()
+
+	go func() { // server side: pushes data down, reads nothing
+		c, err := srv.Accept()
+		if err != nil {
+			return
+		}
+		_, _ = c.Write(payload(9, 8192))
+	}()
+	cli, err := Dial(context.Background(), DialParams{
+		Domain: domain, Key: key, Timeout: 400 * time.Millisecond, OutageLimit: 3 * time.Second, NoAutotune: true,
+		Profiles: []sel.Profile{{Resolver: pc.LocalAddr().String(), RRType: 16, Transport: "udp", Cap: 700}},
+		Rel:      rel.Config{MinRTO: 200 * time.Millisecond, MaxRTO: time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	done := make(chan error, 1)
+	go func() { _, err := io.ReadFull(cli, make([]byte, 8192)); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("the full download arrived through a path that drops its data replies")
+		}
+	case <-time.After(25 * time.Second):
+		t.Fatal("download-only stream stayed attached to a carrier whose data replies are dropped")
+	}
+}

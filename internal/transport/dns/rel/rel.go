@@ -181,6 +181,12 @@ func (e *Endpoint) Pending() int {
 	return len(e.sndBuf) + e.inflightBytes()
 }
 
+// RcvNxt is the next stream byte this side expects from the peer.
+func (e *Endpoint) RcvNxt() uint32 { return e.rcvNxt }
+
+// SeqAfter reports whether a is after b in modular sequence space.
+func SeqAfter(a, b uint32) bool { return after(a, b) }
+
 // PeerWnd returns the peer's last advertised receive window.
 func (e *Endpoint) PeerWnd() int {
 	return e.peerWnd

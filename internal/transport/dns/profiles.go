@@ -1,6 +1,7 @@
 package dnsx
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/musix/backhaul/internal/transport/dns/sel"
@@ -40,6 +41,18 @@ func DefaultProfiles(domain string, resolvers, recordTypes []string) []sel.Profi
 		}
 	}
 	return out
+}
+
+// ValidateRecordTypes rejects names that are not a built-in record type, so a typo
+// fails at startup instead of silently shrinking the profile set (or, if every
+// name is wrong, leaving the client with nothing to try).
+func ValidateRecordTypes(domain string, names []string) error {
+	for _, n := range names {
+		if codecByName(domain, strings.TrimSpace(n)) == nil {
+			return fmt.Errorf("unknown dns record type %q (valid: TXT NULL A AAAA CNAME MX SRV PTR)", n)
+		}
+	}
+	return nil
 }
 
 // RecordTypeCodes maps record type names (empty: every built-in codec, the same

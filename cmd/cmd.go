@@ -8,6 +8,7 @@ import (
 	"github.com/musix/backhaul/internal/client"
 
 	"github.com/musix/backhaul/internal/server"
+	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/utils"
 
 	"github.com/BurntSushi/toml"
@@ -85,6 +86,9 @@ func validateDNSMux(cfg *config.Config, configType string) error {
 	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
 		if cfg.Client.DNSDomain == "" {
 			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")
+		}
+		if err := dnsx.ValidateRecordTypes(cfg.Client.DNSDomain, cfg.Client.DNSRecordTypes); err != nil {
+			return fmt.Errorf("client 'dns_record_types': %w", err)
 		}
 	}
 	return nil

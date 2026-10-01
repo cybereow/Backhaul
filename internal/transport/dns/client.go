@@ -292,6 +292,8 @@ type clientConn struct {
 
 	lastRX      time.Time // when data (or an advancing ACK) last arrived
 	progressAt  time.Time // last time the stream moved (or had nothing to move): outage detection
+	rxProgress  time.Time // last time downstream bytes arrived or the server had none outstanding
+	rxBehind    bool      // the server's last packet pointed past what we have received
 	logf        func(string, ...any)
 	stats       map[sel.Profile]*profStat
 	pool        *connPool
@@ -438,6 +440,7 @@ func (c *clientConn) exchange() {
 		c.mgr.Observe(now, prof, true, time.Duration(rttMs)*time.Millisecond)
 		if !c.established {
 			c.progressAt = now
+			c.rxProgress = now
 		}
 		c.established = true
 		c.lastOK = now
@@ -469,7 +472,17 @@ func (c *clientConn) exchange() {
 				p, err := rel.Unmarshal(respData[1:])
 				if err == nil {
 					pendingBefore := c.ep.Pending()
+					rn0 := c.ep.RcvNxt()
 					c.ep.Recv(now, p)
+					// An empty packet carries the server's send position: when it is
+					// beyond what we received, bytes are outstanding downstream. They
+					// must arrive within the outage limit, or the path drops data
+					// replies while still answering empty polls.
+					rn1 := c.ep.RcvNxt()
+					c.rxBehind = rel.SeqAfter(p.Seq, rn1)
+					if rn1 != rn0 || !c.rxBehind {
+						c.rxProgress = now
+					}
 					// Only new data or an ACK that actually advanced counts as
 					// activity; the cumulative ACK alone is nonzero forever.
 					if len(p.Data) > 0 || c.ep.Pending() < pendingBefore {
@@ -503,7 +516,8 @@ func (c *clientConn) exchange() {
 			c.progressAt = now // the peer is applying backpressure: waiting is legitimate, not a stall
 		}
 		stuck := c.ep.Pending() > 0 && now.Sub(c.progressAt) > c.outage
-		if dead || stuck {
+		downStuck := c.rxBehind && now.Sub(c.rxProgress) > c.outage
+		if dead || stuck || downStuck {
 			why := "no resolver answered"
 			if !dead {
 				why = "no data got through"

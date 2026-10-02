@@ -620,3 +620,25 @@ func TestRotateDrainDoesNotHoldGate(t *testing.T) {
 		t.Fatal("second rotation did not complete")
 	}
 }
+
+// The plan must leave room to dial the replacement even at the worst jitter, and
+// disable rotation for a zero age.
+func TestRotationPlan(t *testing.T) {
+	if a, d := RotationPlan(0); a != 0 || d != 0 {
+		t.Fatalf("zero cdn age planned rotation: %v %v", a, d)
+	}
+	cdn := 300 * time.Second
+	age, drain := RotationPlan(cdn)
+	if age != 210*time.Second || drain != 90*time.Second {
+		t.Fatalf("plan for 300s = %v / %v, want 210s / 90s", age, drain)
+	}
+	worst := time.Duration(float64(age) * (1 + rotateJitter))
+	if cdn-worst < cdn/10 {
+		t.Fatalf("worst-case rotation at %v leaves only %v before the CDN cut", worst, cdn-worst)
+	}
+	for i := 0; i < 1000; i++ {
+		if got := rotateAge(age); got > worst || got < time.Duration(float64(age)*(1-rotateJitter)) {
+			t.Fatalf("rotateAge %v outside +/-%.0f%% of %v", got, rotateJitter*100, age)
+		}
+	}
+}

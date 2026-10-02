@@ -34,6 +34,9 @@ const ( // Default values
 	defaultUDPBuffer   = 2048 // datagrams queued per UDP flow before dropping (wsmux/wssmux)
 )
 
+// minCDNMaxAge is the smallest cdn_max_age honoured, in seconds.
+const minCDNMaxAge = 30
+
 func applyDefaults(cfg *config.Config) {
 	// Token is intentionally not defaulted - see cmd.Run, which requires the
 	// active side to configure one explicitly.
@@ -145,16 +148,15 @@ func applyDefaults(cfg *config.Config) {
 		cfg.Server.UDPBuffer = defaultUDPBuffer
 	}
 
-	// Connection rotation age stays off unless set: it has to sit below the
-	// max age of whatever CDN/LB fronts the server, and a guessed value just
-	// churns connections for nothing.
-	if cfg.Server.MaxConnAge < 0 {
-		cfg.Server.MaxConnAge = 0
+	// Connection rotation stays off unless cdn_max_age is set: it has to match
+	// the CDN/LB in front of the server, and a guessed value just churns
+	// connections for nothing. A value too small to rotate sensibly is raised to
+	// the floor rather than silently rotating in a tight loop.
+	if cfg.Server.CDNMaxAge < 0 {
+		cfg.Server.CDNMaxAge = 0
 	}
-	// Drain cap likewise stays unbounded unless set: closing a retired
-	// connection cuts the long-lived flows still on it.
-	if cfg.Server.MaxDrain < 0 {
-		cfg.Server.MaxDrain = 0
+	if cfg.Server.CDNMaxAge > 0 && cfg.Server.CDNMaxAge < minCDNMaxAge {
+		cfg.Server.CDNMaxAge = minCDNMaxAge
 	}
 
 	// Stripe factor - how many pooled connections a single flow is split

@@ -200,6 +200,14 @@ func loadConfig(configPath string) (*config.Config, error) {
 		return &cfg, err
 	}
 
+	// max_conn_age/max_drain were replaced by cdn_max_age. Ignoring them would
+	// silently turn rotation off for whoever set them, so refuse to start.
+	for _, key := range []string{"max_conn_age", "max_drain"} {
+		if meta.IsDefined("server", key) {
+			return &cfg, fmt.Errorf("server.%s was removed; set server.cdn_max_age (seconds, the shortest max connection age of your CDNs) instead", key)
+		}
+	}
+
 	// SEC: Secure by default. If the user omitted tls_verify from the
 	// configuration, default it to true to prevent unintentional MITM.
 	if !meta.IsDefined("client", "tls_verify") {

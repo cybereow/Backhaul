@@ -8,6 +8,37 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// Rotation is derived from one number, the max connection age of the CDN/LB in
+// front of the server (cdn_max_age), so nobody has to work jitter and dial slack
+// out by hand.
+//
+//   - A pool connection is retired at rotateFraction of that age, +/- rotateJitter.
+//     The worst case, rotateFraction*(1+rotateJitter) of the age, still leaves
+//     the replacement ~20% of the age to be dialled before the CDN would cut it.
+//   - A retired connection is drained for the rest of the age, measured from its
+//     retirement: past that the CDN closes it anyway, so waiting longer buys
+//     nothing and only keeps surplus connections open.
+const (
+	rotateFraction = 0.7
+	rotateJitter   = 0.1
+)
+
+// RotationPlan turns the CDN's max connection age into the age a pool connection
+// is retired at and the longest it is then drained for. Zero disables rotation.
+func RotationPlan(cdnMaxAge time.Duration) (maxConnAge, maxDrain time.Duration) {
+	if cdnMaxAge <= 0 {
+		return 0, 0
+	}
+	maxConnAge = time.Duration(float64(cdnMaxAge) * rotateFraction)
+	return maxConnAge, cdnMaxAge - maxConnAge
+}
+
+// rotateAge is one connection's jittered retirement age; the connections of the
+// initial pool are dialled together, so a fixed age would rotate them in lockstep.
+func rotateAge(base time.Duration) time.Duration {
+	return utils.JitterFraction(base, rotateJitter)
+}
+
 // rotateRetryInterval is how long rotation waits before re-checking for the
 // replacement connection it asked for. Deliberately unhurried: the connection
 // is only aging, and the client may be unable to dial at all for minutes.
@@ -40,15 +71,15 @@ func (s *WsMuxTransport) requestReplacement() {
 // ends. That buys such a flow the whole window up to the CDN's hard limit; the
 // limit itself is not something client-side code can extend.
 //
-// max_drain bounds that wait: once it elapses the session is given up on and the
+// The drain cap bounds that wait: once it elapses the session is given up on and the
 // caller closes it, cutting whatever streams are still on it. It only ever runs
 // after the replacement has joined the pool, so it never shrinks the pool - a
 // failed replacement dial keeps the aging session in service (awaitReplacement)
 // and never reaches here.
 func (s *WsMuxTransport) retireSession(session *smux.Session) {
-	s.logger.Debugf("retiring pool session at max_conn_age, %d live stream(s) to drain", session.NumStreams())
+	s.logger.Debugf("retiring pool session at its rotation age, %d live stream(s) to drain", session.NumStreams())
 
-	// A nil channel (max_drain = 0) blocks forever in the select: drain unbounded.
+	// A nil channel (no drain cap) blocks forever in the select: drain unbounded.
 	var deadline <-chan time.Time
 	if s.config.MaxDrain > 0 {
 		t := time.NewTimer(s.config.MaxDrain)
@@ -83,7 +114,7 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 		case <-s.ctx.Done():
 			return
 		case <-deadline:
-			s.logger.Debugf("retired pool session still has %d stream(s) after max_drain (%s), closing", session.NumStreams(), s.config.MaxDrain)
+			s.logger.Debugf("retired pool session still has %d stream(s) after the drain cap (%s), closing", session.NumStreams(), s.config.MaxDrain)
 			return
 		case <-ticker.C:
 		}
@@ -91,7 +122,7 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 }
 
 // rotateStripedSession is the striped path's equivalent of the rotation branch
-// in handleSession: at max_conn_age the session is pulled out of the leg pool
+// in handleSession: at its rotation age the session is pulled out of the leg pool
 // so no new stripe legs land on it, then drained and closed. The sessionCounter
 // decrement is left to the CloseChan watcher registered in handleLoop.
 //
@@ -99,7 +130,7 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 // unregistering it only stops new legs landing on it, so a restart during the
 // drain still closes it.
 func (s *WsMuxTransport) rotateStripedSession(g *wsGeneration, session *smux.Session) {
-	rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
+	rotateTimer := time.NewTimer(rotateAge(s.config.MaxConnAge))
 	defer rotateTimer.Stop()
 
 	select {
@@ -164,7 +195,7 @@ func (s *WsMuxTransport) awaitReplacement(g *wsGeneration, session *smux.Session
 
 	// ponytail: poll the registry instead of signalling admissions to whoever is
 	// waiting. Rotation is not latency-sensitive - a second either way is noise
-	// against a max_conn_age measured in minutes.
+	// against a rotation age measured in minutes.
 	pollEvery := s.rotatePoll
 	if pollEvery <= 0 {
 		pollEvery = rotatePollEvery

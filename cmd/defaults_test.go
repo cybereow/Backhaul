@@ -330,3 +330,26 @@ func TestLoadConfigMuxStealthHandshake(t *testing.T) {
 		})
 	}
 }
+
+func TestApplyDefaultsResumeWindow(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		cdn, window         int
+		clientWindow        int
+		wantSrv, wantClient int
+	}{
+		{"no cdn_max_age: nothing to resume", 0, 0, 0, 0, defaultResumeWindow},
+		{"cdn_max_age alone turns resume on", 300, 0, 0, defaultResumeWindow, defaultResumeWindow},
+		{"explicit window", 300, 90, 45, 90, 45},
+		{"-1 turns it off", 300, -1, 0, 0, defaultResumeWindow},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var cfg config.Config
+			cfg.Server.CDNMaxAge, cfg.Server.ResumeWindow, cfg.Client.ResumeWindow = tc.cdn, tc.window, tc.clientWindow
+			applyDefaults(&cfg)
+			if cfg.Server.ResumeWindow != tc.wantSrv || cfg.Client.ResumeWindow != tc.wantClient {
+				t.Fatalf("server %d client %d, want %d / %d", cfg.Server.ResumeWindow, cfg.Client.ResumeWindow, tc.wantSrv, tc.wantClient)
+			}
+		})
+	}
+}

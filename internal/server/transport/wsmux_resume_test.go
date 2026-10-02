@@ -66,10 +66,18 @@ func (h *lcHarness) retire(sess *smux.Session) {
 // retired, and finishes with every byte intact in both directions even though
 // the sessions it started on were closed.
 func TestWSMuxResumableFlowMoves(t *testing.T) {
+	t.Run("planned-only", func(t *testing.T) { testResumableFlowMoves(t, 0) })
+	// The same, with resume support on: the swaps run over tunnels that carry ACKs
+	// and keep replay rings.
+	t.Run("with-replay", func(t *testing.T) { testResumableFlowMoves(t, 20*time.Second) })
+}
+
+func testResumableFlowMoves(t *testing.T, resumeWindow time.Duration) {
 	tg := echoTarget(t)
 	h := newLCHarness(t, toTarget(tg.Addr().String()), func(c *WsMuxConfig) {
 		c.MaxConnAge = time.Hour // resumable flows on; natural rotation never fires here
 		c.MaxDrain = time.Minute
+		c.ResumeWindow = resumeWindow
 	})
 	startResumeClient(t, h, 3)
 

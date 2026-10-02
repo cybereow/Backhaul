@@ -69,15 +69,8 @@ func TestWSMuxStripedTransferE2E(t *testing.T) {
 		serverReceived = recv
 	}()
 
-	serverTunnelListener, err := net.Listen("tcp", "127.0.0.1:0")
-	assert.NoError(t, err)
-	serverTunnelPort := serverTunnelListener.Addr().(*net.TCPAddr).Port
-	serverTunnelListener.Close() // find open port for tunnel
-
-	serverListener, err := net.Listen("tcp", "127.0.0.1:0")
-	assert.NoError(t, err)
-	serverPort := serverListener.Addr().(*net.TCPAddr).Port
-	serverListener.Close() // find open port for public
+	serverTunnelPort := testPort(t, "tcp") // tunnel
+	serverPort := testPort(t, "tcp")       // public
 
 	// 2. Setup server WsMux
 	serverConfig := &WsMuxConfig{

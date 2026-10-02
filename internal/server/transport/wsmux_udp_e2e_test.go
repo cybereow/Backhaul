@@ -47,16 +47,11 @@ func TestWSMuxUDPForwardingE2E(t *testing.T) {
 		}
 	}()
 
-	// Pick free ports for the tunnel and the public UDP port.
-	tunnelLn, err := net.Listen("tcp", "127.0.0.1:0")
-	assert.NoError(t, err)
-	tunnelPort := tunnelLn.Addr().(*net.TCPAddr).Port
-	tunnelLn.Close()
-
-	pubConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
-	assert.NoError(t, err)
-	pubPort := pubConn.LocalAddr().(*net.UDPAddr).Port
-	pubConn.Close() // free it for the server to bind
+	// Pick free ports for the tunnel and the public UDP port (below the ephemeral
+	// range, see testports_test.go: an OS-assigned port can be taken by another
+	// test's outgoing connection before the server binds it).
+	tunnelPort := testPort(t, "tcp")
+	pubPort := testPort(t, "udp")
 
 	// 2. Server with accept_udp on.
 	serverConfig := &WsMuxConfig{

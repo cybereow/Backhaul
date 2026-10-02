@@ -145,13 +145,18 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow) erro
 	}
 	_ = stream.SetDeadline(time.Time{})
 
+	// Record the new session before the swap, so a retirement of it that lands
+	// during the swap already sees this flow. A swap refused before it froze
+	// leaves the flow where it was.
+	prev := f.session()
+	f.setSession(ps.session)
 	err = f.sw.Promote(ctx, []net.Conn{stream}, func() (net.Conn, error) {
 		return handlers.NewHalfCloseConn(stream), nil
 	})
 	if err != nil {
+		f.setSession(prev)
 		return err
 	}
-	f.setSession(ps.session)
 	return nil
 }
 

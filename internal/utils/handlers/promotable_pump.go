@@ -369,14 +369,23 @@ func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 // A failure before the freeze ack closes the legs and leaves the flow plain; a
 // later failure closes the legs and aborts the flow.
 func (p *PumpSwapper) Promote(ctx context.Context, legs []net.Conn, build func() (net.Conn, error)) error {
-	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
-	defer cancel()
-
-	own, err := p.FreezeUp(ctx)
+	fctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	own, err := p.FreezeUp(fctx)
+	cancel()
 	if err != nil {
 		closeAll(legs)
 		return err
 	}
+	return p.PromoteFrozen(ctx, own, legs, build)
+}
+
+// PromoteFrozen finishes a swap whose upload FreezeUp already stopped (own is its
+// result). A side that must decide whether to accept a swap uses this to reserve
+// the flow first: once FreezeUp succeeded the flow cannot be refused any more, so
+// a failure from here on aborts it.
+func (p *PumpSwapper) PromoteFrozen(ctx context.Context, own uint64, legs []net.Conn, build func() (net.Conn, error)) error {
+	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	defer cancel()
 
 	peer, err := exchangeCounts(ctx, legs[0], own)
 	if err == nil {

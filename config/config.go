@@ -60,7 +60,7 @@ type ServerConfig struct {
 	DNSDomain            string        `toml:"dns_domain"`    // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
 	DNSKey               string        `toml:"dns_key"`       // dnsmux: shared secret for the per-query MAC; falls back to token
 	DNSListen            string        `toml:"dns_listen"`    // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
-	ResumeWindow         int           `toml:"resume_window"` // seconds. wsmux/wssmux with cdn_max_age: how long a flow whose pool connection was cut WITHOUT warning waits to be resumed on another connection before it is dropped. Flows keep up to 4 MiB of unacknowledged data for this (bounded process-wide). 0 (default) = 30 s; -1 = off (flows only survive the planned moves of cdn_max_age). Needs mux_version >= 2.
+	ResumeWindow         int           `toml:"resume_window"` // seconds. wsmux/wssmux with cdn_max_age: how long a flow whose pool connection was cut WITHOUT warning waits to be resumed on another connection before it is dropped. Flows keep their unacknowledged data for this: a ring growing from 256 KiB to 16 MiB for flows that need it, within a 256 MiB process-wide budget. 0 (default) = 30 s; -1 = off (flows only survive the planned moves of cdn_max_age). Needs mux_version >= 2.
 	CDNMaxAge            int           `toml:"cdn_max_age"`   // seconds. The shortest max connection age among the CDNs/LBs in front of the server (e.g. 300). Pool connections are rotated make-before-break ahead of it, and retired ones drained, both derived from this one number (see transport.RotationPlan). 0 (default) disables rotation. Replaces max_conn_age/max_drain.
 }
 

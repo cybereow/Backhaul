@@ -103,16 +103,17 @@ func (s *WsMuxTransport) flowsOn(sess *smux.Session) []*resumableFlow {
 // registered before its pumps start, so a move can never find a half-built flow.
 // With replayLimit > 0 the flow also keeps what it sent until acknowledged and is
 // resumed on another session if its own is cut without warning.
-func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, replayLimit int, release func()) {
-	defer release()
+func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, grant *handlers.ReplayGrant) {
+	defer grant.Release()
 	sw := handlers.NewPromotablePump(g.ctx, s.config.ProxyProtocol, appConn, handlers.NewHalfCloseConn(stream), s.logger, s.usageMonitor, appConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 	if sw == nil {
 		return // failed proxy protocol
 	}
-	if replayLimit > 0 {
+	if grant != nil {
 		// The client was told (by the flow's kind byte) that this flow keeps replay
 		// state, so a flow that cannot is not an option: end it.
-		if err := sw.EnableReplay(replayLimit); err != nil {
+		sw.SetReplayGrower(grant.Grow)
+		if err := sw.EnableReplay(grant.Limit()); err != nil {
 			s.logger.Errorf("resumable flow %d: %v", flowID, err)
 			sw.Abort()
 			return
@@ -123,7 +124,7 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 	s.registerFlow(f)
 	defer s.unregisterFlow(flowID)
 	sw.Start()
-	if replayLimit > 0 {
+	if grant != nil {
 		go s.driveResume(g.ctx, f)
 	}
 	<-sw.DoneWait()

@@ -1452,9 +1452,10 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 		// The server decided this flow keeps replay state; this end follows (and
 		// takes at least the smallest ring whatever the budget says, since the
 		// two ends must agree).
-		limit, release := handlers.DefaultReplayBudget.Force()
-		defer release()
-		if err := swapper.EnableReplay(limit); err != nil {
+		grant := handlers.DefaultReplayBudget.Open(true)
+		defer grant.Release()
+		swapper.SetReplayGrower(grant.Grow)
+		if err := swapper.EnableReplay(grant.Limit()); err != nil {
 			c.logger.Errorf("resumable flow %d: %v", flowID, err)
 			swapper.Abort()
 			return

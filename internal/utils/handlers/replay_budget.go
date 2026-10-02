@@ -3,18 +3,22 @@ package handlers
 import "sync"
 
 const (
-	// ReplayFlowLimit is the replay ring a flow asks for: how many sent bytes may be
-	// unacknowledged, which bounds the flow's rate to about this much per
-	// acknowledgement round trip. Memory is only held while bytes are in flight.
-	ReplayFlowLimit = 4 << 20
-	// ReplayBudgetTotal caps what all flows of a process may reserve.
+	// ReplayFlowStart is the replay ring a flow starts with (the smallest useful
+	// one). Memory is only held while bytes are in flight.
+	ReplayFlowStart = minReplayLimit
+	// ReplayFlowMax is the most a flow's ring can grow to. The ring bounds the
+	// flow's rate to about its size per acknowledgement round trip, so this is what
+	// lets one flow fill a long fat path: 16 MiB at 80 ms RTT is about 200 MB/s.
+	ReplayFlowMax = 16 << 20
+	// ReplayBudgetTotal caps what all flows of a process may hold.
 	ReplayBudgetTotal = 256 << 20
 )
 
-// ReplayBudget bounds the replay memory of a process. Each flow reserves its ring
-// limit up front (a reservation, not an allocation: rings grow with use), so the
-// worst case is known and a flow that does not fit simply runs without replay and
-// keeps the planned-move behaviour.
+// ReplayBudget bounds the replay memory of a process. A flow starts with the
+// smallest ring and only grows it (doubling, up to ReplayFlowMax) when it finds it
+// full, so idle flows (SSH) cost almost nothing and a bulk flow gets what it needs
+// while the budget lasts. The counted size is the ring's limit, i.e. the worst
+// case, not what is allocated at the moment.
 type ReplayBudget struct {
 	mu    sync.Mutex
 	total int
@@ -24,47 +28,63 @@ type ReplayBudget struct {
 // NewReplayBudget returns a budget of total bytes.
 func NewReplayBudget(total int) *ReplayBudget { return &ReplayBudget{total: total} }
 
-// Reserve grants a ring limit: the full ReplayFlowLimit if it fits, else the
-// smallest useful one, else 0 (no replay for this flow). release returns the
-// reservation; it is safe to call more than once.
-func (b *ReplayBudget) Reserve() (limit int, release func()) {
-	b.mu.Lock()
-	switch {
-	case b.total-b.used >= ReplayFlowLimit:
-		limit = ReplayFlowLimit
-	case b.total-b.used >= minReplayLimit:
-		limit = minReplayLimit
-	}
-	b.used += limit
-	b.mu.Unlock()
-	var once sync.Once
-	return limit, func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.used -= limit
-			b.mu.Unlock()
-		})
-	}
-}
-
-// Force grants the smallest ring regardless of the budget, for a flow whose peer
-// already decided it uses replay (the two ends must agree), and counts it.
-func (b *ReplayBudget) Force() (limit int, release func()) {
-	if limit, release = b.Reserve(); limit > 0 {
-		return limit, release
-	}
-	b.mu.Lock()
-	b.used += minReplayLimit
-	b.mu.Unlock()
-	var once sync.Once
-	return minReplayLimit, func() {
-		once.Do(func() {
-			b.mu.Lock()
-			b.used -= minReplayLimit
-			b.mu.Unlock()
-		})
-	}
-}
-
 // DefaultReplayBudget is the process-wide budget.
 var DefaultReplayBudget = NewReplayBudget(ReplayBudgetTotal)
+
+// ReplayGrant is one flow's share of a budget.
+type ReplayGrant struct {
+	b    *ReplayBudget
+	mu   sync.Mutex
+	held int
+}
+
+// Open gives a flow its starting ring, or nil when the budget cannot even cover
+// that (the flow then runs without replay). With force it always succeeds: a flow
+// whose peer already decided it uses replay must too, the two ends have to agree.
+func (b *ReplayBudget) Open(force bool) *ReplayGrant {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !force && b.total-b.used < ReplayFlowStart {
+		return nil
+	}
+	b.used += ReplayFlowStart
+	return &ReplayGrant{b: b, held: ReplayFlowStart}
+}
+
+// Limit is the ring limit the flow starts with.
+func (g *ReplayGrant) Limit() int { return ReplayFlowStart }
+
+// Grow returns the next ring limit for a flow whose ring (cur) is full: double,
+// up to ReplayFlowMax, if the budget allows; cur otherwise.
+func (g *ReplayGrant) Grow(cur int) int {
+	next := min(cur*2, ReplayFlowMax)
+	if next <= cur {
+		return cur
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if need := next - g.held; need > 0 {
+		g.b.mu.Lock()
+		defer g.b.mu.Unlock()
+		if g.b.total-g.b.used < need {
+			return cur
+		}
+		g.b.used += need
+		g.held = next
+	}
+	return next
+}
+
+// Release gives everything back; safe to call more than once and on nil.
+func (g *ReplayGrant) Release() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	held := g.held
+	g.held = 0
+	g.mu.Unlock()
+	g.b.mu.Lock()
+	g.b.used -= held
+	g.b.mu.Unlock()
+}

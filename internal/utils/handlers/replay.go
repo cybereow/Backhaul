@@ -35,6 +35,23 @@ var (
 	errReplayWake     = errors.New("replay: wait interrupted")
 )
 
+// getLimit and setLimit: the limit can grow while the flow runs (see ReplayGrant).
+func (r *replayRing) getLimit() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.limit
+}
+
+func (r *replayRing) setLimit(n int) {
+	r.mu.Lock()
+	r.limit = n
+	r.mu.Unlock()
+	select { // a sender waiting for room may fit now
+	case r.space <- struct{}{}:
+	default:
+	}
+}
+
 func newReplayRing(limit int) *replayRing {
 	return &replayRing{limit: limit, space: make(chan struct{}, 1)}
 }
@@ -71,7 +88,7 @@ func (r *replayRing) free() int {
 // has something more urgent than room (a swap that needs the sender to reach its
 // next boundary) and decides whether to carry on.
 func (r *replayRing) waitFree(ctx context.Context, abort <-chan struct{}, wake <-chan struct{}, n int) error {
-	if n > r.limit {
+	if n > r.getLimit() {
 		return errReplayTooLarge
 	}
 	for {

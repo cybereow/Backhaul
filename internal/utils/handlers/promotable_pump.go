@@ -70,9 +70,10 @@ type PumpSwapper struct {
 
 	// Replay (level B): nil unless EnableReplay was called before Start.
 	replay      *replayState
-	freezeWake  chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
-	upDst       net.Conn      // the tunnel the upload pump writes to (guarded by mu); acks go there too
-	proxyHeader []byte        // the PROXY protocol header written before Start: payload that replay must retain
+	replayGrow  func(cur int) int // nil: the ring keeps its size
+	freezeWake  chan struct{}     // FreezeUp nudges an upload pump parked on a full replay ring
+	upDst       net.Conn          // the tunnel the upload pump writes to (guarded by mu); acks go there too
+	proxyHeader []byte            // the PROXY protocol header written before Start: payload that replay must retain
 
 	// What Start needs.
 	ctx        context.Context
@@ -862,6 +863,32 @@ const ackDelay = 200 * time.Millisecond
 // ring drain completely before every read.
 const minReplayLimit = 256 << 10
 
+// replayAckEvery: a flow acknowledges after this many delivered bytes. It is
+// independent of the ring size, because the peer's ring may be far bigger than
+// ours: acknowledging only every limit/16 of a small ring would starve a peer whose
+// ring has grown.
+const replayAckEvery = 64 << 10
+
+// SetReplayGrower lets the replay ring grow when the sender finds it full: grow
+// gets the current limit and returns the new one (the same value = no more room).
+// The ring's size bounds the flow's rate to about limit per round trip, so a flow
+// that actually needs a bigger one gets it, within the process-wide budget, while
+// idle ones stay small. Call before Start.
+func (p *PumpSwapper) SetReplayGrower(grow func(cur int) int) { p.replayGrow = grow }
+
+// growReplay tries to enlarge the full replay ring; it reports whether it did.
+func (p *PumpSwapper) growReplay() bool {
+	if p.replayGrow == nil {
+		return false
+	}
+	cur := p.replay.ring.getLimit()
+	if next := p.replayGrow(cur); next > cur {
+		p.replay.ring.setLimit(next)
+		return true
+	}
+	return false
+}
+
 // EnableReplay makes the flow keep up to limit unacknowledged bytes it sends, and
 // acknowledge what it receives, over tunnels that carry ACK records. It must be
 // called before Start; it fails if the current tunnel cannot carry ACKs.
@@ -876,7 +903,7 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 	if len(p.proxyHeader) > 0 {
 		ring.append(p.proxyHeader) // already written, and counted in UpBytes: keep it until the peer has it
 	}
-	p.replay = &replayState{ring: ring, ackEvery: uint64(limit / 16)}
+	p.replay = &replayState{ring: ring, ackEvery: replayAckEvery}
 	return nil
 }
 
@@ -997,6 +1024,9 @@ func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
 		p.mu.Unlock()
 		if suspended {
 			return true, true // nothing can be acknowledged until the flow resumes
+		}
+		if p.replay.ring.free() < n && p.growReplay() {
+			continue // a bigger ring may already fit it
 		}
 		err := p.replay.ring.waitFree(p.ctx, p.abortCh, p.freezeWake, n)
 		switch {

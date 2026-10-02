@@ -2,30 +2,48 @@ package handlers
 
 import "testing"
 
-func TestReplayBudget(t *testing.T) {
-	b := NewReplayBudget(ReplayFlowLimit + minReplayLimit + minReplayLimit/2)
-	l1, r1 := b.Reserve()
-	l2, r2 := b.Reserve()
-	l3, r3 := b.Reserve()
-	if l1 != ReplayFlowLimit || l2 != minReplayLimit || l3 != 0 {
-		t.Fatalf("grants %d %d %d", l1, l2, l3)
+func TestReplayBudgetGrowsOnDemandWithinBudget(t *testing.T) {
+	b := NewReplayBudget(3*ReplayFlowStart + ReplayFlowStart/2)
+	g1, g2 := b.Open(false), b.Open(false)
+	if g1 == nil || g2 == nil {
+		t.Fatal("two starting rings should fit")
 	}
-	r3()
-	if lf, rf := b.Force(); lf != minReplayLimit {
-		t.Fatalf("Force granted %d", lf)
-	} else {
-		rf()
-		rf() // idempotent
+	// g1 doubles while room lasts: 256K -> 512K costs another 256K, then 1M costs 512K.
+	cur := g1.Limit()
+	cur = g1.Grow(cur)
+	if cur != 2*ReplayFlowStart {
+		t.Fatalf("first growth gave %d", cur)
 	}
-	r1()
-	r1()
-	if l, r := b.Reserve(); l != ReplayFlowLimit {
-		t.Fatalf("after release: %d", l)
-	} else {
-		r()
+	if next := g1.Grow(cur); next != cur {
+		t.Fatalf("growth beyond the budget gave %d, want %d", next, cur)
 	}
-	r2()
+	// An idle flow opening later still gets its starting ring from what is left,
+	// and force always succeeds.
+	if g3 := b.Open(false); g3 != nil {
+		t.Fatal("a third flow should not fit")
+	}
+	g4 := b.Open(true)
+	if g4 == nil || g4.Limit() != ReplayFlowStart {
+		t.Fatal("force must grant the starting ring")
+	}
+	g1.Release()
+	g1.Release()
+	g2.Release()
+	g4.Release()
 	if b.used != 0 {
 		t.Fatalf("budget leaked %d", b.used)
+	}
+	var nilGrant *ReplayGrant
+	nilGrant.Release() // no-op
+}
+
+func TestReplayGrantCapsAtFlowMax(t *testing.T) {
+	g := NewReplayBudget(ReplayBudgetTotal).Open(false)
+	cur := g.Limit()
+	for i := 0; i < 20; i++ {
+		cur = g.Grow(cur)
+	}
+	if cur != ReplayFlowMax {
+		t.Fatalf("limit grew to %d, want the cap %d", cur, ReplayFlowMax)
 	}
 }

@@ -231,6 +231,11 @@ nodelay = true
 log_level = "info"
 EOF
 
+# Extra config lines (printf %b escapes, e.g. 'mux_version = 2\ncdn_max_age = 3600'),
+# for measuring options without editing this script.
+[[ -n "${SERVER_EXTRA:-}" ]] && printf '%b\n' "$SERVER_EXTRA" >> "$WORK/server.toml"
+[[ -n "${CLIENT_EXTRA:-}" ]] && printf '%b\n' "$CLIENT_EXTRA" >> "$WORK/client.toml"
+
 # wss/wssmux need a certificate; a self-signed one is fine because the client
 # is told not to verify it.
 case "$TRANSPORT" in

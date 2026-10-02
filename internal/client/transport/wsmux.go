@@ -698,7 +698,7 @@ func (c *WsMuxTransport) poolMaintainer() {
 
 				// send a signal to controlFlow; a full channel must not keep
 				// this worker (and so a restart) waiting once cancelled
-				atomic.StoreInt64(&c.lastShrink, time.Now().UnixNano())
+				markShrink(&c.lastShrink)
 				select {
 				case c.controlFlow <- struct{}{}:
 				case <-ctx.Done():
@@ -784,10 +784,9 @@ func (c *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 			switch msg {
 			case utils.SG_Chan:
 				atomic.AddInt32(&c.loadConnections, 1)
-				select {
-				case <-c.controlFlow: // Do nothing
-
-				default:
+				if c.swallowChanSignal() {
+					c.logger.Debug("channel signal absorbed by a recent pool shrink")
+				} else {
 					c.logger.Debug("channel signal received, initiating tunnel dialer")
 					g.start(c.tunnelDialer)
 				}
@@ -817,33 +816,10 @@ func (c *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 	}
 }
 
-// shrinkTokenTTL is how long a pool shrink may absorb a new-connection request.
-// The token exists so a request already in flight when the pool shrinks does not
-// immediately regrow it. It must not outlive that moment: a stale token would eat
-// a later request - above all the server's rotation request for a replacement
-// connection - and delay the rotation until its slow re-ask, by which time the
-// CDN may have cut the aging connection.
-const shrinkTokenTTL = 5 * time.Second
-
 // swallowChanSignal reports whether this SG_Chan should be ignored because a
-// recent shrink queued a token for it. Tokens older than shrinkTokenTTL are
-// discarded and the request is served.
+// recent shrink queued a token for it (see swallowShrinkToken).
 func (c *WsMuxTransport) swallowChanSignal() bool {
-	select {
-	case <-c.controlFlow:
-	default:
-		return false
-	}
-	if time.Since(time.Unix(0, atomic.LoadInt64(&c.lastShrink))) <= shrinkTokenTTL {
-		return true
-	}
-	for { // stale: drop every leftover token too
-		select {
-		case <-c.controlFlow:
-		default:
-			return false
-		}
-	}
+	return swallowShrinkToken(c.controlFlow, &c.lastShrink)
 }
 
 // controlReconnectWindow bounds how long a dropped control channel is re-dialled

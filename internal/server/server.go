@@ -118,7 +118,9 @@ func (s *Server) Start() {
 		go dnsMuxServer.Start()
 
 	case config.WS, config.WSS:
+		wsMaxConnAge, _ := transport.RotationPlan(time.Duration(s.config.CDNMaxAge) * time.Second)
 		wsConfig := &transport.WsConfig{
+			MaxConnAge:    wsMaxConnAge,
 			BindAddr:      s.config.BindAddr,
 			Nodelay:       s.config.Nodelay,
 			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,

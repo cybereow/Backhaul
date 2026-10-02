@@ -38,6 +38,17 @@ type WsTransport struct {
 	poolConnections int32
 	loadConnections int32
 	controlFlow     chan struct{}
+	// pendingDials counts tunnel dials in flight (not yet established), so the
+	// refill does not re-dial a connection that is still handshaking.
+	pendingDials int32
+	// owedConns is how many pool connections died idle (or failed to dial) and
+	// have not been replaced yet. Only these are refilled: a connection that is
+	// consumed by a flow is replaced by the server's own request, and refilling
+	// it here too would grow the pool by one per flow.
+	owedConns int32
+	// lastShrink is when a pool shrink last queued a controlFlow token; see
+	// swallowShrinkToken.
+	lastShrink int64
 	// userAgent is picked once per process instead of per dial - see the
 	// same field on WsMuxTransport for why.
 	userAgent string
@@ -180,6 +191,9 @@ func (c *WsTransport) Restart() {
 	c.config.TunnelStatus = ""
 	atomic.StoreInt32(&c.poolConnections, 0)
 	atomic.StoreInt32(&c.loadConnections, 0)
+	atomic.StoreInt32(&c.pendingDials, 0)
+	atomic.StoreInt32(&c.owedConns, 0)
+	atomic.StoreInt64(&c.lastShrink, 0)
 	c.controlFlow = make(chan struct{}, 100)
 
 	c.Start()
@@ -279,6 +293,16 @@ func (c *WsTransport) poolMaintainer() {
 			// Accumulate pool connections over time (every second)
 			atomic.AddInt32(&poolConnectionsSum, atomic.LoadInt32(&c.poolConnections))
 
+			// Replace idle pool connections that died on their own (a CDN
+			// max-age or idle reset). Nothing else rebuilt them: the initial fill
+			// runs once and the sizing below only grows on load, so after an idle
+			// spell the pool could sit empty until traffic forced growth. Only
+			// connections that are owed are refilled (see owedConns), gently, and
+			// never past the configured floor.
+			for i, n := 0, c.refillOwed(); i < n; i++ {
+				g.start(c.tunnelDialer)
+			}
+
 		case <-tickerLoad.C:
 			// Calculate the loadConnections over the last 10 seconds
 			loadConnections := (int(atomic.LoadInt32(&c.loadConnections)) + 9) / 10 // +9 for ceil-like logic
@@ -298,6 +322,7 @@ func (c *WsTransport) poolMaintainer() {
 			} else if float64(loadConnections+x) < float64(poolConnectionsAvg)*y && newPoolSize > c.config.ConnPoolSize {
 				c.logger.Debugf("decreasing pool size: %d -> %d, avg pool conn: %d, avg load conn: %d", newPoolSize, newPoolSize-1, poolConnectionsAvg, loadConnections)
 				newPoolSize--
+				markShrink(&c.lastShrink)
 
 				// send a signal to controlFlow; a full channel must not keep
 				// this worker (and so a restart) waiting once cancelled
@@ -313,78 +338,92 @@ func (c *WsTransport) poolMaintainer() {
 }
 
 // channelHandler drives one control channel. It takes the connection as an
-// argument rather than reading c.controlChannel on every use: the field is
-// shared with the dialer and Restart, so a handler whose connection has died
-// must not touch a pointer that by then may hold something else.
+// argument rather than reading c.controlChannel on every use: a handler whose
+// connection has died must not touch the shared pointer that by then may hold
+// its replacement.
 func (c *WsTransport) channelHandler(conn *network.WebSocketConn) {
 	g, ctx := c.gen, c.ctx
 	msgChan := make(chan byte, 1000)
 
-	// Goroutine to handle the blocking ReceiveBinaryString. A worker of the
-	// generation, so Restart waits for it: it is woken by the generation closing
-	// the socket, and its send gives way to cancellation instead of blocking on a
-	// full msgChan that nothing drains any more.
-	g.start(func() {
-		for {
-			select {
-			case <-ctx.Done():
+	// One handler owns one connection and its reader; they end together.
+	//   connDone    closed when the reader goroutine exits (handler <- reader).
+	//   hctx        cancelled when the handler returns (handler -> reader).
+	//   handlerDone closed once both are gone; reconnectControl waits on it so
+	//               a replacement handler never overlaps this one.
+	connDone := make(chan struct{})
+	handlerDone := make(chan struct{})
+	hctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		// Wake a ReadMessage blocked on the (now abandoned) connection, then
+		// join the reader: it cannot block again because its only other wait,
+		// the msgChan send, also selects on hctx.
+		_ = conn.SetReadDeadline(time.Now())
+		<-connDone
+		close(handlerDone)
+	}()
+
+	// Goroutine to handle the blocking ReceiveBinaryString
+	go func() {
+		defer close(connDone)
+		for hctx.Err() == nil {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				if hctx.Err() != nil {
+					// The handler already returned and owns the reconnect
+					// decision; reconnecting here too would double it.
+					return
+				}
+				c.logger.Warn("control channel read failed. ", err)
+				// Not fatal: the control channel carries only heartbeats
+				// and new-connection requests, so it is re-dialled without
+				// touching the pool or the flows running on it.
+				g.start(func() { c.reconnectControl(conn, handlerDone) })
 				return
-
-			default:
-				_, msg, err := conn.ReadMessage()
-				if err != nil {
-					// After cancellation the read fails because the generation
-					// closed the socket, and a restart is already under way.
-					if ctx.Err() == nil && c.cancel != nil {
-						c.logger.Error("failed to read from channel connection. ", err)
-						c.requestRestart()
-					}
-					return
-				}
-
-				// A zero-length binary frame (or padding-only payload) would
-				// panic on msg[0] and take down this read goroutine; skip it.
-				if len(msg) == 0 {
-					continue
-				}
-				select {
-				case msgChan <- msg[0]:
-				case <-ctx.Done():
-					return
-				}
+			}
+			// A zero-length binary frame (or padding-only payload) would
+			// panic on msg[0] and take down this read goroutine; skip it.
+			if len(msg) == 0 {
+				continue
+			}
+			select {
+			case msgChan <- msg[0]:
+			case <-hctx.Done():
+				return
 			}
 		}
-	})
+	}()
 
-	// Main loop to listen for context cancellation or received messages
 	for {
 		select {
 		case <-ctx.Done():
-			// Best effort and bounded: the peer may be gone, and an unbounded
-			// write would keep this handler alive past cancellation.
+			// Bounded: the peer may be gone, and an unbounded write would keep
+			// this handler (and so its reader) alive past cancellation.
 			_ = conn.SetWriteDeadline(time.Now().Add(controlCloseWriteTimeout))
 			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
+			return
+
+		case <-connDone:
+			// Reader exited and has already scheduled the reconnect.
 			return
 
 		case msg := <-msgChan:
 			switch msg {
 			case utils.SG_Chan:
 				atomic.AddInt32(&c.loadConnections, 1)
-				select {
-				case <-c.controlFlow: // Do nothing
-
-				default:
+				if c.swallowChanSignal() {
+					c.logger.Debug("channel signal absorbed by a recent pool shrink")
+				} else {
 					c.logger.Debug("channel signal received, initiating tunnel dialer")
 					g.start(c.tunnelDialer)
 				}
 
 			case utils.SG_HB:
-				c.logger.Debug("heartbeat signal received successfully")
-				// send heartbeat back
+				c.logger.Debug("heartbeat received successfully")
 				err := utils.WriteControlSignal(conn, utils.SG_HB)
 				if err != nil {
-					c.logger.Errorf("failed to send heartbeat: %v", err)
-					c.requestRestart()
+					c.logger.Warnf("failed to send heartbeat: %v", err)
+					g.start(func() { c.reconnectControl(conn, handlerDone) })
 					return
 				}
 				c.logger.Trace("heartbeat signal sent successfully")
@@ -395,16 +434,143 @@ func (c *WsTransport) channelHandler(conn *network.WebSocketConn) {
 				return
 
 			default:
-				c.logger.Errorf("unexpected response from channel: %v", msg)
+				c.logger.Errorf("unexpected response from control channel: %v", msg)
 				c.requestRestart()
 				return
 			}
+
 		}
+	}
+}
+
+// swallowChanSignal reports whether this SG_Chan should be ignored because a
+// recent shrink queued a token for it (see swallowShrinkToken).
+func (c *WsTransport) swallowChanSignal() bool {
+	return swallowShrinkToken(c.controlFlow, &c.lastShrink)
+}
+
+// reconnectControl re-dials the control channel after it dropped, deliberately
+// without cancelling ctx. The pool connections and every flow on them are
+// independent of the control channel, which carries nothing but heartbeats and
+// new-connection requests - so a CDN resetting the control connection (the
+// oldest, longest-lived one, and therefore the first to hit a max-age limit)
+// becomes a brief pause in *new* connection setup instead of a dropped tunnel.
+//
+// Restart, which tears everything down, stays as the fallback for a control
+// channel that cannot be re-established at all.
+//
+// oldDone is closed when the handler that owned old has fully returned (reader
+// included). The replacement is dialled and started only after that, so a stale
+// handler can never consume from, or race, its successor.
+func (c *WsTransport) reconnectControl(old *network.WebSocketConn, oldDone <-chan struct{}) {
+	g, ctx := c.gen, c.ctx
+
+	c.controlMu.Lock()
+	if c.controlChannel != old {
+		// Another goroutine already handled this drop, or a restart is under way.
+		c.controlMu.Unlock()
+		return
+	}
+	c.controlChannel = nil
+	c.controlMu.Unlock()
+	old.Close()
+	g.release(old)
+
+	c.config.TunnelStatus = fmt.Sprintf("Reconnecting (%s)", c.config.Mode)
+	c.logger.Warn("control channel dropped, re-dialing without tearing down the pool")
+
+	// old.Close() above makes the old handler's read and write fail, so this
+	// wait is short; it involves no I/O and holds no lock.
+	select {
+	case <-oldDone:
+	case <-ctx.Done():
+		return
+	}
+
+	deadline := time.Now().Add(controlReconnectWindow)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		// retry=1: the dialer's own retry loop would spend most of the window
+		// backing off against one endpoint, and each failure is worth logging.
+		ep := c.nextEndpoint()
+		conn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/channel", c.config.DialTimeOut, c.config.KeepAlive, true, c.config.Token, c.userAgent, c.config.Mode, 1, 0, 0, 0, c.config.TLSVerify)
+		if err == nil {
+			if !g.own(conn) {
+				return
+			}
+			c.controlMu.Lock()
+			c.controlChannel = conn
+			c.controlMu.Unlock()
+
+			c.config.TunnelStatus = fmt.Sprintf("Connected (%s)", c.config.Mode)
+			c.logger.Info("control channel re-established, pool preserved")
+
+			// Only the handler restarts here - poolMaintainer is still running
+			// under the same context and starting a second one would double the
+			// pool management.
+			g.start(func() { c.channelHandler(conn) })
+			return
+		}
+
+		c.logger.Errorf("control channel re-dial: %v (endpoint %s)", err, ep.addr)
+
+		if time.Now().After(deadline) {
+			c.logger.Warn("control channel could not be re-established within the grace window, falling back to a full restart")
+			// This worker is joined by the restart it asks for, so it cannot
+			// run it itself.
+			c.requestRestart()
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(c.config.RetryInterval):
+		}
+	}
+}
+
+// refillOwed settles the owed-connection debt (see owedConns) against the pool's
+// current deficit and returns how many dials to launch this tick. With no deficit
+// the debt is forgiven: the pool is already at its floor (a rotation replacement
+// arrived first), and keeping it would dial a surplus connection the moment a
+// flow consumes one.
+func (c *WsTransport) refillOwed() int {
+	deficit := poolRefillCount(c.config.ConnPoolSize, int(atomic.LoadInt32(&c.poolConnections)), int(atomic.LoadInt32(&c.pendingDials)), poolRefillPerTick)
+	owed := int(atomic.LoadInt32(&c.owedConns))
+	if deficit <= 0 {
+		atomic.StoreInt32(&c.owedConns, 0)
+		return 0
+	}
+	if owed <= 0 {
+		return 0
+	}
+	n := deficit
+	if owed < n {
+		n = owed
+	}
+	atomic.AddInt32(&c.owedConns, int32(-n))
+	return n
+}
+
+// owe records one pool connection that has to be replaced, capped at the floor
+// so a long outage cannot build up a debt that would burst-dial on recovery.
+func (c *WsTransport) owe() {
+	if int(atomic.AddInt32(&c.owedConns, 1)) > c.config.ConnPoolSize {
+		atomic.StoreInt32(&c.owedConns, int32(c.config.ConnPoolSize))
 	}
 }
 
 func (c *WsTransport) tunnelDialer() {
 	g, ctx := c.gen, c.ctx
+
+	// In flight only while dialing; handed to poolConnections once established.
+	atomic.AddInt32(&c.pendingDials, 1)
 
 	ep := c.nextEndpoint()
 	c.logger.Debugf("initiating new websocket tunnel connection to address %s", ep.addr)
@@ -412,7 +578,11 @@ func (c *WsTransport) tunnelDialer() {
 	// Dial to the tunnel server
 	tunnelConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
 	if err != nil {
+		atomic.AddInt32(&c.pendingDials, -1)
 		c.logger.Errorf("tunnel server dialer: %v", err)
+		if ctx.Err() == nil {
+			c.owe() // retried by the refill, a second at a time
+		}
 
 		return
 	}
@@ -420,6 +590,7 @@ func (c *WsTransport) tunnelDialer() {
 	// Own the socket before anything else touches it. If the generation was
 	// stopped while this dial was in flight, own has already closed it.
 	if !g.own(tunnelConn) {
+		atomic.AddInt32(&c.pendingDials, -1)
 		return
 	}
 	defer g.release(tunnelConn)
@@ -428,6 +599,7 @@ func (c *WsTransport) tunnelDialer() {
 	// once, whichever way this returns: the idle loop below used to leave it
 	// incremented when the context was cancelled.
 	atomic.AddInt32(&c.poolConnections, 1)
+	atomic.AddInt32(&c.pendingDials, -1)
 	counted := true
 	leavePool := func() {
 		if counted {
@@ -450,6 +622,9 @@ func (c *WsTransport) tunnelDialer() {
 			if err != nil {
 				c.logger.Debugf("unable to get port from websocket connection %s: %v", tunnelConn.RemoteAddr().String(), err)
 				tunnelConn.Close()
+				if ctx.Err() == nil {
+					c.owe() // an idle pool connection died; the refill replaces it
+				}
 				return
 			}
 

@@ -44,12 +44,7 @@ func lcWaitClosed(t *testing.T, what string, ch <-chan struct{}) {
 
 func lcFreeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	return ln.Addr().String()
+	return testAddr(t, "tcp")
 }
 
 // trackedConn reports, on readClosed, that the far end (or this side) closed the

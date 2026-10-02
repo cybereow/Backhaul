@@ -129,10 +129,12 @@ func (s *WsMuxTransport) retireSessionWithin(session *smux.Session, budget time.
 	}
 }
 
-// rotateStripedSession is the striped path's equivalent of the rotation branch
-// in handleSession: at its rotation age the session is pulled out of the leg pool
-// so no new stripe legs land on it, then drained and closed. The sessionCounter
-// decrement is left to the CloseChan watcher registered in handleLoop.
+// rotateStripedSession runs the rotation of one pool session, striped or not
+// (the name is historical: every pool session is rotated through here, from
+// handleLoop). At its rotation age the session waits for a replacement, is pulled
+// out of the leg pool so nothing new lands on it, has its resumable flows moved to
+// other sessions, and is then drained and closed. The sessionCounter decrement is
+// left to the CloseChan watcher registered in handleLoop.
 //
 // The session stays owned by the generation (see wsGeneration) while it drains:
 // unregistering it only stops new legs landing on it, so a restart during the

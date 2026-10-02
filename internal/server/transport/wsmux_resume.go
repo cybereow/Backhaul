@@ -166,7 +166,7 @@ func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session)
 	if len(flows) == 0 {
 		return
 	}
-	var moved, failed int
+	var moved, failed, finished int
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, migrateParallel)
@@ -189,6 +189,14 @@ func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session)
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
+				select {
+				case <-f.sw.DoneWait():
+					// It ended on its own while the move was in flight: nothing was
+					// left to move, and nothing was lost.
+					finished++
+					return
+				default:
+				}
 				failed++
 				s.logger.Debugf("moving flow %d off a retiring session: %v", f.id, err)
 				return
@@ -197,7 +205,7 @@ func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session)
 		}(f)
 	}
 	wg.Wait()
-	s.logger.Debugf("retiring session: %d flow(s) moved, %d left on it", moved, failed)
+	s.logger.Debugf("retiring session: %d flow(s) moved, %d finished meanwhile, %d left on it", moved, finished, failed)
 	if failed > 0 {
 		s.recordEvent("flows_not_moved", fmt.Sprintf("%d of %d flow(s) could not be moved off a retiring session; they stay on it until it drains or is cut", failed, len(flows)))
 	}

@@ -47,3 +47,19 @@ func TestReplayGrantCapsAtFlowMax(t *testing.T) {
 		t.Fatalf("limit grew to %d, want the cap %d", cur, ReplayFlowMax)
 	}
 }
+
+func TestReplayBudgetForceIsBounded(t *testing.T) {
+	b := NewReplayBudget(4 * ReplayFlowStart)
+	var grants []*ReplayGrant
+	for i := 0; i < 20; i++ {
+		if g := b.Open(true); g != nil {
+			grants = append(grants, g)
+		}
+	}
+	if len(grants) != 5 { // the budget plus a quarter
+		t.Fatalf("force granted %d flows, want 5 (budget 4 + 25%%)", len(grants))
+	}
+	if b.Open(false) != nil {
+		t.Fatal("a normal flow got a ring beyond the budget")
+	}
+}

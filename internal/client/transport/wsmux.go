@@ -1437,26 +1437,52 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 		recvBuf = 32 * 1024
 	}
 
+	if replay {
+		// Known but not running yet: a resume attach that arrives while the target
+		// is still being dialed must be told to retry, not that the flow is gone.
+		c.promotableFlowsMu.Lock()
+		c.promotableFlows[flowID] = nil
+		c.promotableFlowsMu.Unlock()
+	}
+	forget := func() {
+		c.promotableFlowsMu.Lock()
+		delete(c.promotableFlows, flowID)
+		c.promotableFlowsMu.Unlock()
+	}
+
 	localConnection, err := network.TcpDialer(ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
 	if err != nil {
 		c.logger.Errorf("local dialer: %v", err)
+		if replay {
+			forget()
+		}
 		stream.Close()
 		return
 	}
 
 	swapper := handlers.NewPromotablePump(ctx, false, localConnection, handlers.NewHalfCloseConn(stream), c.logger, c.usageMonitor, port, c.config.Sniffer)
 	if swapper == nil {
+		if replay {
+			forget()
+		}
 		return
 	}
 	if replay {
-		// The server decided this flow keeps replay state; this end follows (and
-		// takes at least the smallest ring whatever the budget says, since the
-		// two ends must agree).
+		// The server decided this flow keeps replay state, so this end must too. The
+		// client may exceed the budget a little (the server cannot know), but not
+		// without bound: past that the flow is refused.
 		grant := handlers.DefaultReplayBudget.Open(true)
+		if grant == nil {
+			c.logger.Warnf("resumable flow %d refused: the replay memory budget is exhausted", flowID)
+			forget()
+			swapper.Abort()
+			return
+		}
 		defer grant.Release()
 		swapper.SetReplayGrower(grant.Grow)
 		if err := swapper.EnableReplay(grant.Limit()); err != nil {
 			c.logger.Errorf("resumable flow %d: %v", flowID, err)
+			forget()
 			swapper.Abort()
 			return
 		}
@@ -1485,8 +1511,9 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 	ctx := c.ctx // this worker's generation, read once
 
 	c.promotableFlowsMu.Lock()
-	swapper := c.promotableFlows[flowID]
+	swapper, known := c.promotableFlows[flowID]
 	c.promotableFlowsMu.Unlock()
+	pending := known && swapper == nil // accepted, its target is still being dialed
 
 	reject := func(reason byte, why string) {
 		c.logger.Debugf("attach of flow %d refused: %s", flowID, why)
@@ -1495,7 +1522,7 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 		stream.Close()
 	}
 	if mode == utils.AttachResume && flags == 0 {
-		c.handleResumeAttach(ctx, stream, flowID, swapper, reject)
+		c.handleResumeAttach(ctx, stream, flowID, swapper, pending, reject)
 		return
 	}
 	switch {
@@ -1550,8 +1577,11 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 // (this end may not have noticed the loss yet); a flow that cannot be resumed (it
 // is unknown, finished, or has no replay state) is refused, which tells the server
 // to give it up.
-func (c *WsMuxTransport) handleResumeAttach(ctx context.Context, stream *smux.Stream, flowID uint64, swapper *handlers.PumpSwapper, reject func(byte, string)) {
+func (c *WsMuxTransport) handleResumeAttach(ctx context.Context, stream *smux.Stream, flowID uint64, swapper *handlers.PumpSwapper, pending bool, reject func(byte, string)) {
 	switch {
+	case pending:
+		reject(utils.AttachRejectBusy, "flow still being set up; try again")
+		return
 	case swapper == nil:
 		reject(utils.AttachRejectUnknownFlow, "unknown or finished flow")
 		return
@@ -1587,7 +1617,7 @@ func (c *WsMuxTransport) handlePromoteStream(stream *smux.Stream, flowID uint64,
 	swapper, ok := c.promotableFlows[flowID]
 	c.promotableFlowsMu.Unlock()
 
-	if !ok {
+	if !ok || swapper == nil {
 		c.logger.Errorf("promotion leg for unknown flow %d", flowID)
 		stream.Close()
 		return

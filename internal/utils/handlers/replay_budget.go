@@ -39,12 +39,17 @@ type ReplayGrant struct {
 }
 
 // Open gives a flow its starting ring, or nil when the budget cannot even cover
-// that (the flow then runs without replay). With force it always succeeds: a flow
-// whose peer already decided it uses replay must too, the two ends have to agree.
+// that (the flow then runs without replay). With force the budget may be exceeded,
+// by at most a quarter: a flow whose peer already decided it uses replay must too
+// (the two ends have to agree), but the process stays bounded; past that, nil.
 func (b *ReplayBudget) Open(force bool) *ReplayGrant {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if !force && b.total-b.used < ReplayFlowStart {
+	limit := b.total
+	if force {
+		limit += b.total / 4
+	}
+	if limit-b.used < ReplayFlowStart {
 		return nil
 	}
 	b.used += ReplayFlowStart

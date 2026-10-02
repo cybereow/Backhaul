@@ -272,3 +272,62 @@ func TestWSMuxResumeAfterUnannouncedCut(t *testing.T) {
 		t.Fatalf("cuts=%d resumes=%d", cuts, f.sw.Resumes())
 	}
 }
+
+// A flow whose download direction already ended and whose upload direction is
+// idle in a read of the user's socket performs no tunnel I/O, so no pump can notice
+// its session died: only the server watching the session starts the resume. It
+// must happen before the user sends anything, and the request sent after still
+// arrives.
+func TestWSMuxResumeIdleHalfClosedFlow(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_ = c.(*net.TCPConn).CloseWrite() // nothing to say: the reply direction ends at once
+		b, _ := io.ReadAll(c)
+		got <- string(b)
+	}()
+
+	h := newLCHarness(t, toTarget(ln.Addr().String()), func(c *WsMuxConfig) {
+		c.MaxConnAge = time.Hour
+		c.MaxDrain = time.Minute
+		c.ResumeWindow = 20 * time.Second
+	})
+	startResumeClient(t, h, 3)
+
+	user := h.user().(*net.TCPConn)
+	_ = user.SetDeadline(time.Now().Add(30 * time.Second))
+
+	var f *resumableFlow
+	lcWaitFor(t, "the flow", func() bool {
+		h.s.flowsMu.Lock()
+		defer h.s.flowsMu.Unlock()
+		for _, x := range h.s.flows {
+			f = x
+		}
+		return f != nil
+	})
+	time.Sleep(300 * time.Millisecond) // let the END reach the server
+	from := f.session()
+	from.Close()
+	lcWaitFor(t, "the idle flow to resume without any traffic", func() bool { return f.sw.Resumes() >= 1 && f.session() != from })
+
+	user.Write([]byte("request after the cut"))
+	user.CloseWrite()
+	select {
+	case s := <-got:
+		if s != "request after the cut" {
+			t.Fatalf("the target received %q", s)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("the request after the cut never arrived")
+	}
+}

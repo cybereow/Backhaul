@@ -138,8 +138,18 @@ var errFlowGone = errors.New("the client no longer has this flow")
 // resume window runs out, which ends this too.
 func (s *WsMuxTransport) driveResume(ctx context.Context, f *resumableFlow) {
 	for {
+		// A flow idle in a socket read performs no tunnel I/O that could fail, so its
+		// pumps may not notice its session died: watch the session too.
+		sess := f.session()
 		select {
 		case <-f.sw.SuspendedCh():
+		case <-sess.CloseChan():
+			if f.session() != sess {
+				continue // it was moved off this session meanwhile
+			}
+			if !f.sw.Suspend() {
+				return // finished, or cannot be resumed
+			}
 		case <-f.sw.DoneWait():
 			return
 		case <-ctx.Done():

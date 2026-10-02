@@ -207,3 +207,26 @@ func TestLegScoreValue(t *testing.T) {
 		t.Errorf("unprobed session should not out-rank a measured 1ms session")
 	}
 }
+
+// A session near its rotation age costs more than a fresh one of equal load, up
+// to (1+ageWeight)x, and no rotation age means no preference.
+func TestAgeFactor(t *testing.T) {
+	maxAge := 100 * time.Second
+	if got := ageFactor(0, maxAge); got != 1 {
+		t.Fatalf("fresh session factor = %v, want 1", got)
+	}
+	if got := ageFactor(maxAge, maxAge); got != 1+ageWeight {
+		t.Fatalf("session at rotation age factor = %v, want %v", got, 1+ageWeight)
+	}
+	if got := ageFactor(10*maxAge, maxAge); got != 1+ageWeight {
+		t.Fatalf("factor must be capped, got %v", got)
+	}
+	if got := ageFactor(50*time.Second, 0); got != 1 {
+		t.Fatalf("no rotation age must mean no preference, got %v", got)
+	}
+	young := &pooledSession{born: time.Now(), maxAge: maxAge}
+	old := &pooledSession{born: time.Now().Add(-maxAge), maxAge: maxAge}
+	if agedScore(10, young) >= agedScore(10, old) {
+		t.Fatal("a young session must score better than an old one at equal load and RTT")
+	}
+}

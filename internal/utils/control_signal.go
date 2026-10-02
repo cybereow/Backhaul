@@ -45,10 +45,16 @@ func WriteControlSignal(conn *network.WebSocketConn, signal byte) error {
 // form a perfectly periodic pattern. Falls back to base for non-positive
 // durations.
 func JitterDuration(base time.Duration) time.Duration {
+	return JitterFraction(base, heartbeatJitterFraction)
+}
+
+// JitterFraction is JitterDuration with an explicit spread: base shifted by up
+// to +/- frac of itself.
+func JitterFraction(base time.Duration, frac float64) time.Duration {
 	if base <= 0 {
 		return base
 	}
-	spread := float64(base) * heartbeatJitterFraction
+	spread := float64(base) * frac
 	offset := (rand.Float64()*2 - 1) * spread // in [-spread, +spread]
 	return base + time.Duration(offset)
 }

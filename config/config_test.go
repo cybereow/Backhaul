@@ -46,7 +46,7 @@ proxy_protocol = true
 path = "/ws"
 fallback = "http://127.0.0.1:8081"
 tls_engine = "standard"
-max_conn_age = 3600
+cdn_max_age = 300
 `
 
 	var serverCfg ServerConfig
@@ -90,7 +90,7 @@ max_conn_age = 3600
 	assert.Equal(t, "/ws", serverCfg.Path)
 	assert.Equal(t, "http://127.0.0.1:8081", serverCfg.Fallback)
 	assert.Equal(t, "standard", serverCfg.TLSEngine)
-	assert.Equal(t, 3600, serverCfg.MaxConnAge)
+	assert.Equal(t, 300, serverCfg.CDNMaxAge)
 }
 
 func TestClientConfig(t *testing.T) {

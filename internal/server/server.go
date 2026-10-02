@@ -118,7 +118,9 @@ func (s *Server) Start() {
 		go dnsMuxServer.Start()
 
 	case config.WS, config.WSS:
+		wsMaxConnAge, _ := transport.RotationPlan(time.Duration(s.config.CDNMaxAge) * time.Second)
 		wsConfig := &transport.WsConfig{
+			MaxConnAge:    wsMaxConnAge,
 			BindAddr:      s.config.BindAddr,
 			Nodelay:       s.config.Nodelay,
 			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,
@@ -144,6 +146,7 @@ func (s *Server) Start() {
 		go wsServer.Start()
 
 	case config.WSMUX, config.WSSMUX:
+		maxConnAge, maxDrain := transport.RotationPlan(time.Duration(s.config.CDNMaxAge) * time.Second)
 		wsMuxConfig := &transport.WsMuxConfig{
 			BindAddr:             s.config.BindAddr,
 			Nodelay:              s.config.Nodelay,
@@ -179,8 +182,8 @@ func (s *Server) Start() {
 			Path:                 s.config.Path,
 			Fallback:             s.config.Fallback,
 			TLSEngine:            s.config.TLSEngine,
-			MaxConnAge:           time.Duration(s.config.MaxConnAge) * time.Second,
-			MaxDrain:             time.Duration(s.config.MaxDrain) * time.Second,
+			MaxConnAge:           maxConnAge,
+			MaxDrain:             maxDrain,
 			WSFraming:            s.config.MuxWSFraming,
 			HalfClose:            s.config.MuxHalfClose,
 		}

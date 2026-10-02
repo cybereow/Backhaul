@@ -2,141 +2,52 @@ package transport
 
 import (
 	"context"
-	"net"
-	"sync/atomic"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils"
-	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/xtaci/smux"
 )
 
-func (s *WsMuxTransport) handleSession(session *smux.Session) {
-	counter := make(chan struct{}, s.config.MuxCon)
-	defer session.Close() // runs after retireSession below has drained the session
-	defer close(counter)
+// Rotation is derived from one number, the max connection age of the CDN/LB in
+// front of the server (cdn_max_age), so nobody has to work jitter and dial slack
+// out by hand.
+//
+//   - A pool connection is retired at rotateFraction of that age, +/- rotateJitter.
+//     The worst case, rotateFraction*(1+rotateJitter) of the age, still leaves
+//     the replacement ~20% of the age to be dialled before the CDN would cut it.
+//   - A retired connection is drained for the rest of the age, measured from its
+//     retirement: past that the CDN closes it anyway, so waiting longer buys
+//     nothing and only keeps surplus connections open.
+const (
+	rotateFraction = 0.7
+	rotateJitter   = 0.1
+)
 
-	// Retire this session before it gets old enough for the CDN's own max-age
-	// reset to land on it. The age is jittered because the initial pool is
-	// dialled all at once - on a fixed age every connection would rotate in the
-	// same second, which is both a reconnect storm and a nice periodic
-	// signature. A nil channel (rotation disabled) blocks forever in the select.
-	var rotate <-chan time.Time
-	if s.config.MaxConnAge > 0 {
-		rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
-		defer rotateTimer.Stop()
-		rotate = rotateTimer.C
+// RotationPlan turns the CDN's max connection age into the age a pool connection
+// is retired at and the longest it is then drained for. Zero disables rotation.
+func RotationPlan(cdnMaxAge time.Duration) (maxConnAge, maxDrain time.Duration) {
+	if cdnMaxAge <= 0 {
+		return 0, 0
 	}
-	// replaced closes once a replacement pool connection has actually been
-	// admitted. Nil until rotation starts, so the select ignores it.
-	var replaced chan struct{}
+	maxConnAge = time.Duration(float64(cdnMaxAge) * rotateFraction)
+	return maxConnAge, cdnMaxAge - maxConnAge
+}
 
-	for {
-		// +1 for mux connection counter
-		counter <- struct{}{}
-
-		select {
-		case <-s.ctx.Done():
-			return
-
-		case <-rotate:
-			<-counter // hand back the slot reserved above; no connection used it
-			rotate = nil
-
-			// Make before break: order the replacement, but keep serving on this
-			// connection until it is actually up. That is the point of waiting -
-			// if the client cannot dial (edge IP blackholed, CDN refusing the
-			// upgrade) an aging connection still carries traffic until the CDN
-			// resets it, while a closed one carries nothing.
-			replaced = make(chan struct{})
-			go func(ch chan struct{}, g *wsGeneration) {
-				if s.awaitReplacement(g, session) {
-					close(ch)
-				}
-			}(replaced, s.gen)
-			continue
-
-		case <-replaced:
-			<-counter // hand back the slot reserved above; no connection used it
-			atomic.AddInt32(&s.sessionCounter, -1)
-			s.retireSession(session)
-			return
-
-		case incomingConn := <-s.localChannel:
-			if time.Now().UnixMilli()-incomingConn.timeCreated > 3000 { // 3000ms
-				s.logger.Debugf("timeouted local connection: %d ms", time.Now().UnixMilli()-incomingConn.timeCreated)
-				incomingConn.conn.Close()
-
-				// Decrement the counter
-				atomic.AddInt32(&s.streamCounter, -1)
-				<-counter
-				continue
-			}
-
-			stream, err := session.OpenStream()
-			if err != nil {
-				s.handleSessionError(&incomingConn, err)
-				return
-			}
-
-			var flowID uint64
-			var promotable bool
-
-			if s.config.MuxVersion >= 2 && s.config.PromoteBytes > 0 {
-				// Always promotable, so it keeps FlowPlain (legacy full-close):
-				// only dispatchPlain's non-promotable flows use FlowPlainHC (plan 024).
-				promotable = true
-				flowID = uint64(time.Now().UnixNano())
-				if err := utils.SendFlowPlain(stream, flowID, incomingConn.remoteAddr); err != nil {
-					s.logger.Tracef("failed to send plain flow header: %v", err)
-					stream.Close()
-					select {
-					case s.localChannel <- incomingConn:
-					default:
-						incomingConn.conn.Close()
-						atomic.AddInt32(&s.streamCounter, -1)
-					}
-					<-counter
-					continue
-				}
-			} else {
-				// Send the target port over the tunnel connection (legacy mode)
-				if err := utils.SendBinaryString(stream, incomingConn.remoteAddr); err != nil {
-					s.logger.Tracef("failed to send address over stream: %v", err)
-					// Close the stream that never served traffic - leaving it open
-					// leaks the smux stream. Requeue non-blocking (a full
-					// localChannel would otherwise park this goroutine forever and
-					// permanently burn a MuxCon slot), dropping the conn if full.
-					stream.Close()
-					select {
-					case s.localChannel <- incomingConn:
-					default:
-						incomingConn.conn.Close()
-						atomic.AddInt32(&s.streamCounter, -1)
-					}
-					<-counter // release the mux slot reserved at the top of the loop
-					continue
-				}
-			}
-
-			// Handle data exchange between connections
-			go func() {
-				if promotable {
-					s.dispatchPromotable(s.gen, incomingConn.conn, stream, flowID, incomingConn.remoteAddr)
-				} else {
-					handlers.TCPConnectionHandler(s.ctx, s.config.ProxyProtocol, incomingConn.conn, stream, s.logger, s.usageMonitor, incomingConn.conn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
-				}
-				atomic.AddInt32(&s.streamCounter, -1)
-				<-counter // read signal from the channel
-			}()
-		}
-	}
+// rotateAge is one connection's jittered retirement age; the connections of the
+// initial pool are dialled together, so a fixed age would rotate them in lockstep.
+func rotateAge(base time.Duration) time.Duration {
+	return utils.JitterFraction(base, rotateJitter)
 }
 
 // rotateRetryInterval is how long rotation waits before re-checking for the
 // replacement connection it asked for. Deliberately unhurried: the connection
 // is only aging, and the client may be unable to dial at all for minutes.
 const rotateRetryInterval = 30 * time.Second
+
+// retireSettle is the pause before a drained session is actually closed, so a
+// stream opened by a flow that picked the session just before it was retired is
+// seen and drained instead of cut.
+const retireSettle = 200 * time.Millisecond
 
 // requestReplacement asks the client to bring up one more pool connection.
 func (s *WsMuxTransport) requestReplacement() {
@@ -160,15 +71,15 @@ func (s *WsMuxTransport) requestReplacement() {
 // ends. That buys such a flow the whole window up to the CDN's hard limit; the
 // limit itself is not something client-side code can extend.
 //
-// max_drain bounds that wait: once it elapses the session is given up on and the
+// The drain cap bounds that wait: once it elapses the session is given up on and the
 // caller closes it, cutting whatever streams are still on it. It only ever runs
 // after the replacement has joined the pool, so it never shrinks the pool - a
 // failed replacement dial keeps the aging session in service (awaitReplacement)
 // and never reaches here.
 func (s *WsMuxTransport) retireSession(session *smux.Session) {
-	s.logger.Debugf("retiring pool session at max_conn_age, %d live stream(s) to drain", session.NumStreams())
+	s.logger.Debugf("retiring pool session at its rotation age, %d live stream(s) to drain", session.NumStreams())
 
-	// A nil channel (max_drain = 0) blocks forever in the select: drain unbounded.
+	// A nil channel (no drain cap) blocks forever in the select: drain unbounded.
 	var deadline <-chan time.Time
 	if s.config.MaxDrain > 0 {
 		t := time.NewTimer(s.config.MaxDrain)
@@ -186,14 +97,24 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 			return
 		}
 		if session.NumStreams() == 0 {
-			s.logger.Debug("retired pool session drained, closing")
-			return
+			// A flow placed on this session just before it left the registry may
+			// not have registered its stream yet (selection and OpenStream are not
+			// atomic); give it a moment to show up rather than closing under it.
+			select {
+			case <-s.ctx.Done():
+				return
+			case <-time.After(retireSettle):
+			}
+			if session.NumStreams() == 0 {
+				s.logger.Debug("retired pool session drained, closing")
+				return
+			}
 		}
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-deadline:
-			s.logger.Debugf("retired pool session still has %d stream(s) after max_drain (%s), closing", session.NumStreams(), s.config.MaxDrain)
+			s.logger.Debugf("retired pool session still has %d stream(s) after the drain cap (%s), closing", session.NumStreams(), s.config.MaxDrain)
 			return
 		case <-ticker.C:
 		}
@@ -201,7 +122,7 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 }
 
 // rotateStripedSession is the striped path's equivalent of the rotation branch
-// in handleSession: at max_conn_age the session is pulled out of the leg pool
+// in handleSession: at its rotation age the session is pulled out of the leg pool
 // so no new stripe legs land on it, then drained and closed. The sessionCounter
 // decrement is left to the CloseChan watcher registered in handleLoop.
 //
@@ -209,7 +130,7 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 // unregistering it only stops new legs landing on it, so a restart during the
 // drain still closes it.
 func (s *WsMuxTransport) rotateStripedSession(g *wsGeneration, session *smux.Session) {
-	rotateTimer := time.NewTimer(utils.JitterDuration(s.config.MaxConnAge))
+	rotateTimer := time.NewTimer(rotateAge(s.config.MaxConnAge))
 	defer rotateTimer.Stop()
 
 	select {
@@ -274,7 +195,7 @@ func (s *WsMuxTransport) awaitReplacement(g *wsGeneration, session *smux.Session
 
 	// ponytail: poll the registry instead of signalling admissions to whoever is
 	// waiting. Rotation is not latency-sensitive - a second either way is noise
-	// against a max_conn_age measured in minutes.
+	// against a rotation age measured in minutes.
 	pollEvery := s.rotatePoll
 	if pollEvery <= 0 {
 		pollEvery = rotatePollEvery
@@ -362,28 +283,4 @@ func (s *WsMuxTransport) retireIfReplaced(old *smux.Session, seen map[*smux.Sess
 		return true
 	}
 	return false
-}
-
-func (s *WsMuxTransport) handleSessionError(incomingConn *LocalTCPConn, err error) {
-	s.logger.Tracef("failed to handle session: %v", err)
-
-	// decrease session value
-	atomic.AddInt32(&s.sessionCounter, -1)
-
-	// Put local connection back to local channel (non-blocking): a blocking
-	// send on a full localChannel would park this goroutine forever, and the
-	// caller returns right after this - leaking the session and its counter slot.
-	select {
-	case s.localChannel <- *incomingConn:
-	default:
-		incomingConn.conn.Close()
-		atomic.AddInt32(&s.streamCounter, -1)
-	}
-
-	// Attempt to request a new connection
-	select {
-	case s.reqNewConnChan <- struct{}{}:
-	default:
-		s.logger.Warn("request new connection channel is full")
-	}
 }

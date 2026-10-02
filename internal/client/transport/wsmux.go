@@ -188,6 +188,10 @@ type WsMuxTransport struct {
 	pendingDials    int32
 	loadConnections int32
 	controlFlow     chan struct{}
+	// lastShrink is when a pool shrink last queued a controlFlow token (unix
+	// nanos). A token only cancels the SG_Chan that follows the shrink closely;
+	// see swallowChanSignal.
+	lastShrink int64
 	// userAgent is picked once per process instead of per dial, so a single
 	// client identity doesn't show up with a different browser signature on
 	// every pool connection/reconnect - a pattern no real browser produces.
@@ -501,6 +505,7 @@ func (c *WsMuxTransport) Restart() {
 	atomic.StoreInt32(&c.pendingDials, 0)
 	atomic.StoreInt32(&c.loadConnections, 0)
 	c.controlFlow = make(chan struct{}, 100)
+	atomic.StoreInt64(&c.lastShrink, 0)
 
 	c.closeStripeGroups()
 	c.promotableFlowsMu.Lock()
@@ -693,6 +698,7 @@ func (c *WsMuxTransport) poolMaintainer() {
 
 				// send a signal to controlFlow; a full channel must not keep
 				// this worker (and so a restart) waiting once cancelled
+				markShrink(&c.lastShrink)
 				select {
 				case c.controlFlow <- struct{}{}:
 				case <-ctx.Done():
@@ -778,10 +784,9 @@ func (c *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 			switch msg {
 			case utils.SG_Chan:
 				atomic.AddInt32(&c.loadConnections, 1)
-				select {
-				case <-c.controlFlow: // Do nothing
-
-				default:
+				if c.swallowChanSignal() {
+					c.logger.Debug("channel signal absorbed by a recent pool shrink")
+				} else {
 					c.logger.Debug("channel signal received, initiating tunnel dialer")
 					g.start(c.tunnelDialer)
 				}
@@ -809,6 +814,12 @@ func (c *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 
 		}
 	}
+}
+
+// swallowChanSignal reports whether this SG_Chan should be ignored because a
+// recent shrink queued a token for it (see swallowShrinkToken).
+func (c *WsMuxTransport) swallowChanSignal() bool {
+	return swallowShrinkToken(c.controlFlow, &c.lastShrink)
 }
 
 // controlReconnectWindow bounds how long a dropped control channel is re-dialled

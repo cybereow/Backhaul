@@ -15,9 +15,11 @@ import (
 // CDNs) and an EWMA round-trip estimate maintained by probeSessionRTT.
 type pooledSession struct {
 	session   *smux.Session
-	halfClose bool         // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
-	cdn       string       // CDN identity: the remote IP the pool connection arrived from
-	rtt       atomic.Int64 // EWMA round-trip in nanoseconds; 0 until the first probe lands
+	halfClose bool          // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
+	cdn       string        // CDN identity: the remote IP the pool connection arrived from
+	rtt       atomic.Int64  // EWMA round-trip in nanoseconds; 0 until the first probe lands
+	born      time.Time     // when the session was admitted
+	maxAge    time.Duration // rotation age (0 = no rotation, so no age preference)
 
 	// pendingOpens counts plain-leg OpenStreams that have picked this session but
 	// not yet returned (see openPlainLegPS). It is guarded by
@@ -55,7 +57,7 @@ const (
 // registerSession adds a pool session to the live registry and returns its
 // wrapper so the caller can start probing it. unregisterSession removes it.
 func (s *WsMuxTransport) registerSession(session *smux.Session, halfClose bool) *pooledSession {
-	ps := &pooledSession{session: session, halfClose: halfClose, cdn: cdnKey(session.RemoteAddr())}
+	ps := &pooledSession{session: session, halfClose: halfClose, cdn: cdnKey(session.RemoteAddr()), born: time.Now(), maxAge: s.config.MaxConnAge}
 	s.sessionsMu.Lock()
 	s.sessions = append(s.sessions, ps)
 	s.sessionsMu.Unlock()
@@ -115,7 +117,36 @@ func cdnKey(addr net.Addr) string {
 // load (open streams on the session) with the measured RTT so selection favours
 // the least-loaded, lowest-latency connection.
 func legScore(ps *pooledSession) float64 {
-	return legScoreValue(ps.session.NumStreams(), ps.rtt.Load())
+	return agedScore(legScoreValue(ps.session.NumStreams(), ps.rtt.Load()), ps)
+}
+
+// ageWeight is how much a session's cost grows from birth to its rotation age: at
+// retirement it costs (1+ageWeight)x a fresh one, all else equal.
+const ageWeight = 0.5
+
+// ageFactor is 1 for a fresh session, rising linearly to 1+ageWeight at its
+// rotation age. A flow is pinned to its session (smux cannot migrate a stream),
+// so one that lands on an old session loses the time that session has left;
+// preferring young sessions gives long-lived flows (SSH, a big download) the
+// most of the CDN's connection lifetime. It is a mild bias, not a rule: load and
+// RTT still dominate, so it never concentrates flows on one session. No rotation
+// age means no preference.
+func ageFactor(age, maxAge time.Duration) float64 {
+	if maxAge <= 0 || age <= 0 {
+		return 1
+	}
+	frac := float64(age) / float64(maxAge)
+	if frac > 1 {
+		frac = 1
+	}
+	return 1 + ageWeight*frac
+}
+
+func agedScore(base float64, ps *pooledSession) float64 {
+	if ps.maxAge <= 0 {
+		return base
+	}
+	return base * ageFactor(time.Since(ps.born), ps.maxAge)
 }
 
 // legScoreValue is the pure scoring math, split out from legScore so it can be
@@ -332,7 +363,7 @@ func (s *WsMuxTransport) releasePlainLeg(ps *pooledSession) {
 // (it never reserves); a new placement mode that shares sessions with plain
 // flows must add pendingOpens too, or it can burst onto one session.
 func placementScore(ps *pooledSession) float64 {
-	return legScoreValue(ps.session.NumStreams()+ps.pendingOpens, ps.rtt.Load())
+	return agedScore(legScoreValue(ps.session.NumStreams()+ps.pendingOpens, ps.rtt.Load()), ps)
 }
 
 // bestPerCDN returns the best-scoring session for each distinct CDN, so an

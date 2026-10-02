@@ -259,3 +259,29 @@ func TestControlReconnectWaitsForOldHandler(t *testing.T) {
 	close(oldDone)
 	waitFor(t, "re-dial after the old handler finished", func() bool { return countLogs(hook, "control channel re-dial") >= 1 })
 }
+
+// A shrink token absorbs the SG_Chan right after the shrink, but a stale one must
+// not eat a later request (the server's rotation request for a replacement).
+func TestSwallowChanSignal(t *testing.T) {
+	c := &WsMuxTransport{controlFlow: make(chan struct{}, 100)}
+	if c.swallowChanSignal() {
+		t.Fatal("swallowed with no token")
+	}
+
+	c.controlFlow <- struct{}{}
+	atomic.StoreInt64(&c.lastShrink, time.Now().UnixNano())
+	if !c.swallowChanSignal() {
+		t.Fatal("fresh token not honoured")
+	}
+
+	for i := 0; i < 3; i++ {
+		c.controlFlow <- struct{}{}
+	}
+	atomic.StoreInt64(&c.lastShrink, time.Now().Add(-2*shrinkTokenTTL).UnixNano())
+	if c.swallowChanSignal() {
+		t.Fatal("stale token swallowed a request")
+	}
+	if len(c.controlFlow) != 0 {
+		t.Fatalf("stale tokens left behind: %d", len(c.controlFlow))
+	}
+}

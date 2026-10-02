@@ -91,3 +91,39 @@ func TestFlowPlainHCHeader(t *testing.T) {
 	assert.Equal(t, uint64(0), flowID)
 	assert.Equal(t, addr, gotAddr)
 }
+
+func TestFlowResumableAndAttachRoundTrip(t *testing.T) {
+	// FlowResumable carries the FlowPlain layout under its own kind.
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	go func() { SendFlowResumable(a, 0xdeadbeefcafe, "127.0.0.1:22") }()
+	kind, err := ReadFlowKind(b)
+	assert.NoError(t, err)
+	assert.Equal(t, FlowResumable, kind)
+	id, addr, err := ReceiveFlowResumable(b)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(0xdeadbeefcafe), id)
+	assert.Equal(t, "127.0.0.1:22", addr)
+
+	go func() { SendFlowAttach(a, 42, AttachDrained, 0) }()
+	kind, err = ReadFlowKind(b)
+	assert.NoError(t, err)
+	assert.Equal(t, FlowAttach, kind)
+	id, mode, flags, err := ReceiveFlowAttach(b)
+	assert.NoError(t, err)
+	assert.Equal(t, uint64(42), id)
+	assert.Equal(t, AttachDrained, mode)
+	assert.Equal(t, byte(0), flags)
+
+	go func() { WriteAttachVerdict(b, false, AttachRejectBusy) }()
+	accept, reason, err := ReadAttachVerdict(a)
+	assert.NoError(t, err)
+	assert.False(t, accept)
+	assert.Equal(t, AttachRejectBusy, reason)
+	go func() { WriteAttachVerdict(b, true, 99) }()
+	accept, reason, err = ReadAttachVerdict(a)
+	assert.NoError(t, err)
+	assert.True(t, accept)
+	assert.Equal(t, byte(0), reason, "an accept carries no reason")
+}

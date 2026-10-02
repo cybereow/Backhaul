@@ -418,6 +418,10 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 		halfClose := s.config.MuxVersion >= 2 && !promotable && ps.halfClose
 		var streamConn net.Conn = stream
 
+		// A resumable flow (cdn_max_age set) can be moved to another session when
+		// its own is retired; it takes the envelope and the swapper pump instead.
+		resumable := s.resumable(promotable)
+
 		// The header write shares the setup's expiry, and the deadline is cleared
 		// before the stream carries data.
 		_ = stream.SetWriteDeadline(a.expiry)
@@ -428,7 +432,10 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 				flowID = uint64(time.Now().UnixNano())
 			}
 			send := utils.SendFlowPlain
-			if halfClose {
+			if resumable {
+				flowID = newFlowID()
+				send = utils.SendFlowResumable
+			} else if halfClose {
 				send = utils.SendFlowPlainHC
 				streamConn = handlers.NewHalfCloseConn(stream)
 			}
@@ -458,7 +465,9 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 
 		defer atomic.AddInt32(&s.plainFlows, -1)
 		defer atomic.AddInt32(&s.streamCounter, -1)
-		if promotable {
+		if resumable {
+			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID)
+		} else if promotable {
 			// dispatchPromotable blocks until the flow (and any mid-stream
 			// promotion) completes, so the counters above are released only when
 			// the flow is truly done.

@@ -64,6 +64,13 @@ type PumpSwapper struct {
 	dlBytes atomic.Uint64 // payload bytes delivered to the app, from the start of the flow
 	done    chan struct{}
 
+	// What Start needs.
+	ctx        context.Context
+	usage      *web.Usage
+	remotePort int
+	sniffer    bool
+	startOnce  sync.Once
+
 	mu  sync.Mutex
 	cur net.Conn // tunnel in service; replaced when a swap completes
 
@@ -158,34 +165,68 @@ func (p *PumpSwapper) Abort() {
 }
 
 // PromotablePump replaces io.CopyBuffer with a custom loop for promotable flows.
+// It is NewPromotablePump followed by Start.
 func PromotablePump(
 	ctx context.Context, proxyProtocol bool, app net.Conn, tunnel net.Conn,
 	logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool,
 ) *PumpSwapper {
+	p := NewPromotablePump(ctx, proxyProtocol, app, tunnel, logger, usage, remotePort, sniffer)
+	if p != nil {
+		p.Start()
+	}
+	return p
+}
+
+// NewPromotablePump builds the swapper without running it, so the caller can
+// publish it (for a peer's attach to find) before any byte moves, and then call
+// Start. Nil means the PROXY protocol header could not be written and the flow's
+// conns are already closed.
+func NewPromotablePump(
+	ctx context.Context, proxyProtocol bool, app net.Conn, tunnel net.Conn,
+	logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool,
+) *PumpSwapper {
+	p := &PumpSwapper{
+		app:        app,
+		cur:        tunnel,
+		done:       make(chan struct{}),
+		upAck:      make(chan struct{}),
+		installCh:  make(chan struct{}),
+		abortCh:    make(chan struct{}),
+		ctx:        ctx,
+		usage:      usage,
+		remotePort: remotePort,
+		sniffer:    sniffer,
+	}
 
 	if proxyProtocol {
-		// Written before any pump runs and counted by neither offset: it is not
-		// payload and must never be replayed on a later tunnel.
-		if err := WriteProxyProtocol(app, tunnel); err != nil {
+		// The header travels the tunnel like any byte and the peer delivers it to
+		// its app, so it is payload: it counts in UpBytes, or the count exchanged
+		// at a swap would be short by its length and the peer would switch early.
+		header, err := ProxyProtocolHeader(app.RemoteAddr(), tunnel.RemoteAddr())
+		if err == nil {
+			var w int
+			w, err = writeFull(tunnel, header)
+			p.upBytes.Add(uint64(w))
+		}
+		if err != nil {
 			logger.Error(err)
 			app.Close()
 			tunnel.Close()
 			return nil
 		}
 	}
+	return p
+}
 
-	p := &PumpSwapper{
-		app:       app,
-		cur:       tunnel,
-		done:      make(chan struct{}),
-		upAck:     make(chan struct{}),
-		installCh: make(chan struct{}),
-		abortCh:   make(chan struct{}),
-	}
+// Start runs the two pumps. Idempotent.
+func (p *PumpSwapper) Start() {
+	p.startOnce.Do(p.start)
+}
 
+func (p *PumpSwapper) start() {
 	go func() {
 		select {
-		case <-ctx.Done():
+		case <-p.ctx.Done():
 			p.Abort()
 		case <-p.done:
 		}
@@ -197,19 +238,19 @@ func PromotablePump(
 	// App -> Tunnel (Upload direction relative to the tunnel's writes)
 	go func() {
 		defer wg.Done()
-		p.pumpAppToTunnel(usage, remotePort, sniffer)
+		p.pumpAppToTunnel(p.usage, p.remotePort, p.sniffer)
 	}()
 
 	// Tunnel -> App (Download direction relative to the tunnel's reads)
 	go func() {
 		defer wg.Done()
-		p.pumpTunnelToApp(usage, remotePort, sniffer)
+		p.pumpTunnelToApp(p.usage, p.remotePort, p.sniffer)
 	}()
 
 	go func() {
 		wg.Wait()
 		close(p.done)
-		app.Close()
+		p.app.Close()
 		p.mu.Lock()
 		cur, next := p.cur, p.next
 		p.mu.Unlock()
@@ -220,8 +261,15 @@ func PromotablePump(
 			next.Close()
 		}
 	}()
+}
 
-	return p
+// Swappable reports whether a swap could be started right now: the flow is not
+// aborted or finished and no swap is in progress. It is a hint for answering an
+// attach before anything freezes, not a reservation: FreezeUp still decides.
+func (p *PumpSwapper) Swappable() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.aborted && !p.freezeReq && !(p.upEnded && p.dlEnded)
 }
 
 // FreezeUp stops the upload direction at a write boundary and returns the final
@@ -530,12 +578,16 @@ func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer 
 				continue
 			}
 
-			// The stream ended. If our upload is already frozen this is the peer
-			// releasing its old tunnel after its own transition, which can overtake
-			// our Install: the promised count is not known yet, so decide once it
-			// is. Otherwise this direction is over.
+			// The stream ended or failed. If our upload is already frozen this is
+			// the peer releasing its old tunnel after its own transition, which can
+			// overtake our Install: the promised count is not known yet, so decide
+			// once it is. It need not look like a clean EOF: a peer that closes an
+			// enveloped tunnel without an END surfaces as an error (unexpected EOF,
+			// or its ABORT). A genuinely failed tunnel still ends the flow: the
+			// handshake that is waiting for the Install is itself bounded. Otherwise
+			// this direction is over.
 			p.mu.Lock()
-			waitInstall := !p.installed && p.frozen && err == io.EOF
+			waitInstall := !p.installed && p.frozen
 			installCh := p.installCh
 			p.mu.Unlock()
 			if waitInstall {

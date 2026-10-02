@@ -77,12 +77,20 @@ func (s *WsMuxTransport) requestReplacement() {
 // failed replacement dial keeps the aging session in service (awaitReplacement)
 // and never reaches here.
 func (s *WsMuxTransport) retireSession(session *smux.Session) {
+	s.retireSessionWithin(session, s.config.MaxDrain)
+}
+
+// retireSessionWithin is retireSession with the drain budget given explicitly
+// (0 = unbounded): rotation spends part of the configured cap moving flows off the
+// session first and drains only for what is left, so the whole retirement still
+// ends inside max_drain.
+func (s *WsMuxTransport) retireSessionWithin(session *smux.Session, budget time.Duration) {
 	s.logger.Debugf("retiring pool session at its rotation age, %d live stream(s) to drain", session.NumStreams())
 
 	// A nil channel (no drain cap) blocks forever in the select: drain unbounded.
 	var deadline <-chan time.Time
-	if s.config.MaxDrain > 0 {
-		t := time.NewTimer(s.config.MaxDrain)
+	if budget > 0 {
+		t := time.NewTimer(budget)
 		defer t.Stop()
 		deadline = t.C
 	}
@@ -114,17 +122,19 @@ func (s *WsMuxTransport) retireSession(session *smux.Session) {
 		case <-s.ctx.Done():
 			return
 		case <-deadline:
-			s.logger.Debugf("retired pool session still has %d stream(s) after the drain cap (%s), closing", session.NumStreams(), s.config.MaxDrain)
+			s.logger.Debugf("retired pool session still has %d stream(s) after the drain cap (%s), closing", session.NumStreams(), budget)
 			return
 		case <-ticker.C:
 		}
 	}
 }
 
-// rotateStripedSession is the striped path's equivalent of the rotation branch
-// in handleSession: at its rotation age the session is pulled out of the leg pool
-// so no new stripe legs land on it, then drained and closed. The sessionCounter
-// decrement is left to the CloseChan watcher registered in handleLoop.
+// rotateStripedSession runs the rotation of one pool session, striped or not
+// (the name is historical: every pool session is rotated through here, from
+// handleLoop). At its rotation age the session waits for a replacement, is pulled
+// out of the leg pool so nothing new lands on it, has its resumable flows moved to
+// other sessions, and is then drained and closed. The sessionCounter decrement is
+// left to the CloseChan watcher registered in handleLoop.
 //
 // The session stays owned by the generation (see wsGeneration) while it drains:
 // unregistering it only stops new legs landing on it, so a restart during the
@@ -150,7 +160,25 @@ func (s *WsMuxTransport) rotateStripedSession(g *wsGeneration, session *smux.Ses
 		return
 	}
 
-	s.retireSession(session)
+	// Move the resumable flows off first: they would otherwise be pinned to this
+	// session until the CDN cuts it. Moving them and draining share the one
+	// max_drain budget.
+	start := time.Now()
+	budget := s.config.MaxDrain
+	mctx := g.ctx
+	if budget > 0 {
+		var cancel context.CancelFunc
+		mctx, cancel = context.WithTimeout(g.ctx, budget)
+		defer cancel()
+	}
+	s.migrateFlowsOff(mctx, session)
+	if budget > 0 {
+		if budget -= time.Since(start); budget < time.Millisecond {
+			budget = time.Millisecond
+		}
+	}
+
+	s.retireSessionWithin(session, budget)
 	session.Close()
 }
 

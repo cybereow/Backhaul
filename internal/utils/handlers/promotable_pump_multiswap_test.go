@@ -331,6 +331,12 @@ func runRandomSwaps(t *testing.T, seed int64, enveloped, replay bool) {
 	if gotA.err != nil || !bytes.Equal(gotA.data, toA) {
 		t.Fatalf("B->A: got %d bytes err=%v, want %d", len(gotA.data), gotA.err, len(toA))
 	}
+	defer func() {
+		if t.Failed() {
+			dumpPump(t, "A", A.pump)
+			dumpPump(t, "B", B.pump)
+		}
+	}()
 	waitDone(t, A.pump, "A")
 	waitDone(t, B.pump, "B")
 	if A.pump.UpBytes() != uint64(len(toB)) || B.pump.DlBytes() != uint64(len(toB)) ||

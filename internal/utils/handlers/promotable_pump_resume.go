@@ -267,6 +267,9 @@ func (p *PumpSwapper) ResumeBegin(ctx context.Context) (uint64, error) {
 // when peerRecv cannot be right (beyond what was sent, or older than the replay
 // ring retains); a failure of the tunnel itself leaves the flow suspended.
 func (p *PumpSwapper) ResumeFinish(tunnel net.Conn, peerRecv uint64) error {
+	if _, ok := tunnel.(ackConn); !ok {
+		return errTunnelNoAcks
+	}
 	p.mu.Lock()
 	if p.aborted || !p.suspended {
 		p.mu.Unlock()

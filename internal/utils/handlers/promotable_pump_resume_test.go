@@ -323,3 +323,49 @@ func dumpPump(t *testing.T, n string, p *PumpSwapper) {
 		t.Logf("%s: ring=%d endAcked=%v endAckSent=%v ackSent=%d busy=%v", n, r.ring.len(), r.endAcked.Load(), r.endAckSent.Load(), r.ackSent.Load(), r.ackBusy.Load())
 	}
 }
+
+// A replay flow refuses a replacement tunnel that cannot carry ACK records: it
+// would run until its ring filled and then stall for good.
+func TestReplayRefusesTunnelWithoutAcks(t *testing.T) {
+	ctx, _ := testCtx(t)
+	_, a0, b0 := newRawTunnel(t)
+	A, _ := newResumableEnd(t, ctx, a0), newResumableEnd(t, ctx, b0)
+	plain, _ := tcpConnPair(t)
+	if err := A.pump.Install(plain, 0); err == nil {
+		t.Fatal("Install accepted a tunnel without ACK support")
+	}
+	A.pump.Suspend()
+	if err := A.pump.ResumeFinish(plain, 0); err == nil {
+		t.Fatal("ResumeFinish accepted a tunnel without ACK support")
+	}
+}
+
+// A freeze that finds the replay ring full does not push the ring past its limit:
+// the read it was holding is sent after the swap, and nothing is lost or repeated.
+func TestReplayRingStaysBoundedAcrossSwaps(t *testing.T) {
+	const limit = 256 << 10
+	ctx, _ := testCtx(t)
+	a0, b0 := tunnelPair(t, true)
+	// B never acknowledges by itself (no replay), so A's ring fills.
+	A := newReplayFlowEnd(t, ctx, a0, limit)
+	B := newFlowEnd(t, ctx, b0)
+
+	up := genPayload(6 * limit)
+	go A.user.Write(up)
+	deadline := time.Now().Add(hcTestTimeout)
+	for A.pump.ReplayLen() < limit-64<<10 {
+		if time.Now().After(deadline) {
+			t.Fatalf("ring never filled (%d)", A.pump.ReplayLen())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	for i := 0; i < 4; i++ {
+		if err := swapTunnelWith(t, ctx, A.pump, B.pump, true); err != nil {
+			t.Fatalf("swap %d: %v", i, err)
+		}
+		if got := A.pump.ReplayLen(); got > limit {
+			t.Fatalf("after swap %d the ring holds %d bytes, over its limit %d", i, got, limit)
+		}
+	}
+	_ = B
+}

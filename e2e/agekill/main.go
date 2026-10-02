@@ -12,6 +12,10 @@
 //
 //	go build -o /tmp/backhaul . && go run ./e2e/agekill -bin /tmp/backhaul -cdn 30 -rot 30 -dur 120
 //
+// To see level B (no planned move at all), set -rot far above -cdn so that no
+// rotation ever fires before the cut: flows are resumable but only resume after the
+// cut, e.g. -cdn 30 -rot 3600; -resume -1 turns resume off for comparison.
+//
 // Not part of CI: a meaningful run takes minutes (cdn_max_age has a 30s floor).
 package main
 
@@ -36,6 +40,7 @@ var (
 	base   = flag.Int("base", 20000, "port base")
 	tr     = flag.String("tr", "wsmux", "transport")
 	label  = flag.String("label", "", "")
+	resume = flag.Int("resume", 0, "server resume_window in seconds (0 = default 30, -1 = off); only with -rot")
 )
 
 func echo(l net.Listener) {
@@ -81,7 +86,7 @@ func main() {
 
 	rotLine := ""
 	if *rot > 0 {
-		rotLine = fmt.Sprintf("cdn_max_age = %d\n", *rot)
+		rotLine = fmt.Sprintf("cdn_max_age = %d\nresume_window = %d\n", *rot, *resume)
 	}
 	os.WriteFile(filepath.Join(dir, "s.toml"), []byte(fmt.Sprintf(`[server]
 bind_addr = "127.0.0.1:%d"

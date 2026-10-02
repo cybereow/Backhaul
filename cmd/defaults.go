@@ -40,6 +40,9 @@ const ( // Default values
 // minCDNMaxAge is the smallest cdn_max_age honoured, in seconds.
 const minCDNMaxAge = 30
 
+// defaultResumeWindow is the resume_window in seconds when none is set.
+const defaultResumeWindow = 30
+
 func applyDefaults(cfg *config.Config) {
 	// Token is intentionally not defaulted - see cmd.Run, which requires the
 	// active side to configure one explicitly.
@@ -160,6 +163,18 @@ func applyDefaults(cfg *config.Config) {
 	}
 	if cfg.Server.CDNMaxAge > 0 && cfg.Server.CDNMaxAge < minCDNMaxAge {
 		cfg.Server.CDNMaxAge = minCDNMaxAge
+	}
+
+	// Resume (surviving a cut without warning) is on whenever flows are resumable
+	// at all; -1 turns it off. The value handed on is 0 = off.
+	switch {
+	case cfg.Server.CDNMaxAge == 0 || cfg.Server.ResumeWindow < 0:
+		cfg.Server.ResumeWindow = 0
+	case cfg.Server.ResumeWindow == 0:
+		cfg.Server.ResumeWindow = defaultResumeWindow
+	}
+	if cfg.Client.ResumeWindow <= 0 {
+		cfg.Client.ResumeWindow = defaultResumeWindow
 	}
 
 	// Stripe factor - how many pooled connections a single flow is split

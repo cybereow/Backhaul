@@ -57,10 +57,11 @@ type ServerConfig struct {
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
-	DNSDomain            string        `toml:"dns_domain"`  // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
-	DNSKey               string        `toml:"dns_key"`     // dnsmux: shared secret for the per-query MAC; falls back to token
-	DNSListen            string        `toml:"dns_listen"`  // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
-	CDNMaxAge            int           `toml:"cdn_max_age"` // seconds. The shortest max connection age among the CDNs/LBs in front of the server (e.g. 300). Pool connections are rotated make-before-break ahead of it, and retired ones drained, both derived from this one number (see transport.RotationPlan). 0 (default) disables rotation. Replaces max_conn_age/max_drain.
+	DNSDomain            string        `toml:"dns_domain"`    // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
+	DNSKey               string        `toml:"dns_key"`       // dnsmux: shared secret for the per-query MAC; falls back to token
+	DNSListen            string        `toml:"dns_listen"`    // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
+	ResumeWindow         int           `toml:"resume_window"` // seconds. wsmux/wssmux with cdn_max_age: how long a flow whose pool connection was cut WITHOUT warning waits to be resumed on another connection before it is dropped. Flows keep their unacknowledged data for this: a ring growing from 256 KiB to 16 MiB for flows that need it, within a 256 MiB process-wide budget. 0 (default) = 30 s; -1 = off (flows only survive the planned moves of cdn_max_age). Needs mux_version >= 2.
+	CDNMaxAge            int           `toml:"cdn_max_age"`   // seconds. The shortest max connection age among the CDNs/LBs in front of the server (e.g. 300). Pool connections are rotated make-before-break ahead of it, and retired ones drained, both derived from this one number (see transport.RotationPlan). 0 (default) disables rotation. Replaces max_conn_age/max_drain.
 }
 
 // ClientConfig represents the configuration for the client.
@@ -76,6 +77,7 @@ type ClientConfig struct {
 	Keepalive            int           `toml:"keepalive_period"`
 	LogLevel             string        `toml:"log_level"`
 	PPROF                bool          `toml:"pprof"`
+	ResumeWindow         int           `toml:"resume_window"` // seconds. wsmux/wssmux: how long a flow waits to be resumed after its connection was cut without warning. 0 (default) = 30 s. Only used for flows the server opened with resume support (see server.resume_window).
 	MuxSession           int           `toml:"mux_session"`
 	MuxVersion           int           `toml:"mux_version"`
 	MaxFrameSize         int           `toml:"mux_framesize"`

@@ -233,3 +233,33 @@ func TestReplayRingOverflowDoesNotDouble(t *testing.T) {
 		t.Fatalf("capacity %d after one byte past the limit, want %d", got, limit+1)
 	}
 }
+
+// A sender that finds its ring full asks for a bigger one, up to what the budget
+// allows, and not beyond.
+func TestReplayRingGrowsWhenFull(t *testing.T) {
+	ctx, _ := testCtx(t)
+	b := NewReplayBudget(1 << 20)
+	grant := b.Open(false)
+	a0, b0 := tunnelPair(t, true)
+	u, appc := tcpConnPair(t)
+	p := NewPromotablePump(ctx, false, appc, a0, testLogger(), testUsage(t), 0, false)
+	p.SetReplayGrower(grant.Grow)
+	if err := p.EnableReplay(grant.Limit()); err != nil {
+		t.Fatal(err)
+	}
+	p.Start()
+	_ = newFlowEnd(t, ctx, b0) // never acknowledges, so the ring only fills
+
+	go u.Write(genPayload(4 << 20))
+	deadline := time.Now().Add(hcTestTimeout)
+	for p.ReplayLen() < (1<<20)-(70<<10) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the ring stopped at %d bytes, want it near the budget (1 MiB)", p.ReplayLen())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := p.ReplayLen(); n > 1<<20 {
+		t.Fatalf("the ring holds %d bytes, over the budget", n)
+	}
+}

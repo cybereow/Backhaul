@@ -400,7 +400,16 @@ func (c *halfCloseConn) Write(p []byte) (int, error) {
 		return 0, nil
 	}
 	bp := hcBufPool.Get().(*[]byte)
-	defer hcBufPool.Put(bp)
+	// A failed Write may leave the buffer queued inside the stream's session (smux
+	// returns early when the session dies, while its send loop can still be copying
+	// from the buffer), so only a buffer whose every write completed goes back to
+	// the pool.
+	clean := true
+	defer func() {
+		if clean {
+			hcBufPool.Put(bp)
+		}
+	}()
 	buf := *bp
 	done := 0
 	for done < len(p) {
@@ -410,6 +419,7 @@ func (c *halfCloseConn) Write(p []byte) (int, error) {
 		copy(buf[hcHeaderLen:], p[done:done+n])
 		w, err := c.Conn.Write(buf[:hcHeaderLen+n])
 		if err != nil {
+			clean = false
 			err = c.writeErr(err)
 			if w > 0 {
 				// A partial record is on the wire: any further record would be

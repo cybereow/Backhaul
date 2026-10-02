@@ -101,16 +101,119 @@ func (s *WsMuxTransport) flowsOn(sess *smux.Session) []*resumableFlow {
 
 // dispatchResumable runs one resumable flow until it ends. The swapper is
 // registered before its pumps start, so a move can never find a half-built flow.
-func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64) {
+// With replayLimit > 0 the flow also keeps what it sent until acknowledged and is
+// resumed on another session if its own is cut without warning.
+func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, grant *handlers.ReplayGrant) {
+	defer grant.Release()
 	sw := handlers.NewPromotablePump(g.ctx, s.config.ProxyProtocol, appConn, handlers.NewHalfCloseConn(stream), s.logger, s.usageMonitor, appConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 	if sw == nil {
 		return // failed proxy protocol
+	}
+	if grant != nil {
+		// The client was told (by the flow's kind byte) that this flow keeps replay
+		// state, so a flow that cannot is not an option: end it.
+		sw.SetReplayGrower(grant.Grow)
+		if err := sw.EnableReplay(grant.Limit()); err != nil {
+			s.logger.Errorf("resumable flow %d: %v", flowID, err)
+			sw.Abort()
+			return
+		}
+		sw.SetResumeWindow(s.config.ResumeWindow)
 	}
 	f := &resumableFlow{id: flowID, sw: sw, sess: ps.session}
 	s.registerFlow(f)
 	defer s.unregisterFlow(flowID)
 	sw.Start()
+	if grant != nil {
+		go s.driveResume(g.ctx, f)
+	}
 	<-sw.DoneWait()
+}
+
+var errFlowGone = errors.New("the client no longer has this flow")
+
+// driveResume resumes the flow each time it is suspended (its stream or session
+// died without warning) by opening a stream on another live session and running
+// the resume handshake on it, until the flow ends. The flow aborts itself when its
+// resume window runs out, which ends this too.
+func (s *WsMuxTransport) driveResume(ctx context.Context, f *resumableFlow) {
+	for {
+		// A flow idle in a socket read performs no tunnel I/O that could fail, so its
+		// pumps may not notice its session died: watch the session too.
+		sess := f.session()
+		select {
+		case <-f.sw.SuspendedCh():
+		case <-sess.CloseChan():
+			if f.session() != sess {
+				continue // it was moved off this session meanwhile
+			}
+			if !f.sw.Suspend() {
+				return // finished, or cannot be resumed
+			}
+		case <-f.sw.DoneWait():
+			return
+		case <-ctx.Done():
+			return
+		}
+		backoff := 100 * time.Millisecond
+		started := time.Now()
+		for attempt := 1; ; attempt++ {
+			err := s.resumeOnce(ctx, f)
+			if err == nil {
+				s.logger.Debugf("flow %d resumed on another session after %v (%d attempt(s))", f.id, time.Since(started).Round(time.Millisecond), attempt)
+				break
+			}
+			if errors.Is(err, errFlowGone) {
+				f.sw.Abort()
+				return
+			}
+			select {
+			case <-f.sw.DoneWait():
+				return
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			if backoff < 2*time.Second {
+				backoff *= 2
+			}
+		}
+	}
+}
+
+// resumeOnce makes one attempt to resume a suspended flow on a fresh stream.
+func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow) error {
+	stream, ps, err := s.openPlainLegPS()
+	if err != nil {
+		return fmt.Errorf("%w: %v", errNoOtherSession, err)
+	}
+	_ = stream.SetDeadline(time.Now().Add(handlers.PromoteHandshakeTimeout))
+	if err := utils.SendFlowAttach(stream, f.id, utils.AttachResume, 0); err != nil {
+		stream.Close()
+		return err
+	}
+	accept, reason, err := utils.ReadAttachVerdict(stream)
+	if err != nil {
+		stream.Close()
+		return err
+	}
+	if !accept {
+		stream.Close()
+		if reason == utils.AttachRejectUnknownFlow {
+			return errFlowGone
+		}
+		return fmt.Errorf("%w (reason %d)", errAttachRefused, reason)
+	}
+	_ = stream.SetDeadline(time.Time{})
+
+	err = f.sw.Resume(ctx, stream, func() (net.Conn, error) {
+		return handlers.NewHalfCloseConn(stream), nil
+	})
+	if err != nil {
+		return err
+	}
+	f.setSession(ps.session)
+	return nil
 }
 
 // migrateFlow moves one flow onto a fresh stream on another live session. The
@@ -167,7 +270,12 @@ const migrateParallel = 8
 // migrateFlowsOff moves every resumable flow off a session that is being retired.
 // It returns when all of them have been moved or given up on; ctx bounds it.
 func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session) {
-	flows := s.flowsOn(old)
+	var flows []*resumableFlow
+	for _, f := range s.flowsOn(old) {
+		if f.sw.Swappable() { // a flow already suspended or being moved is not ours to move
+			flows = append(flows, f)
+		}
+	}
 	if len(flows) == 0 {
 		return
 	}

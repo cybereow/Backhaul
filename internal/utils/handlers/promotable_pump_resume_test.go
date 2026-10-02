@@ -398,3 +398,34 @@ func TestReplayRingStaysBoundedAcrossSwaps(t *testing.T) {
 		}
 	}
 }
+
+// The PROXY header is payload the peer may not have received when the tunnel dies:
+// the sender keeps it for replay, and the flow resumes with the header intact.
+func TestResumeReplaysProxyHeader(t *testing.T) {
+	const limit = 256 << 10
+	ctx, _ := testCtx(t)
+	rt, a0, b0 := newRawTunnel(t)
+	u, appc := tcpConnPair(t)
+	A := NewPromotablePump(ctx, true, appc, a0, testLogger(), testUsage(t), 0, false)
+	if A == nil {
+		t.Fatal("NewPromotablePump returned nil")
+	}
+	if err := A.EnableReplay(limit); err != nil {
+		t.Fatal(err)
+	}
+	A.Start()
+	B := newResumableEnd(t, ctx, b0)
+	header, err := ProxyProtocolHeader(appc.RemoteAddr(), a0.RemoteAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rt.cut() // before B has necessarily read the header
+	resumeBoth(t, ctx, A, B.pump)
+	msg := genPayload(5000)
+	u.Write(msg)
+	got := readExact(t, B.user, len(header)+len(msg))
+	if !bytes.Equal(got[:len(header)], header) || !bytes.Equal(got[len(header):], msg) {
+		t.Fatal("the header or the payload after the resume differs")
+	}
+}

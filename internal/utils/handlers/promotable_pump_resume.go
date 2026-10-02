@@ -220,6 +220,10 @@ func (p *PumpSwapper) parkDl() (src net.Conn, ok bool) {
 // replayTo sends dst every payload byte from flow offset from up to everything
 // the flow has read from its app, and records that as committed.
 func (p *PumpSwapper) replayTo(dst net.Conn, from uint64) error {
+	// A peer that stops reading must not hold the replay forever: a failure here
+	// suspends the flow again and the next attempt starts over.
+	_ = dst.SetWriteDeadline(time.Now().Add(PromoteHandshakeTimeout))
+	defer dst.SetWriteDeadline(time.Time{})
 	ring := p.replay.ring
 	end := ring.end()
 	bufPtr := copyBufferPool.Get().(*[]byte)
@@ -308,8 +312,9 @@ func (p *PumpSwapper) ResumeFinish(tunnel net.Conn, peerRecv uint64) error {
 		// No upload pump is left to replay and end the upload on the new tunnel.
 		err := p.replayTo(tunnel, peerRecv)
 		if err == nil {
-			closeWrite(tunnel)
-		} else if !p.Suspend() {
+			err = closeWriteErr(tunnel) // a lost END must be retried like lost data
+		}
+		if err != nil && !p.Suspend() {
 			p.Abort()
 		}
 		return err

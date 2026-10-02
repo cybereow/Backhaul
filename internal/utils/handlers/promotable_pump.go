@@ -69,9 +69,10 @@ type PumpSwapper struct {
 	done    chan struct{}
 
 	// Replay (level B): nil unless EnableReplay was called before Start.
-	replay     *replayState
-	freezeWake chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
-	upDst      net.Conn      // the tunnel the upload pump writes to (guarded by mu); acks go there too
+	replay      *replayState
+	freezeWake  chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
+	upDst       net.Conn      // the tunnel the upload pump writes to (guarded by mu); acks go there too
+	proxyHeader []byte        // the PROXY protocol header written before Start: payload that replay must retain
 
 	// What Start needs.
 	ctx        context.Context
@@ -245,6 +246,7 @@ func NewPromotablePump(
 			var w int
 			w, err = writeFull(tunnel, header)
 			p.upBytes.Add(uint64(w))
+			p.proxyHeader = header // a resume may have to send it again
 		}
 		if err != nil {
 			logger.Error(err)
@@ -632,7 +634,12 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				p.checkParkedLocked()
 				p.mu.Unlock()
 				if srcErr == io.EOF {
-					closeWrite(dst) // the upload's EOF goes to its destination
+					// The upload's EOF goes to its destination. If that fails on a
+					// flow that can resume, the resume sends it again (the upload is
+					// marked ended, so ResumeFinish replays and re-ends it).
+					if err := closeWriteErr(dst); err != nil && p.replay != nil {
+						p.Suspend()
+					}
 				} else {
 					p.Abort()
 				}
@@ -866,7 +873,9 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 		return errors.New("replay needs a tunnel that carries ACK records")
 	}
 	ring := newReplayRing(limit)
-	ring.base = p.upBytes.Load() // a proxy header already written is not retained, but is counted
+	if len(p.proxyHeader) > 0 {
+		ring.append(p.proxyHeader) // already written, and counted in UpBytes: keep it until the peer has it
+	}
 	p.replay = &replayState{ring: ring, ackEvery: uint64(limit / 16)}
 	return nil
 }

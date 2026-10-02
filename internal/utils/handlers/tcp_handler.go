@@ -233,9 +233,13 @@ func transferData(from net.Conn, to net.Conn, logger *logrus.Logger, usage *web.
 // those), sending a clean FIN that lets the peer finish replying. Conn types
 // without a half-close (smux.Stream, striping.Conn) fall back to a full close.
 func closeWrite(c net.Conn) {
+	_ = closeWriteErr(c)
+}
+
+// closeWriteErr is closeWrite that reports whether the end reached the tunnel.
+func closeWriteErr(c net.Conn) error {
 	if cw, ok := c.(interface{ CloseWrite() error }); ok {
-		_ = cw.CloseWrite()
-		return
+		return cw.CloseWrite()
 	}
-	c.Close()
+	return c.Close()
 }

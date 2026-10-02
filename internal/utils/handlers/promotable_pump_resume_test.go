@@ -376,6 +376,10 @@ func TestReplayRingStaysBoundedAcrossSwaps(t *testing.T) {
 		if err := swapTunnelWith(t, ctx, A.pump, B.pump, true); err != nil {
 			t.Fatalf("swap %d: %v", i, err)
 		}
+		// A swap completes only once both directions have switched; the next one
+		// cannot start before.
+		waitSwaps(t, A.pump, uint64(i+1))
+		waitSwaps(t, B.pump, uint64(i+1))
 		if n := A.pump.ReplayLen(); n > limit {
 			t.Fatalf("after swap %d the ring holds %d bytes, over its limit %d", i, n, limit)
 		}

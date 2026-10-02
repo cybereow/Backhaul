@@ -225,12 +225,17 @@ func TestPumpSwapperRandomSwaps(t *testing.T) {
 	if testing.Short() {
 		seeds = 6
 	}
-	for _, enveloped := range []bool{false, true} {
+	// plain TCP tunnels, enveloped smux tunnels, and enveloped tunnels with the
+	// replay ring and ACKs running on both ends.
+	for _, mode := range []struct {
+		name              string
+		enveloped, replay bool
+	}{{"plain", false, false}, {"enveloped", true, false}, {"replay", true, true}} {
 		for seed := int64(1); seed <= int64(seeds); seed++ {
-			seed, enveloped := seed, enveloped
-			t.Run(fmt.Sprintf("enveloped=%v/seed%d", enveloped, seed), func(t *testing.T) {
+			seed, mode := seed, mode
+			t.Run(fmt.Sprintf("%s/seed%d", mode.name, seed), func(t *testing.T) {
 				t.Parallel()
-				runRandomSwaps(t, seed, enveloped)
+				runRandomSwaps(t, seed, mode.enveloped, mode.replay)
 			})
 		}
 	}
@@ -260,11 +265,16 @@ func paced(w io.Writer, data []byte, rng *rand.Rand) error {
 	return nil
 }
 
-func runRandomSwaps(t *testing.T, seed int64, enveloped bool) {
+func runRandomSwaps(t *testing.T, seed int64, enveloped, replay bool) {
 	rng := rand.New(rand.NewSource(seed))
 	ctx, _ := testCtx(t)
 	a0, b0 := tunnelPair(t, enveloped)
-	A, B := newFlowEnd(t, ctx, a0), newFlowEnd(t, ctx, b0)
+	var A, B *flowEnd
+	if replay {
+		A, B = newReplayFlowEnd(t, ctx, a0, 256<<10), newReplayFlowEnd(t, ctx, b0, 256<<10)
+	} else {
+		A, B = newFlowEnd(t, ctx, a0), newFlowEnd(t, ctx, b0)
+	}
 
 	nSwaps := 1 + rng.Intn(6)
 	toB := randomBytes(rng, rng.Intn(400000)) // may be empty: an immediate half-close
@@ -326,6 +336,13 @@ func runRandomSwaps(t *testing.T, seed int64, enveloped bool) {
 	if A.pump.UpBytes() != uint64(len(toB)) || B.pump.DlBytes() != uint64(len(toB)) ||
 		B.pump.UpBytes() != uint64(len(toA)) || A.pump.DlBytes() != uint64(len(toA)) {
 		t.Fatalf("offsets: A up=%d dl=%d B up=%d dl=%d", A.pump.UpBytes(), A.pump.DlBytes(), B.pump.UpBytes(), B.pump.DlBytes())
+	}
+	if replay && (A.pump.ReplayLen() > 256<<10 || B.pump.ReplayLen() > 256<<10) {
+		// The ring is bounded whatever tunnels the flow went through. (Whether it
+		// drained is not checked here: once both ends have finished the tunnel is
+		// closed, and the last ACKs have nowhere to go. TestReplayAcksSurviveSwaps
+		// checks that on a live flow.)
+		t.Fatalf("replay rings over their limit: A=%d B=%d", A.pump.ReplayLen(), B.pump.ReplayLen())
 	}
 	if A.pump.Swaps() != uint64(nSwaps) || B.pump.Swaps() != uint64(nSwaps) {
 		t.Fatalf("swaps: A=%d B=%d want %d", A.pump.Swaps(), B.pump.Swaps(), nSwaps)

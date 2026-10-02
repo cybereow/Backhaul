@@ -20,6 +20,9 @@ import (
 //	  0x01 DATA   length 1..32768  application bytes
 //	  0x02 END    length 0         sender sends no more DATA (directional EOF)
 //	  0x03 ABORT  length 0         sender abandons the stream; receiver fails loudly
+//	  0x04 ACK    length 8         cumulative payload offset (big-endian) the sender
+//	                               of this record has delivered to its application;
+//	                               only used by resumable flows (see SetAckHandler)
 //
 // Every receiver-side violation is a protocol error: the stream is closed and
 // Read reports an error wrapping io.ErrUnexpectedEOF, never a clean io.EOF.
@@ -27,6 +30,7 @@ const (
 	hcData  byte = 0x01
 	hcEnd   byte = 0x02
 	hcAbort byte = 0x03
+	hcAck   byte = 0x04
 
 	hcHeaderLen = 3
 	hcMaxData   = 32768
@@ -71,6 +75,9 @@ type halfCloseConn struct {
 	hdrN      int
 	remaining int   // unread payload bytes of the current DATA record
 	rerr      error // sticky terminal read result (io.EOF after END)
+	inAck     bool  // the current record is an ACK whose payload is being read
+	ackBuf    [8]byte
+	ackN      int
 
 	// wmu serializes Write, CloseWrite and the ABORT sent by Close.
 	wmu sync.Mutex
@@ -84,6 +91,8 @@ type halfCloseConn struct {
 	closed      bool  // Close called or stream failed; further I/O fails
 	wpoison     error // a record was cut short mid-write: framing is lost
 
+	ackFn     func(uint64) // receiver of the peer's ACK records; nil = ACKs are a protocol error
+	serveOnce sync.Once
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -159,6 +168,8 @@ func (c *halfCloseConn) readHeader() error {
 	switch {
 	case typ == hcData && length >= 1 && length <= hcMaxData:
 		c.remaining = length
+	case typ == hcAck && length == 8 && c.hasAckFn():
+		c.inAck, c.ackN = true, 0
 	case typ == hcEnd && length == 0:
 		c.rerr = io.EOF
 		c.mu.Lock()
@@ -167,11 +178,146 @@ func (c *halfCloseConn) readHeader() error {
 		c.mu.Unlock()
 		if both {
 			c.closeStream()
+		} else if c.hasAckFn() {
+			// The peer will not send data any more, but it still acks ours: keep
+			// the stream parsed for those records.
+			c.startServe()
 		}
 	case typ == hcAbort && length == 0:
 		c.fail(errHalfCloseAborted)
 	default:
 		c.fail(fmt.Errorf("halfclose: protocol error (type 0x%02x, length %d): %w", typ, length, io.ErrUnexpectedEOF))
+	}
+	return nil
+}
+
+func (c *halfCloseConn) hasAckFn() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ackFn != nil
+}
+
+// SetAckHandler registers the receiver of the peer's ACK records (offset =
+// payload bytes the peer has delivered to its application). It is called from
+// whichever goroutine parses the stream, so it must not block. Without a handler
+// an ACK is a protocol error, as before. Set it before the first Read.
+func (c *halfCloseConn) SetAckHandler(fn func(uint64)) {
+	c.mu.Lock()
+	c.ackFn = fn
+	ended := c.recvEnded
+	c.mu.Unlock()
+	if ended {
+		c.startServe()
+	}
+}
+
+// ServeAcks parses the stream for ACK and END records when no reader owns its
+// receive side (the flow's download direction already ended), until the stream
+// ends. Idempotent, and a no-op without an ACK handler.
+func (c *halfCloseConn) ServeAcks() {
+	if c.hasAckFn() {
+		c.startServe()
+	}
+}
+
+func (c *halfCloseConn) startServe() {
+	c.serveOnce.Do(func() { go c.serve() })
+}
+
+// serve is the parser for a stream nobody Reads: the peer's data direction is over
+// (or was never read), so only ACK, END and ABORT are valid.
+func (c *halfCloseConn) serve() {
+	var hdr [hcHeaderLen]byte
+	var payload [8]byte
+	for {
+		if _, err := io.ReadFull(c.Conn, hdr[:]); err != nil {
+			return // closed, reset or ended: the flow's own pumps classify that
+		}
+		typ, length := hdr[0], int(binary.BigEndian.Uint16(hdr[1:]))
+		switch {
+		case typ == hcAck && length == 8:
+			if _, err := io.ReadFull(c.Conn, payload[:]); err != nil {
+				return
+			}
+			if fn := c.ackHandler(); fn != nil {
+				fn(binary.BigEndian.Uint64(payload[:]))
+			}
+		case typ == hcEnd && length == 0:
+			c.mu.Lock()
+			c.recvEnded = true
+			both := c.sendEnded
+			c.mu.Unlock()
+			if both {
+				c.closeStream()
+				return
+			}
+		default: // DATA after END, ABORT, or garbage: nothing more is worth reading
+			c.mu.Lock()
+			c.closed = true
+			c.mu.Unlock()
+			c.closeStream()
+			return
+		}
+	}
+}
+
+func (c *halfCloseConn) ackHandler() func(uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ackFn
+}
+
+// readAck accumulates the 8-byte payload of the current ACK record and hands it
+// to the handler; a timeout leaves the partial payload in place.
+func (c *halfCloseConn) readAck() error {
+	for c.ackN < len(c.ackBuf) {
+		n, err := c.Conn.Read(c.ackBuf[c.ackN:])
+		c.ackN += n
+		if err != nil && c.ackN < len(c.ackBuf) {
+			if isTimeout(err) {
+				return err
+			}
+			c.readFailed(err, "stream ended inside an ACK record")
+			return nil
+		}
+	}
+	c.inAck = false
+	if fn := c.ackHandler(); fn != nil {
+		fn(binary.BigEndian.Uint64(c.ackBuf[:]))
+	}
+	return nil
+}
+
+// SendAck tells the peer how many payload bytes this end has delivered to its
+// application. Unlike data it is still allowed after this end's END: the other
+// direction keeps flowing and needs its acks.
+func (c *halfCloseConn) SendAck(off uint64) error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.mu.Lock()
+	switch {
+	case c.closed || c.sendAborted:
+		c.mu.Unlock()
+		return net.ErrClosed
+	case c.wpoison != nil:
+		err := c.wpoison
+		c.mu.Unlock()
+		return err
+	}
+	c.mu.Unlock()
+	var rec [hcHeaderLen + 8]byte
+	rec[0] = hcAck
+	binary.BigEndian.PutUint16(rec[1:], 8)
+	binary.BigEndian.PutUint64(rec[hcHeaderLen:], off)
+	w, err := c.Conn.Write(rec[:])
+	if err != nil {
+		err = c.writeErr(err)
+		if w > 0 {
+			c.mu.Lock()
+			c.wpoison = err
+			c.mu.Unlock()
+		}
+		return err
 	}
 	return nil
 }
@@ -190,6 +336,12 @@ func (c *halfCloseConn) Read(p []byte) (int, error) {
 		}
 		if len(p) == 0 {
 			return 0, nil
+		}
+		if c.inAck {
+			if err := c.readAck(); err != nil {
+				return 0, err
+			}
+			continue
 		}
 		if c.remaining == 0 {
 			if err := c.readHeader(); err != nil {

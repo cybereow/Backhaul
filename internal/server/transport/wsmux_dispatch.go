@@ -404,6 +404,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 		}
 
 		var flowID uint64
+		replayLimit, releaseReplay := 0, func() {}
 		// Promotion migrates a heavy plain flow onto a striped group, so it only
 		// makes sense when a group is actually wider than one leg. In pure-plain mode
 		// (StripeFactor 1, no parity) legsPerFlow is 1, so "promotion" would just wrap
@@ -435,6 +436,13 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 			if resumable {
 				flowID = newFlowID()
 				send = utils.SendFlowResumable
+				if s.config.ResumeWindow > 0 {
+					// Survive a cut without warning too, if the memory budget allows:
+					// the peer follows the kind byte.
+					if replayLimit, releaseReplay = handlers.DefaultReplayBudget.Reserve(); replayLimit > 0 {
+						send = utils.SendFlowResumableReplay
+					}
+				}
 			} else if halfClose {
 				send = utils.SendFlowPlainHC
 				streamConn = handlers.NewHalfCloseConn(stream)
@@ -444,6 +452,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 			err = utils.SendBinaryString(stream, incomingConn.remoteAddr)
 		}
 		if err != nil {
+			releaseReplay()
 			atomic.AddInt32(&s.plainFlows, -1)
 			stream.Close()
 			if !a.wait(setupRetryBackoff) {
@@ -456,6 +465,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 
 		if !a.handoff() {
 			// The guard already closed the local socket at expiry.
+			releaseReplay()
 			atomic.AddInt32(&s.plainFlows, -1)
 			stream.Close()
 			a.drop()
@@ -466,7 +476,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 		defer atomic.AddInt32(&s.plainFlows, -1)
 		defer atomic.AddInt32(&s.streamCounter, -1)
 		if resumable {
-			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID)
+			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID, replayLimit, releaseReplay)
 		} else if promotable {
 			// dispatchPromotable blocks until the flow (and any mid-stream
 			// promotion) completes, so the counters above are released only when

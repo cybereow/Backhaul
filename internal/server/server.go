@@ -184,6 +184,7 @@ func (s *Server) Start() {
 			TLSEngine:            s.config.TLSEngine,
 			MaxConnAge:           maxConnAge,
 			MaxDrain:             maxDrain,
+			ResumeWindow:         time.Duration(s.config.ResumeWindow) * time.Second,
 			WSFraming:            s.config.MuxWSFraming,
 			HalfClose:            s.config.MuxHalfClose,
 		}

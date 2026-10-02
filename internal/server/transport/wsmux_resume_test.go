@@ -194,3 +194,73 @@ func TestWSMuxAttachRefusedLeavesFlowAlone(t *testing.T) {
 		t.Fatalf("the flow broke after a refused attach: %v", err)
 	}
 }
+
+// A flow whose session is cut WITHOUT warning (no retirement, no migration)
+// is resumed on another session: every byte of a long echo arrives once and in
+// order across repeated cuts, under traffic in both directions.
+func TestWSMuxResumeAfterUnannouncedCut(t *testing.T) {
+	tg := echoTarget(t)
+	h := newLCHarness(t, toTarget(tg.Addr().String()), func(c *WsMuxConfig) {
+		c.MaxConnAge = time.Hour // resumable flows on; no rotation fires during the test
+		c.MaxDrain = time.Minute
+		c.ResumeWindow = 20 * time.Second
+	})
+	startResumeClient(t, h, 4)
+
+	user := h.user().(*net.TCPConn)
+	_ = user.SetDeadline(time.Now().Add(60 * time.Second))
+
+	payload := promoPayload(6*1024*1024+13, 21)
+	var sent, recvd int
+	readerDone := make(chan error, 1)
+	go func() {
+		got := make([]byte, 64<<10)
+		for recvd < len(payload) {
+			n, err := user.Read(got)
+			if n > 0 {
+				if !bytes.Equal(got[:n], payload[recvd:recvd+n]) {
+					readerDone <- fmt.Errorf("echoed bytes differ at offset %d", recvd)
+					return
+				}
+				recvd += n
+			}
+			if err != nil {
+				readerDone <- fmt.Errorf("reading the echo at %d of %d: %w", recvd, len(payload), err)
+				return
+			}
+		}
+		readerDone <- nil
+	}()
+
+	var f *resumableFlow
+	cuts := 0
+	for sent < len(payload) {
+		n := min(256<<10, len(payload)-sent)
+		if _, err := user.Write(payload[sent : sent+n]); err != nil {
+			t.Fatalf("writing at %d: %v (after %d cuts)", sent, err, cuts)
+		}
+		sent += n
+		if f == nil {
+			h.s.flowsMu.Lock()
+			for _, x := range h.s.flows {
+				f = x
+			}
+			h.s.flowsMu.Unlock()
+		}
+		if f != nil && cuts < 3 && sent > (cuts+1)*(1<<20) {
+			from := f.session()
+			from.Close() // the CDN's cut: nothing announced, nothing migrated
+			cuts++
+			lcWaitFor(t, "the flow to resume on another session", func() bool {
+				return f.sw.Resumes() >= uint64(cuts) && f.session() != from
+			})
+		}
+	}
+	_ = user.CloseWrite()
+	if err := <-readerDone; err != nil {
+		t.Fatal(err)
+	}
+	if cuts == 0 || f.sw.Resumes() < uint64(cuts) {
+		t.Fatalf("cuts=%d resumes=%d", cuts, f.sw.Resumes())
+	}
+}

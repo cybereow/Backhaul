@@ -342,6 +342,7 @@ type WsMuxConfig struct {
 	RetryInterval        time.Duration
 	DialTimeOut          time.Duration
 	MuxVersion           int
+	ResumeWindow         time.Duration // how long a flow waits to be resumed (0 = handlers.DefaultResumeWindow)
 	MaxFrameSize         int
 	MaxReceiveBuffer     int
 	MaxStreamBuffer      int
@@ -1109,7 +1110,19 @@ func (c *WsMuxTransport) setupStream(stream *smux.Stream, remote string, run fun
 			bad("bad resumable flow header", err)
 			return
 		}
-		ready(func() { c.localDialerResumable(stream, flowID, remoteAddr) })
+		ready(func() { c.localDialerResumable(stream, flowID, remoteAddr, false) })
+	case utils.FlowResumableReplay:
+		// A resumable flow whose two ends also keep what they send until it is
+		// acknowledged, so it survives its session being cut without warning.
+		flowID, remoteAddr, err := utils.ReceiveFlowResumable(stream)
+		if err == nil && flowID == 0 {
+			err = fmt.Errorf("zero flow id on a resumable flow")
+		}
+		if err != nil {
+			bad("bad resumable flow header", err)
+			return
+		}
+		ready(func() { c.localDialerResumable(stream, flowID, remoteAddr, true) })
 	case utils.FlowAttach:
 		flowID, mode, flags, err := utils.ReceiveFlowAttach(stream)
 		if err != nil {
@@ -1407,7 +1420,7 @@ func (c *WsMuxTransport) localDialerPlain(stream *smux.Stream, flowID uint64, re
 // promoted flow, over the half-close envelope. The swapper is published for the
 // server's attach BEFORE any byte moves, so an attach can never find the flow
 // missing or half-built.
-func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64, remoteAddr string) {
+func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64, remoteAddr string, replay bool) {
 	ctx := c.ctx // this worker's generation, read once
 	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
 	if err != nil {
@@ -1434,6 +1447,21 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 	swapper := handlers.NewPromotablePump(ctx, false, localConnection, handlers.NewHalfCloseConn(stream), c.logger, c.usageMonitor, port, c.config.Sniffer)
 	if swapper == nil {
 		return
+	}
+	if replay {
+		// The server decided this flow keeps replay state; this end follows (and
+		// takes at least the smallest ring whatever the budget says, since the
+		// two ends must agree).
+		limit, release := handlers.DefaultReplayBudget.Force()
+		defer release()
+		if err := swapper.EnableReplay(limit); err != nil {
+			c.logger.Errorf("resumable flow %d: %v", flowID, err)
+			swapper.Abort()
+			return
+		}
+		if w := c.config.ResumeWindow; w > 0 {
+			swapper.SetResumeWindow(w)
+		}
 	}
 	c.promotableFlowsMu.Lock()
 	c.promotableFlows[flowID] = swapper
@@ -1464,6 +1492,10 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 		_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
 		_ = utils.WriteAttachVerdict(stream, false, reason)
 		stream.Close()
+	}
+	if mode == utils.AttachResume && flags == 0 {
+		c.handleResumeAttach(ctx, stream, flowID, swapper, reject)
+		return
 	}
 	switch {
 	case mode != utils.AttachDrained || flags != 0:
@@ -1510,6 +1542,42 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 		return
 	}
 	c.logger.Debugf("flow %d moved to a new stream", flowID)
+}
+
+// handleResumeAttach answers the server's request to resume flow flowID, whose
+// tunnel died without warning, on this stream. The flow is suspended here first
+// (this end may not have noticed the loss yet); a flow that cannot be resumed (it
+// is unknown, finished, or has no replay state) is refused, which tells the server
+// to give it up.
+func (c *WsMuxTransport) handleResumeAttach(ctx context.Context, stream *smux.Stream, flowID uint64, swapper *handlers.PumpSwapper, reject func(byte, string)) {
+	switch {
+	case swapper == nil:
+		reject(utils.AttachRejectUnknownFlow, "unknown or finished flow")
+		return
+	case !swapper.Suspend():
+		reject(utils.AttachRejectUnknownFlow, "flow cannot be resumed (finished or without replay)")
+		return
+	}
+	_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
+	if err := utils.WriteAttachVerdict(stream, true, 0); err != nil {
+		stream.Close() // the server will try again; the flow stays suspended
+		return
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+
+	err := swapper.Resume(ctx, stream, func() (net.Conn, error) {
+		return handlers.NewHalfCloseConn(stream), nil
+	})
+	if err != nil {
+		select {
+		case <-swapper.DoneWait():
+			c.logger.Debugf("resume of flow %d: the flow had already finished (%v)", flowID, err)
+		default:
+			c.logger.Debugf("resume of flow %d failed, waiting for another attempt: %v", flowID, err)
+		}
+		return
+	}
+	c.logger.Debugf("flow %d resumed on a new stream", flowID)
 }
 
 func (c *WsMuxTransport) handlePromoteStream(stream *smux.Stream, flowID uint64, groupID uint32, index, total, parity uint8) {

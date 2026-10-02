@@ -281,6 +281,11 @@ const (
 	// FlowAttach asks the peer to move the resumable flow flowID onto the stream
 	// it arrives on (see SendFlowAttach).
 	FlowAttach byte = 0x08
+	// FlowResumableReplay is a FlowResumable flow whose two ends also keep what they
+	// sent until it is acknowledged, so that it survives its stream or session dying
+	// without warning (resume, AttachResume). Same header as FlowResumable. The
+	// server decides per flow (memory budget), the client follows.
+	FlowResumableReplay byte = 0x09
 )
 
 // Attach modes (FlowAttach header).
@@ -288,8 +293,9 @@ const (
 	// AttachDrained: planned move. The old tunnel is still healthy, so both ends
 	// freeze, exchange their sent counts and drain it; nothing is replayed.
 	AttachDrained byte = 0
-	// AttachResume is reserved for resuming after an unannounced loss (replay from
-	// the peer's received offset). Not implemented yet; peers must reject it.
+	// AttachResume: the flow's tunnel died without warning. Both ends suspend it,
+	// exchange how many bytes each has delivered, and replay the rest from their
+	// replay rings (FlowResumableReplay flows only).
 	AttachResume byte = 1
 )
 
@@ -309,6 +315,12 @@ func SendFlowResumable(conn net.Conn, flowID uint64, remoteAddr string) error {
 // separately by ReadFlowKind.
 func ReceiveFlowResumable(conn net.Conn) (flowID uint64, remoteAddr string, err error) {
 	return ReceiveFlowPlain(conn)
+}
+
+// SendFlowResumableReplay writes the FlowResumableReplay header (same layout as
+// FlowPlain).
+func SendFlowResumableReplay(conn net.Conn, flowID uint64, remoteAddr string) error {
+	return sendFlowPlainKind(conn, FlowResumableReplay, flowID, remoteAddr)
 }
 
 // SendFlowAttach writes the FlowAttach header: kind | flowID(8) | mode(1) |

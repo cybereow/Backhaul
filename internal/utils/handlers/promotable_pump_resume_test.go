@@ -352,6 +352,19 @@ func TestReplayRingStaysBoundedAcrossSwaps(t *testing.T) {
 
 	up := genPayload(6 * limit)
 	go A.user.Write(up)
+	got := make(chan []byte, 1)
+	go func() { // B's app reads, or its download could never reach a swap's limit
+		b := make([]byte, 0, len(up))
+		buf := make([]byte, 32<<10)
+		for len(b) < len(up) {
+			n, err := B.user.Read(buf)
+			b = append(b, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		got <- b
+	}()
 	deadline := time.Now().Add(hcTestTimeout)
 	for A.pump.ReplayLen() < limit-64<<10 {
 		if time.Now().After(deadline) {
@@ -363,9 +376,25 @@ func TestReplayRingStaysBoundedAcrossSwaps(t *testing.T) {
 		if err := swapTunnelWith(t, ctx, A.pump, B.pump, true); err != nil {
 			t.Fatalf("swap %d: %v", i, err)
 		}
-		if got := A.pump.ReplayLen(); got > limit {
-			t.Fatalf("after swap %d the ring holds %d bytes, over its limit %d", i, got, limit)
+		if n := A.pump.ReplayLen(); n > limit {
+			t.Fatalf("after swap %d the ring holds %d bytes, over its limit %d", i, n, limit)
 		}
 	}
-	_ = B
+	// B does not acknowledge, so stand in for it: acknowledge what was sent.
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	timeout := time.After(4 * hcTestTimeout)
+	for {
+		select {
+		case b := <-got:
+			if !bytes.Equal(b, up) {
+				t.Fatalf("payload differs after the swaps: %d bytes", len(b))
+			}
+			return
+		case <-tick.C:
+			A.pump.replay.ring.ackTo(A.pump.UpBytes())
+		case <-timeout:
+			t.Fatal("the payload never arrived")
+		}
+	}
 }

@@ -1,27 +1,57 @@
 package handlers
 
 import (
+	"encoding/binary"
 	"io"
 	"net"
-	"sync/atomic"
+	"sync"
 	"testing"
 
 	"github.com/xtaci/smux"
 )
 
-// tailConn counts the writes smux makes to its underlying connection that carry
-// exactly one 3-byte record header: a smux frame header (8 bytes) plus 3 payload
-// bytes. That is what a full record leaves behind when it does not fit one frame.
+// tailConn walks the smux frame stream written to its underlying connection and
+// counts PSH frames carrying exactly one 3-byte record header: what a full
+// record leaves behind when it does not fit one frame. Frames are parsed from
+// the byte stream, so the count does not depend on how smux coalesces writes.
 type tailConn struct {
 	net.Conn
-	tails atomic.Int64
+	mu    sync.Mutex
+	hdr   [8]byte
+	hn    int // header bytes collected
+	skip  int // payload bytes left in the current frame
+	tails int64
 }
 
 func (c *tailConn) Write(b []byte) (int, error) {
-	if len(b) == 8+HalfCloseRecordSize-32768 {
-		c.tails.Add(1)
+	c.mu.Lock()
+	for p := b; len(p) > 0; {
+		if c.skip > 0 {
+			n := min(c.skip, len(p))
+			c.skip -= n
+			p = p[n:]
+			continue
+		}
+		n := copy(c.hdr[c.hn:], p)
+		c.hn += n
+		p = p[n:]
+		if c.hn < len(c.hdr) {
+			continue
+		}
+		c.hn = 0
+		c.skip = int(binary.LittleEndian.Uint16(c.hdr[2:4]))
+		if c.hdr[1] == 2 && c.skip == 3 { // cmdPSH
+			c.tails++
+		}
 	}
+	c.mu.Unlock()
 	return c.Conn.Write(b)
+}
+
+func (c *tailConn) count() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tails
 }
 
 // tailsFor sends total bytes through an enveloped stream, written 32 KiB at a
@@ -61,7 +91,7 @@ func tailsFor(t *testing.T, frame, total int) int64 {
 		cw.CloseWrite()
 	}
 	<-done
-	return cc.tails.Load()
+	return cc.count()
 }
 
 // With the frame size at HalfCloseRecordSize every record travels in one frame;
@@ -72,7 +102,7 @@ func TestHalfCloseRecordFitsOneFrame(t *testing.T) {
 	fit := tailsFor(t, HalfCloseRecordSize, records*32768)
 	spill := tailsFor(t, 32768, records*32768)
 	t.Logf("tail frames: %d at frame size %d, %d at 32768", fit, HalfCloseRecordSize, spill)
-	if spill < records/4 { // smux sometimes coalesces frames into one write
+	if spill < records/4 {
 		t.Fatalf("frame size 32768: only %d tail frames for %d records, expected a good share of one each; has smux's framing changed?", spill, records)
 	}
 	if fit > 8 {

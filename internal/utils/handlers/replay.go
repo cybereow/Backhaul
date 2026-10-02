@@ -96,10 +96,8 @@ func (r *replayRing) append(p []byte) {
 		for newCap < need {
 			newCap *= 2
 		}
-		if newCap > r.limit && need <= r.limit {
-			newCap = r.limit
-		} else if newCap < need {
-			newCap = need // over the limit: a caller bug, but never lose data
+		if newCap > r.limit {
+			newCap = max(r.limit, need) // never more than needed past the limit
 		}
 		nb := make([]byte, newCap)
 		r.copyOut(nb[:r.size])

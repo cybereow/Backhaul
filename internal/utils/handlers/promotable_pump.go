@@ -146,7 +146,9 @@ func (p *PumpSwapper) switched(up bool) {
 		// arrived, and with no more data nothing would trigger another: say again,
 		// on the new tunnel, how much has been delivered (ACKs are cumulative, so
 		// repeating one is harmless).
-		p.replay.ackSent.Store(0)
+		// A flushAck already running on the old tunnel notices the new generation
+		// and neither records its result nor gives up on it.
+		p.replay.resetAcked()
 		p.kickAck()
 	}
 }
@@ -701,8 +703,28 @@ type replayState struct {
 	ackEvery uint64 // acknowledge after this many newly delivered bytes ...
 
 	ackSent  atomic.Uint64 // highest offset acknowledged to the peer so far
+	ackGen   atomic.Uint64 // bumped when ackSent is reset by a swap
+	ackMu    sync.Mutex    // makes "record the ack" and "reset by a swap" exclusive
 	ackBusy  atomic.Bool   // a flushAck is running
 	timerSet atomic.Bool   // a delayed ack is armed
+}
+
+// resetAcked forgets what was acknowledged: the new tunnel has not heard any of it.
+func (r *replayState) resetAcked() {
+	r.ackMu.Lock()
+	r.ackGen.Add(1)
+	r.ackSent.Store(0)
+	r.ackMu.Unlock()
+}
+
+// noteAcked records that dl was acknowledged, unless a swap reset the bookkeeping
+// since gen was read (the ack then went to a tunnel that is gone).
+func (r *replayState) noteAcked(gen, dl uint64) {
+	r.ackMu.Lock()
+	if r.ackGen.Load() == gen {
+		r.ackSent.Store(dl)
+	}
+	r.ackMu.Unlock()
 }
 
 // ackDelay bounds how long delivered bytes go unacknowledged when too few arrive
@@ -724,7 +746,9 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 	if _, ok := p.cur.(ackConn); !ok {
 		return errors.New("replay needs a tunnel that carries ACK records")
 	}
-	p.replay = &replayState{ring: newReplayRing(limit), ackEvery: uint64(limit / 16)}
+	ring := newReplayRing(limit)
+	ring.base = p.upBytes.Load() // a proxy header already written is not retained, but is counted
+	p.replay = &replayState{ring: ring, ackEvery: uint64(limit / 16)}
 	return nil
 }
 
@@ -783,16 +807,20 @@ func (p *PumpSwapper) kickAck() {
 func (p *PumpSwapper) flushAck() {
 	r := p.replay
 	for {
+		gen := r.ackGen.Load()
 		if dl := p.dlBytes.Load(); dl > r.ackSent.Load() {
 			p.mu.Lock()
 			c := p.upDst
 			p.mu.Unlock()
 			ac, ok := c.(ackConn)
 			if !ok || ac.SendAck(dl) != nil {
+				if r.ackGen.Load() != gen {
+					continue // the tunnel it failed on was just replaced: send on the new one
+				}
 				r.ackBusy.Store(false) // a dead tunnel is for the resume logic to notice
 				return
 			}
-			r.ackSent.Store(dl)
+			r.noteAcked(gen, dl)
 		}
 		r.ackBusy.Store(false)
 		// More may have been delivered while this one was being sent. A kick that

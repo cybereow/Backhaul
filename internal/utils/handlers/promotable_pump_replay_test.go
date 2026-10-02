@@ -188,3 +188,48 @@ func TestReplayAcksSurviveSwaps(t *testing.T) {
 		})
 	}
 }
+
+// A PROXY header written before replay is enabled counts in the flow's offsets
+// (the peer acknowledges it), so the ring must start at that offset or every ACK
+// would look like it acknowledges bytes never sent and the ring would never drain.
+func TestReplayAcksCountProxyHeader(t *testing.T) {
+	const limit = 256 << 10
+	ctx, _ := testCtx(t)
+	// The PROXY header needs real TCP addresses.
+	ta, tb := tcpConnPair(t)
+	a0, b0 := NewHalfCloseConn(ta), NewHalfCloseConn(tb)
+	u, appc := tcpConnPair(t)
+	p := NewPromotablePump(ctx, true, appc, a0, testLogger(), testUsage(t), 0, false)
+	if p == nil {
+		t.Fatal("NewPromotablePump returned nil")
+	}
+	if err := p.EnableReplay(limit); err != nil {
+		t.Fatal(err)
+	}
+	p.Start()
+	B := newReplayFlowEnd(t, ctx, b0, limit)
+
+	header, err := ProxyProtocolHeader(appc.RemoteAddr(), a0.RemoteAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	up := genPayload(3 * limit)
+	go u.Write(up)
+	readExact(t, B.user, len(header))
+	if got := readExact(t, B.user, len(up)); !bytes.Equal(got, up) {
+		t.Fatal("payload differs")
+	}
+	waitReplayEmpty(t, p, "sender after the peer delivered everything")
+}
+
+// An ring that must hold a little more than its limit (a read admitted so a swap
+// can reach its boundary) grows to what is needed, not to the next power of two.
+func TestReplayRingOverflowDoesNotDouble(t *testing.T) {
+	const limit = 1 << 20
+	r := newReplayRing(limit)
+	r.append(make([]byte, limit))
+	r.append(make([]byte, 1))
+	if got := len(r.buf); got != limit+1 {
+		t.Fatalf("capacity %d after one byte past the limit, want %d", got, limit+1)
+	}
+}

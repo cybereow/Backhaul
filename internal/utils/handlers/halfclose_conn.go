@@ -31,6 +31,13 @@ const (
 	hcHeaderLen = 3
 	hcMaxData   = 32768
 
+	// HalfCloseRecordSize is the largest record the envelope writes (header plus a
+	// full DATA payload). A smux session whose max frame size is at least this
+	// carries every record in ONE frame; with the stock 32768 each full record spills
+	// a 3-byte frame behind it, which doubles the frames (and writes to the
+	// connection) per 32 KiB and costs about 8% of bulk throughput.
+	HalfCloseRecordSize = hcHeaderLen + hcMaxData
+
 	// hcAbortTimeout bounds the best-effort ABORT written by Close, so a peer
 	// that stopped reading cannot wedge teardown.
 	hcAbortTimeout = 500 * time.Millisecond

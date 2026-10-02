@@ -1477,14 +1477,25 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 		return
 	}
 
+	// Reserve the flow before accepting: Swappable is only a snapshot, and a freeze
+	// that fails after an accept would abort a flow we could have refused.
+	fctx, cancel := context.WithTimeout(ctx, handlers.PromoteHandshakeTimeout/2)
+	own, err := swapper.FreezeUp(fctx)
+	cancel()
+	if err != nil {
+		reject(utils.AttachRejectBusy, fmt.Sprintf("flow cannot freeze: %v", err))
+		return
+	}
+
 	_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
 	if err := utils.WriteAttachVerdict(stream, true, 0); err != nil {
 		stream.Close()
+		swapper.Abort() // frozen and no way to thaw: the peer never saw an accept
 		return
 	}
 	_ = stream.SetWriteDeadline(time.Time{})
 
-	err := swapper.Promote(ctx, []net.Conn{stream}, func() (net.Conn, error) {
+	err = swapper.PromoteFrozen(ctx, own, []net.Conn{stream}, func() (net.Conn, error) {
 		return handlers.NewHalfCloseConn(stream), nil
 	})
 	if err != nil {

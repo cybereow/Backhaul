@@ -188,6 +188,10 @@ type WsMuxTransport struct {
 	pendingDials    int32
 	loadConnections int32
 	controlFlow     chan struct{}
+	// lastShrink is when a pool shrink last queued a controlFlow token (unix
+	// nanos). A token only cancels the SG_Chan that follows the shrink closely;
+	// see swallowChanSignal.
+	lastShrink int64
 	// userAgent is picked once per process instead of per dial, so a single
 	// client identity doesn't show up with a different browser signature on
 	// every pool connection/reconnect - a pattern no real browser produces.
@@ -501,6 +505,7 @@ func (c *WsMuxTransport) Restart() {
 	atomic.StoreInt32(&c.pendingDials, 0)
 	atomic.StoreInt32(&c.loadConnections, 0)
 	c.controlFlow = make(chan struct{}, 100)
+	atomic.StoreInt64(&c.lastShrink, 0)
 
 	c.closeStripeGroups()
 	c.promotableFlowsMu.Lock()
@@ -693,6 +698,7 @@ func (c *WsMuxTransport) poolMaintainer() {
 
 				// send a signal to controlFlow; a full channel must not keep
 				// this worker (and so a restart) waiting once cancelled
+				atomic.StoreInt64(&c.lastShrink, time.Now().UnixNano())
 				select {
 				case c.controlFlow <- struct{}{}:
 				case <-ctx.Done():
@@ -807,6 +813,35 @@ func (c *WsMuxTransport) channelHandler(conn *network.WebSocketConn) {
 				return
 			}
 
+		}
+	}
+}
+
+// shrinkTokenTTL is how long a pool shrink may absorb a new-connection request.
+// The token exists so a request already in flight when the pool shrinks does not
+// immediately regrow it. It must not outlive that moment: a stale token would eat
+// a later request - above all the server's rotation request for a replacement
+// connection - and delay the rotation until its slow re-ask, by which time the
+// CDN may have cut the aging connection.
+const shrinkTokenTTL = 5 * time.Second
+
+// swallowChanSignal reports whether this SG_Chan should be ignored because a
+// recent shrink queued a token for it. Tokens older than shrinkTokenTTL are
+// discarded and the request is served.
+func (c *WsMuxTransport) swallowChanSignal() bool {
+	select {
+	case <-c.controlFlow:
+	default:
+		return false
+	}
+	if time.Since(time.Unix(0, atomic.LoadInt64(&c.lastShrink))) <= shrinkTokenTTL {
+		return true
+	}
+	for { // stale: drop every leftover token too
+		select {
+		case <-c.controlFlow:
+		default:
+			return false
 		}
 	}
 }

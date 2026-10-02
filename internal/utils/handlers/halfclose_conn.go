@@ -176,12 +176,14 @@ func (c *halfCloseConn) readHeader() error {
 		c.recvEnded = true
 		both := c.sendEnded
 		c.mu.Unlock()
-		if both {
-			c.closeStream()
-		} else if c.hasAckFn() {
-			// The peer will not send data any more, but it still acks ours: keep
-			// the stream parsed for those records.
+		if c.hasAckFn() {
+			// The peer will not send data any more, but it still acks ours (and
+			// the ACK for this very END is on its way): keep the stream parsed for
+			// those records. A stream with ACKs is closed by its owner once
+			// everything is acknowledged, not when both ENDs are through.
 			c.startServe()
+		} else if both {
+			c.closeStream()
 		}
 	case typ == hcAbort && length == 0:
 		c.fail(errHalfCloseAborted)
@@ -245,12 +247,7 @@ func (c *halfCloseConn) serve() {
 		case typ == hcEnd && length == 0:
 			c.mu.Lock()
 			c.recvEnded = true
-			both := c.sendEnded
 			c.mu.Unlock()
-			if both {
-				c.closeStream()
-				return
-			}
 		default: // DATA after END, ABORT, or garbage: nothing more is worth reading
 			c.mu.Lock()
 			c.closed = true
@@ -455,7 +452,7 @@ func (c *halfCloseConn) CloseWrite() error {
 	c.sendEnded = true
 	both := c.recvEnded
 	c.mu.Unlock()
-	if both {
+	if both && !c.hasAckFn() { // with ACKs the owner closes it once all is acknowledged
 		c.closeStream()
 	}
 	return nil
@@ -492,6 +489,15 @@ func (c *halfCloseConn) Close() error {
 		c.wmu.Unlock()
 	}
 	return c.closeStream()
+}
+
+// Drop closes the stream without sending ABORT: the flow carried on it is not
+// over, only this tunnel is, and the peer must not take it for the flow's death.
+func (c *halfCloseConn) Drop() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+	_ = c.closeStream()
 }
 
 // AbortWrite is the loud teardown transferData uses after a mid-copy error.

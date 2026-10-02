@@ -46,6 +46,13 @@ func (r *replayRing) end() uint64 {
 	return r.base + uint64(r.size)
 }
 
+// firstOffset is the flow offset of the oldest retained byte.
+func (r *replayRing) firstOffset() uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.base
+}
+
 // len is the number of retained (unacknowledged) bytes.
 func (r *replayRing) len() int {
 	r.mu.Lock()

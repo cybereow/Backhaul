@@ -15,6 +15,10 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// errTunnelNoAcks: a flow with replay can only move onto tunnels that carry ACK
+// records (the half-close envelope); anything else would stall once its ring fills.
+var errTunnelNoAcks = errors.New("promotable pump: replay needs a tunnel that carries ACK records")
+
 // PromoteHandshakeTimeout bounds the whole promotion handshake (freeze, count
 // exchange, wrapper construction, install). See PumpSwapper.Promote. A variable
 // only so tests can shorten it; production never changes it.
@@ -93,6 +97,20 @@ type PumpSwapper struct {
 	dlEnded bool // the download direction finished normally
 	aborted bool
 	swaps   uint64 // completed swaps
+
+	// Suspension (level B): the tunnel died without the flow ending. See Suspend.
+	suspended    bool
+	suspendGen   uint64
+	suspendCh    chan struct{} // closed while suspended; replaced when the flow resumes
+	resumeCh     chan struct{} // closed by ResumeFinish to release the parked pumps
+	parkedCh     chan struct{} // closed once every live pump is parked
+	parkedClosed bool
+	upParked     bool
+	dlParked     bool
+	resumeConn   net.Conn // the tunnel the parked pumps carry on with
+	resumeFrom   uint64   // the peer's received offset: replay starts there
+	resumeWindow time.Duration
+	resumes      uint64
 
 	upAck     chan struct{} // closed when the upload pump acks the freeze
 	installCh chan struct{} // closed by Install
@@ -209,6 +227,9 @@ func NewPromotablePump(
 		upAck:      make(chan struct{}),
 		installCh:  make(chan struct{}),
 		abortCh:    make(chan struct{}),
+		suspendCh:  make(chan struct{}),
+		resumeCh:   make(chan struct{}),
+		parkedCh:   make(chan struct{}),
 		ctx:        ctx,
 		usage:      usage,
 		remotePort: remotePort,
@@ -269,8 +290,9 @@ func (p *PumpSwapper) start() {
 
 	go func() {
 		wg.Wait()
-		close(p.done)
 		p.app.Close()
+		p.lingerForAcks()
+		close(p.done)
 		p.mu.Lock()
 		cur, next := p.cur, p.next
 		p.mu.Unlock()
@@ -289,7 +311,7 @@ func (p *PumpSwapper) start() {
 func (p *PumpSwapper) Swappable() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return !p.aborted && !p.freezeReq && !(p.upEnded && p.dlEnded)
+	return !p.aborted && !p.suspended && !p.freezeReq && !(p.upEnded && p.dlEnded)
 }
 
 // FreezeUp stops the upload direction at a write boundary and returns the final
@@ -300,8 +322,8 @@ func (p *PumpSwapper) Swappable() bool {
 // flow). A swap that is still in progress also yields ErrPromoteUnavailable.
 func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	p.mu.Lock()
-	if p.aborted || p.freezeReq || (p.upEnded && p.dlEnded) {
-		err := fmt.Errorf("%w (aborted=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.upEnded && p.dlEnded, p.freezeReq)
+	if p.aborted || p.suspended || p.freezeReq || (p.upEnded && p.dlEnded) {
+		err := fmt.Errorf("%w (aborted=%v suspended=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.suspended, p.upEnded && p.dlEnded, p.freezeReq)
 		p.mu.Unlock()
 		return 0, err
 	}
@@ -326,6 +348,7 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	case p.freezeWake <- struct{}{}:
 	default:
 	}
+	sc := p.suspendCh
 	p.mu.Unlock()
 
 	var cause error
@@ -335,6 +358,8 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 		n := p.upLimit
 		p.mu.Unlock()
 		return n, nil
+	case <-sc:
+		cause = ErrPromoteUnavailable // the tunnel died: the swap was cancelled
 	case <-ctx.Done():
 		cause = ctx.Err()
 	case <-p.abortCh:
@@ -350,8 +375,10 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 		return p.upLimit, nil
 	default:
 	}
-	p.freezeReq = false
-	_ = p.app.SetReadDeadline(time.Time{})
+	if !p.suspended { // a suspension's own wakeup must stay armed
+		p.freezeReq = false
+		_ = p.app.SetReadDeadline(time.Time{})
+	}
 	return 0, cause
 }
 
@@ -360,6 +387,11 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 // bytes in total are delivered before the download switches. An error means the
 // flow ended or was aborted meanwhile; the caller must then Abort (post-freeze).
 func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
+	if p.replay != nil {
+		if _, ok := newTunnel.(ackConn); !ok {
+			return errTunnelNoAcks
+		}
+	}
 	p.mu.Lock()
 	if p.aborted || !p.frozen || p.installed || (p.upEnded && p.dlEnded) {
 		p.mu.Unlock()
@@ -438,7 +470,9 @@ func (p *PumpSwapper) PromoteFrozen(ctx context.Context, own uint64, legs []net.
 	}
 	if err != nil {
 		closeAll(legs)
-		p.Abort()
+		if !p.Suspend() { // a flow that can be resumed survives a failed swap
+			p.Abort()
+		}
 		return err
 	}
 	return nil
@@ -500,40 +534,73 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	dst := p.cur
 	p.mu.Unlock()
 	var srcErr error // how the app read ended; delivered to whichever tunnel is current
+	pend := 0        // bytes of buf read from the app but not yet retained or sent
 
 	for { // one pass per tunnel the flow is carried on
-		var installCh chan struct{}
+		var installCh, suspendCh chan struct{}
 
 		// app -> dst, until the app ends or a freeze is requested.
 	run:
 		for {
-			if srcErr == nil {
-				n, err := app.Read(buf)
+			if srcErr == nil || pend > 0 {
+				var n int
+				var err error
+				if pend > 0 {
+					// Bytes read before a freeze or suspension that could not be sent
+					// then go first, on whichever tunnel the flow is on now.
+					n, err = pend, srcErr
+					pend, srcErr = 0, nil
+				} else {
+					n, err = app.Read(buf)
+				}
 				if n > 0 {
+					interrupted := false
 					if p.replay != nil {
 						// Keep what is being sent until the peer acknowledges it, and
 						// wait here (not in the app's socket) while a full window of it
 						// is unacknowledged.
-						if !p.waitReplayRoom(n) {
+						var ok bool
+						if ok, interrupted = p.waitReplayRoom(n); !ok {
 							p.Abort()
 							return
 						}
-						p.replay.ring.append(buf[:n])
+						if interrupted {
+							// A swap or suspension needs this pump at its boundary, and
+							// the ACKs that would make room only come after it: hold the
+							// read instead of letting the ring grow past its limit.
+							pend = n
+						} else {
+							p.replay.ring.append(buf[:n])
+						}
 					}
-					w, werr := writeFull(dst, buf[:n])
-					p.upBytes.Add(uint64(w))
-					if sniffer {
-						usage.AddOrUpdatePort(remotePort, uint64(n))
-					}
-					if werr != nil {
-						p.Abort()
-						return
+					if !interrupted {
+						w, werr := writeFull(dst, buf[:n])
+						p.upBytes.Add(uint64(w))
+						if sniffer {
+							usage.AddOrUpdatePort(remotePort, uint64(n))
+						}
+						if werr != nil && !p.Suspend() {
+							p.Abort()
+							return
+						}
 					}
 				}
 				srcErr = err
 			}
 
 			p.mu.Lock()
+			if p.suspended {
+				p.mu.Unlock()
+				ndst, ok := p.parkUp()
+				if !ok {
+					return
+				}
+				dst = ndst
+				if isTimeout(srcErr) {
+					srcErr = nil
+				}
+				continue run
+			}
 			if p.freezeReq && !p.frozen {
 				// Boundary: every byte read from the app so far is written to the
 				// tunnel, so UpBytes is final. A timeout here is our own wakeup.
@@ -542,6 +609,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				_ = app.SetReadDeadline(time.Time{})
 				ack := p.upAck
 				installCh = p.installCh
+				suspendCh = p.suspendCh
 				p.mu.Unlock()
 				close(ack)
 				if isTimeout(srcErr) {
@@ -554,8 +622,14 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				_ = app.SetReadDeadline(time.Time{})
 				srcErr = nil
 			}
+			if pend > 0 {
+				// The freeze that interrupted the send was withdrawn: send it now.
+				p.mu.Unlock()
+				continue run
+			}
 			if srcErr != nil {
 				p.upEnded = true
+				p.checkParkedLocked()
 				p.mu.Unlock()
 				if srcErr == io.EOF {
 					closeWrite(dst) // the upload's EOF goes to its destination
@@ -570,10 +644,21 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 		// Frozen: wait for the peer's count and the new tunnel (or the flow's end).
 		select {
 		case <-installCh:
+		case <-suspendCh:
 		case <-p.abortCh:
 			return
 		}
 		p.mu.Lock()
+		if p.suspended {
+			// The tunnel died and the swap with it: carry on after the resume.
+			p.mu.Unlock()
+			ndst, ok := p.parkUp()
+			if !ok {
+				return
+			}
+			dst = ndst
+			continue
+		}
 		dst = p.next // published by Install before installCh was closed
 		p.upDst = dst
 		p.mu.Unlock()
@@ -591,6 +676,7 @@ func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer 
 	src := p.cur
 	p.mu.Unlock()
 
+dl:
 	for { // one pass per tunnel the flow is carried on
 		// src -> app. Before Install there is no limit (the peer can never have
 		// written more than its final count); after it, never read past the limit.
@@ -646,11 +732,12 @@ func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer 
 			// this direction is over.
 			p.mu.Lock()
 			waitInstall := !p.installed && p.frozen
-			installCh := p.installCh
+			installCh, suspendCh := p.installCh, p.suspendCh
 			p.mu.Unlock()
 			if waitInstall {
 				select {
 				case <-installCh:
+				case <-suspendCh: // the swap died with the tunnel
 				case <-p.abortCh:
 					return
 				}
@@ -666,6 +753,7 @@ func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer 
 			case !installed && err == io.EOF:
 				p.mu.Lock()
 				p.dlEnded = true
+				p.checkParkedLocked()
 				p.mu.Unlock()
 				if p.replay != nil {
 					p.kickAck() // the peer is still waiting to learn how much arrived
@@ -673,6 +761,16 @@ func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer 
 				closeWrite(app) // clean end of the download
 				return
 			default:
+				// A tunnel that failed (not one the peer aborted on purpose) does not
+				// end a flow that can be resumed on another.
+				if p.replay != nil && !errors.Is(err, errHalfCloseAborted) && p.Suspend() {
+					nsrc, ok := p.parkDl()
+					if !ok {
+						return
+					}
+					src = nsrc
+					continue dl
+				}
 				p.Abort() // truncation or transport error
 				return
 			}
@@ -680,6 +778,15 @@ func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer 
 		}
 
 		p.mu.Lock()
+		if p.suspended {
+			p.mu.Unlock()
+			nsrc, ok := p.parkDl()
+			if !ok {
+				return
+			}
+			src = nsrc
+			continue
+		}
 		src = p.next
 		p.mu.Unlock()
 		p.switched(false)
@@ -702,11 +809,15 @@ type replayState struct {
 	ring     *replayRing
 	ackEvery uint64 // acknowledge after this many newly delivered bytes ...
 
-	ackSent  atomic.Uint64 // highest offset acknowledged to the peer so far
-	ackGen   atomic.Uint64 // bumped when ackSent is reset by a swap
-	ackMu    sync.Mutex    // makes "record the ack" and "reset by a swap" exclusive
-	ackBusy  atomic.Bool   // a flushAck is running
-	timerSet atomic.Bool   // a delayed ack is armed
+	ackSent atomic.Uint64 // highest offset acknowledged to the peer so far
+	ackGen  atomic.Uint64 // bumped when ackSent is reset by a swap
+	ackMu   sync.Mutex    // makes "record the ack" and "reset by a swap" exclusive
+	ackBusy atomic.Bool   // a flushAck is running
+	// endAckSent: the ACK that told the peer this side's download ended has been
+	// sent on the current tunnel. endAcked: the peer's said the same of ours.
+	endAckSent atomic.Bool
+	endAcked   atomic.Bool
+	timerSet   atomic.Bool // a delayed ack is armed
 }
 
 // resetAcked forgets what was acknowledged: the new tunnel has not heard any of it.
@@ -714,18 +825,26 @@ func (r *replayState) resetAcked() {
 	r.ackMu.Lock()
 	r.ackGen.Add(1)
 	r.ackSent.Store(0)
+	r.endAckSent.Store(false)
 	r.ackMu.Unlock()
 }
 
 // noteAcked records that dl was acknowledged, unless a swap reset the bookkeeping
 // since gen was read (the ack then went to a tunnel that is gone).
-func (r *replayState) noteAcked(gen, dl uint64) {
+func (r *replayState) noteAcked(gen, dl uint64, ended bool) {
 	r.ackMu.Lock()
 	if r.ackGen.Load() == gen {
 		r.ackSent.Store(dl)
+		if ended {
+			r.endAckSent.Store(true)
+		}
 	}
 	r.ackMu.Unlock()
 }
+
+// endAckFlag, set in the offset of an ACK, says the sender's download has ended:
+// the peer's END arrived, so the peer need not resend it after a cut.
+const endAckFlag = 1 << 63
 
 // ackDelay bounds how long delivered bytes go unacknowledged when too few arrive
 // to reach ackEvery, so the peer's replay buffer does not hold them for ever.
@@ -763,7 +882,14 @@ func (p *PumpSwapper) ReplayLen() int {
 // attachAcks routes the ACK records arriving on c to the replay ring.
 func (p *PumpSwapper) attachAcks(c net.Conn) {
 	if ac, ok := c.(ackConn); ok {
-		ac.SetAckHandler(p.replay.ring.ackTo)
+		r := p.replay
+		ac.SetAckHandler(func(off uint64) {
+			if off&endAckFlag != 0 {
+				off &^= endAckFlag
+				r.endAcked.Store(true)
+			}
+			r.ring.ackTo(off)
+		})
 	}
 }
 
@@ -808,29 +934,39 @@ func (p *PumpSwapper) flushAck() {
 	r := p.replay
 	for {
 		gen := r.ackGen.Load()
-		if dl := p.dlBytes.Load(); dl > r.ackSent.Load() {
+		p.mu.Lock()
+		ended := p.dlEnded
+		p.mu.Unlock()
+		if dl := p.dlBytes.Load(); dl > r.ackSent.Load() || (ended && !r.endAckSent.Load()) {
 			p.mu.Lock()
 			c := p.upDst
 			p.mu.Unlock()
+			v := dl
+			if ended {
+				v |= endAckFlag // also tells the peer its END arrived
+			}
 			ac, ok := c.(ackConn)
-			if !ok || ac.SendAck(dl) != nil {
+			if !ok || ac.SendAck(v) != nil {
 				if r.ackGen.Load() != gen {
 					continue // the tunnel it failed on was just replaced: send on the new one
 				}
 				r.ackBusy.Store(false) // a dead tunnel is for the resume logic to notice
 				return
 			}
-			r.noteAcked(gen, dl)
+			r.noteAcked(gen, dl, ended)
 		}
 		r.ackBusy.Store(false)
 		// More may have been delivered while this one was being sent. A kick that
 		// arrived meanwhile was dropped (busy), so whatever is left must either be
 		// sent now or get its own timer: nothing else will remember it.
+		p.mu.Lock()
+		ended = p.dlEnded // may have ended while the ACK above was in flight
+		p.mu.Unlock()
 		rest := p.dlBytes.Load() - r.ackSent.Load()
-		if rest == 0 {
+		if rest == 0 && (!ended || r.endAckSent.Load()) {
 			return
 		}
-		if rest < r.ackEvery {
+		if rest < r.ackEvery && !(ended && !r.endAckSent.Load()) {
 			p.armAckTimer()
 			return
 		}
@@ -840,26 +976,33 @@ func (p *PumpSwapper) flushAck() {
 	}
 }
 
-// waitReplayRoom waits until the replay ring can take n more bytes. It gives up
-// waiting when a freeze is pending: the sender must be able to reach its boundary
-// without ACKs (they may only arrive after the swap), so the ring may exceed its
-// limit by this one read. It reports false when the flow was aborted.
-func (p *PumpSwapper) waitReplayRoom(n int) bool {
+// waitReplayRoom waits until the replay ring can take n more bytes. It stops
+// waiting (interrupted) when a freeze or suspension is pending: the sender must be
+// able to reach its boundary without ACKs, which may only arrive after the swap or
+// resume, so the caller holds its read back rather than overfilling the ring. ok is
+// false when the flow was aborted.
+func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
 	for {
+		p.mu.Lock()
+		suspended := p.suspended
+		p.mu.Unlock()
+		if suspended {
+			return true, true // nothing can be acknowledged until the flow resumes
+		}
 		err := p.replay.ring.waitFree(p.ctx, p.abortCh, p.freezeWake, n)
 		switch {
 		case err == nil:
-			return true
+			return true, false
 		case err == errReplayWake:
 			p.mu.Lock()
-			pending := p.freezeReq && !p.frozen
+			pending := (p.freezeReq && !p.frozen) || p.suspended
 			p.mu.Unlock()
 			if pending {
-				return true
+				return true, true
 			}
 			// A stale nudge from a freeze that has since been withdrawn.
 		default:
-			return false
+			return false, false
 		}
 	}
 }

@@ -258,7 +258,10 @@ type WsMuxTransport struct {
 	// arrived over and a live RTT estimate so leg selection can steer toward the
 	// lowest-latency, least-loaded connection and spread a flow across distinct
 	// CDNs. The non-striped TCP path never touches this.
-	sessionsMu    sync.Mutex
+	sessionsMu sync.Mutex
+	// flowsMu guards flows: the running resumable flows by id (see wsmux_resume.go).
+	flowsMu       sync.Mutex
+	flows         map[uint64]*resumableFlow
 	sessions      []*pooledSession
 	stripeGroupID uint32
 	// plainSelectMu guards only single-leg (plain) flow *selection* and the
@@ -525,6 +528,9 @@ func (s *WsMuxTransport) Restart() {
 	s.sessionsMu.Lock()
 	s.sessions = nil
 	s.sessionsMu.Unlock()
+	s.flowsMu.Lock()
+	s.flows = nil
+	s.flowsMu.Unlock()
 
 	s.Start()
 }

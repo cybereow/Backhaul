@@ -32,12 +32,34 @@ func newFlowEnd(t *testing.T, ctx context.Context, tunnel net.Conn) *flowEnd {
 	return &flowEnd{user: u, pump: p}
 }
 
+// tunnelPair is a connected pair of tunnels. Enveloped tunnels are what
+// resumable flows run on in production: smux streams wrapped in the half-close
+// envelope, where a peer that closes the stream without an END surfaces as an
+// error, not as io.EOF. They use real smux streams on purpose: a raw TCP socket
+// closed with unread data sends an RST that makes the peer drop what it had not
+// read yet, which a stream close never does, and would fail these tests for a
+// reason that cannot happen in production. The plain ones are TCP sockets, which
+// (unlike a smux stream) can half-close.
+func tunnelPair(t *testing.T, enveloped bool) (net.Conn, net.Conn) {
+	t.Helper()
+	if enveloped {
+		a, b := streamPair(t)
+		return NewHalfCloseConn(a), NewHalfCloseConn(b)
+	}
+	return tcpConnPair(t)
+}
+
 // swapTunnel runs one whole two-sided swap: both ends freeze, exchange their
 // counts (here directly, in production over the new leg) and install a fresh
 // tunnel.
 func swapTunnel(t *testing.T, ctx context.Context, a, b *PumpSwapper) error {
 	t.Helper()
-	na, nb := tcpConnPair(t)
+	return swapTunnelWith(t, ctx, a, b, false)
+}
+
+func swapTunnelWith(t *testing.T, ctx context.Context, a, b *PumpSwapper, enveloped bool) error {
+	t.Helper()
+	na, nb := tunnelPair(t, enveloped)
 
 	var ownA, ownB uint64
 	var errA, errB error
@@ -203,12 +225,14 @@ func TestPumpSwapperRandomSwaps(t *testing.T) {
 	if testing.Short() {
 		seeds = 6
 	}
-	for seed := int64(1); seed <= int64(seeds); seed++ {
-		seed := seed
-		t.Run(fmt.Sprintf("seed%d", seed), func(t *testing.T) {
-			t.Parallel()
-			runRandomSwaps(t, seed)
-		})
+	for _, enveloped := range []bool{false, true} {
+		for seed := int64(1); seed <= int64(seeds); seed++ {
+			seed, enveloped := seed, enveloped
+			t.Run(fmt.Sprintf("enveloped=%v/seed%d", enveloped, seed), func(t *testing.T) {
+				t.Parallel()
+				runRandomSwaps(t, seed, enveloped)
+			})
+		}
 	}
 }
 
@@ -236,10 +260,10 @@ func paced(w io.Writer, data []byte, rng *rand.Rand) error {
 	return nil
 }
 
-func runRandomSwaps(t *testing.T, seed int64) {
+func runRandomSwaps(t *testing.T, seed int64, enveloped bool) {
 	rng := rand.New(rand.NewSource(seed))
 	ctx, _ := testCtx(t)
-	a0, b0 := tcpConnPair(t)
+	a0, b0 := tunnelPair(t, enveloped)
 	A, B := newFlowEnd(t, ctx, a0), newFlowEnd(t, ctx, b0)
 
 	nSwaps := 1 + rng.Intn(6)
@@ -280,7 +304,7 @@ func runRandomSwaps(t *testing.T, seed int64) {
 
 	for i := 0; i < nSwaps; i++ {
 		time.Sleep(time.Duration(rng.Intn(6)) * time.Millisecond)
-		if err := swapTunnel(t, ctx, A.pump, B.pump); err != nil {
+		if err := swapTunnelWith(t, ctx, A.pump, B.pump, enveloped); err != nil {
 			close(swapsDone)
 			t.Fatalf("swap %d/%d: %v", i+1, nSwaps, err)
 		}
@@ -306,4 +330,102 @@ func runRandomSwaps(t *testing.T, seed int64) {
 	if A.pump.Swaps() != uint64(nSwaps) || B.pump.Swaps() != uint64(nSwaps) {
 		t.Fatalf("swaps: A=%d B=%d want %d", A.pump.Swaps(), B.pump.Swaps(), nSwaps)
 	}
+}
+
+// The PROXY protocol header is payload for the peer (its app receives it), so it
+// must count in UpBytes: otherwise the count exchanged at a swap is short by its
+// length and the peer switches tunnels too early.
+func TestPumpSwapperCountsProxyHeader(t *testing.T) {
+	ctx, _ := testCtx(t)
+	tunnel, peer := tcpConnPair(t)
+	u, appc := tcpConnPair(t)
+	p := PromotablePump(ctx, true, appc, tunnel, testLogger(), testUsage(t), 0, false)
+	if p == nil {
+		t.Fatal("PromotablePump returned nil")
+	}
+	header, err := ProxyProtocolHeader(appc.RemoteAddr(), tunnel.RemoteAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readExact(t, peer, len(header)); !bytes.Equal(got, header) {
+		t.Fatal("the PROXY header did not reach the peer first")
+	}
+	msg := genPayload(1234)
+	u.Write(msg)
+	if got := readExact(t, peer, len(msg)); !bytes.Equal(got, msg) {
+		t.Fatal("payload after the header differs")
+	}
+	// The pump counts a write after it returns, which can be after the peer has
+	// already read it.
+	want := uint64(len(header) + len(msg))
+	deadline := time.Now().Add(hcTestTimeout)
+	for p.UpBytes() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("UpBytes = %d, want %d (header counted)", p.UpBytes(), want)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// The peer may finish its own swap and release the old tunnel before this end's
+// Install ran. Over the envelope that release is an error (the stream closes
+// without an END, or with the peer's ABORT), not io.EOF: the download must wait
+// for the Install, see that every promised byte already arrived, and carry on.
+func TestPumpSwapperPeerReleasesOldTunnelBeforeInstall(t *testing.T) {
+	ctx, _ := testCtx(t)
+	a0, b0 := tunnelPair(t, true)
+	A, B := newFlowEnd(t, ctx, a0), newFlowEnd(t, ctx, b0)
+
+	up, dn := genPayload(60000), genPayload(45000)
+	A.user.Write(up[:30000])
+	B.user.Write(dn[:20000])
+	readExact(t, B.user, 30000)
+	readExact(t, A.user, 20000)
+
+	var ownA, ownB uint64
+	var errA, errB error
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); ownA, errA = A.pump.FreezeUp(ctx) }()
+	go func() { defer wg.Done(); ownB, errB = B.pump.FreezeUp(ctx) }()
+	wg.Wait()
+	if errA != nil || errB != nil {
+		t.Fatalf("freeze: %v %v", errA, errB)
+	}
+
+	// B installs and completes its whole swap, releasing the old tunnel, while A
+	// has not installed yet.
+	na, nb := tunnelPair(t, true)
+	if err := B.pump.Install(nb, ownA); err != nil {
+		t.Fatal(err)
+	}
+	waitSwaps(t, B.pump, 1)
+
+	// Give A's download time to see the released tunnel. It must not take the
+	// flow down: the install is still coming.
+	select {
+	case <-A.pump.DoneWait():
+		t.Fatal("the flow died when the peer released the old tunnel before our install")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	if err := A.pump.Install(na, ownB); err != nil {
+		t.Fatalf("install after the peer had already swapped: %v", err)
+	}
+	waitSwaps(t, A.pump, 1)
+
+	A.user.Write(up[30000:])
+	B.user.Write(dn[20000:])
+	A.user.CloseWrite()
+	B.user.CloseWrite()
+	gotB, err := readAllDeadline(B.user)
+	if err != nil || !bytes.Equal(gotB, up[30000:]) {
+		t.Fatalf("B user: %d bytes err=%v", len(gotB), err)
+	}
+	gotA, err := readAllDeadline(A.user)
+	if err != nil || !bytes.Equal(gotA, dn[20000:]) {
+		t.Fatalf("A user: %d bytes err=%v", len(gotA), err)
+	}
+	waitDone(t, A.pump, "A")
+	waitDone(t, B.pump, "B")
 }

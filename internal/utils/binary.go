@@ -272,7 +272,92 @@ const (
 	// identical to FlowPlain (flowID is always 0). Only ever sent to a peer that
 	// offered the halfclose-v1 capability: an older client would misparse it.
 	FlowPlainHC byte = 0x06
+	// FlowResumable is a plain flow that can be moved to another tunnel stream
+	// while it runs (see docs/resumable-flows-plan.md). Header identical to
+	// FlowPlain, with a random non-zero flowID; the stream payload is wrapped in
+	// the half-close envelope from its first byte, because the payload format of
+	// a stream cannot change after it is opened.
+	FlowResumable byte = 0x07
+	// FlowAttach asks the peer to move the resumable flow flowID onto the stream
+	// it arrives on (see SendFlowAttach).
+	FlowAttach byte = 0x08
 )
+
+// Attach modes (FlowAttach header).
+const (
+	// AttachDrained: planned move. The old tunnel is still healthy, so both ends
+	// freeze, exchange their sent counts and drain it; nothing is replayed.
+	AttachDrained byte = 0
+	// AttachResume is reserved for resuming after an unannounced loss (replay from
+	// the peer's received offset). Not implemented yet; peers must reject it.
+	AttachResume byte = 1
+)
+
+// Why a peer refused an attach (second byte of the verdict).
+const (
+	AttachRejectUnknownFlow byte = 1 // no such flow, or it already finished
+	AttachRejectBusy        byte = 2 // a swap of that flow is already in progress
+	AttachRejectUnsupported byte = 3 // mode or flags not understood
+)
+
+// SendFlowResumable writes the FlowResumable header (same layout as FlowPlain).
+func SendFlowResumable(conn net.Conn, flowID uint64, remoteAddr string) error {
+	return sendFlowPlainKind(conn, FlowResumable, flowID, remoteAddr)
+}
+
+// ReceiveFlowResumable reads the FlowResumable header; the kind byte is consumed
+// separately by ReadFlowKind.
+func ReceiveFlowResumable(conn net.Conn) (flowID uint64, remoteAddr string, err error) {
+	return ReceiveFlowPlain(conn)
+}
+
+// SendFlowAttach writes the FlowAttach header: kind | flowID(8) | mode(1) |
+// flags(1). flags is reserved (must be 0 today) so a later capability does not
+// have to change the header.
+func SendFlowAttach(conn net.Conn, flowID uint64, mode, flags byte) error {
+	var buf [1 + 8 + 1 + 1]byte
+	buf[0] = FlowAttach
+	binary.BigEndian.PutUint64(buf[1:9], flowID)
+	buf[9] = mode
+	buf[10] = flags
+	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to send attach header: %w", err)
+	}
+	return nil
+}
+
+// ReceiveFlowAttach reads the FlowAttach header after the kind byte.
+func ReceiveFlowAttach(conn net.Conn) (flowID uint64, mode, flags byte, err error) {
+	var buf [8 + 1 + 1]byte
+	if _, err = io.ReadFull(conn, buf[:]); err != nil {
+		return 0, 0, 0, fmt.Errorf("failed to read attach header: %w", err)
+	}
+	return binary.BigEndian.Uint64(buf[0:8]), buf[8], buf[9], nil
+}
+
+// WriteAttachVerdict answers an attach: accept, or reject with one of the
+// AttachReject* reasons. A rejection happens before either end freezes, so the
+// flow simply stays where it is.
+func WriteAttachVerdict(conn net.Conn, accept bool, reason byte) error {
+	buf := [2]byte{0, reason}
+	if accept {
+		buf[0] = 1
+		buf[1] = 0
+	}
+	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to send attach verdict: %w", err)
+	}
+	return nil
+}
+
+// ReadAttachVerdict reads the answer to an attach.
+func ReadAttachVerdict(conn net.Conn) (accept bool, reason byte, err error) {
+	var buf [2]byte
+	if _, err = io.ReadFull(conn, buf[:]); err != nil {
+		return false, 0, fmt.Errorf("failed to read attach verdict: %w", err)
+	}
+	return buf[0] == 1, buf[1], nil
+}
 
 func SendFlowPlain(conn net.Conn, flowID uint64, remoteAddr string) error {
 	return sendFlowPlainKind(conn, FlowPlain, flowID, remoteAddr)

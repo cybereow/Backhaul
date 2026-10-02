@@ -1096,6 +1096,27 @@ func (c *WsMuxTransport) setupStream(stream *smux.Stream, remote string, run fun
 		} else {
 			ready(func() { c.localDialer(stream, remoteAddr) })
 		}
+	case utils.FlowResumable:
+		// A plain flow that can later be moved to another stream. The payload is
+		// wrapped in the half-close envelope from its first byte (the stream's
+		// payload format cannot change once it is open), so a zero flowID cannot
+		// name it.
+		flowID, remoteAddr, err := utils.ReceiveFlowResumable(stream)
+		if err == nil && flowID == 0 {
+			err = fmt.Errorf("zero flow id on a resumable flow")
+		}
+		if err != nil {
+			bad("bad resumable flow header", err)
+			return
+		}
+		ready(func() { c.localDialerResumable(stream, flowID, remoteAddr) })
+	case utils.FlowAttach:
+		flowID, mode, flags, err := utils.ReceiveFlowAttach(stream)
+		if err != nil {
+			bad("bad attach header", err)
+			return
+		}
+		ready(func() { c.handleAttachStream(stream, flowID, mode, flags) })
 	case utils.FlowStriped:
 		striped()
 	case utils.FlowPromote:
@@ -1380,6 +1401,104 @@ func (c *WsMuxTransport) localDialerPlain(stream *smux.Stream, flowID uint64, re
 	c.promotableFlowsMu.Lock()
 	delete(c.promotableFlows, flowID)
 	c.promotableFlowsMu.Unlock()
+}
+
+// localDialerResumable runs a resumable flow: the same promotable pump as a
+// promoted flow, over the half-close envelope. The swapper is published for the
+// server's attach BEFORE any byte moves, so an attach can never find the flow
+// missing or half-built.
+func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64, remoteAddr string) {
+	ctx := c.ctx // this worker's generation, read once
+	port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
+	if err != nil {
+		c.logger.Infof("failed to resolve remote port: %v", err)
+		stream.Close()
+		return
+	}
+
+	var sendBuf, recvBuf int
+	if strings.Contains(resolvedAddr, "127.0.0.1") {
+		sendBuf, recvBuf = 32*1024, 32*1024 // localhost
+	} else if c.config.AggressivePool {
+		sendBuf = 32 * 1024
+		recvBuf = 32 * 1024
+	}
+
+	localConnection, err := network.TcpDialer(ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
+	if err != nil {
+		c.logger.Errorf("local dialer: %v", err)
+		stream.Close()
+		return
+	}
+
+	swapper := handlers.NewPromotablePump(ctx, false, localConnection, handlers.NewHalfCloseConn(stream), c.logger, c.usageMonitor, port, c.config.Sniffer)
+	if swapper == nil {
+		return
+	}
+	c.promotableFlowsMu.Lock()
+	c.promotableFlows[flowID] = swapper
+	c.promotableFlowsMu.Unlock()
+	swapper.Start()
+
+	<-swapper.DoneWait()
+
+	c.promotableFlowsMu.Lock()
+	delete(c.promotableFlows, flowID)
+	c.promotableFlowsMu.Unlock()
+}
+
+// handleAttachStream answers the server's request to move flow flowID onto this
+// stream. The verdict is given before anything freezes, so a refusal (unknown or
+// finished flow, a swap already running, a mode or flags this client does not
+// know) leaves the flow exactly where it was. After an accept both ends freeze,
+// exchange their sent counts, and the flow continues on this stream.
+func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, mode, flags byte) {
+	ctx := c.ctx // this worker's generation, read once
+
+	c.promotableFlowsMu.Lock()
+	swapper := c.promotableFlows[flowID]
+	c.promotableFlowsMu.Unlock()
+
+	reject := func(reason byte, why string) {
+		c.logger.Debugf("attach of flow %d refused: %s", flowID, why)
+		_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
+		_ = utils.WriteAttachVerdict(stream, false, reason)
+		stream.Close()
+	}
+	switch {
+	case mode != utils.AttachDrained || flags != 0:
+		reject(utils.AttachRejectUnsupported, fmt.Sprintf("mode %d flags %d", mode, flags))
+		return
+	case swapper == nil:
+		reject(utils.AttachRejectUnknownFlow, "unknown or finished flow")
+		return
+	case !swapper.Swappable():
+		reject(utils.AttachRejectBusy, "flow busy or finished")
+		return
+	}
+
+	_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
+	if err := utils.WriteAttachVerdict(stream, true, 0); err != nil {
+		stream.Close()
+		return
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+
+	err := swapper.Promote(ctx, []net.Conn{stream}, func() (net.Conn, error) {
+		return handlers.NewHalfCloseConn(stream), nil
+	})
+	if err != nil {
+		// A flow that finished on its own while the attach was in flight is not a
+		// failure worth a warning.
+		select {
+		case <-swapper.DoneWait():
+			c.logger.Debugf("attach of flow %d: the flow had already finished (%v)", flowID, err)
+		default:
+			c.logger.Warnf("moving flow %d failed: %v", flowID, err)
+		}
+		return
+	}
+	c.logger.Debugf("flow %d moved to a new stream", flowID)
 }
 
 func (c *WsMuxTransport) handlePromoteStream(stream *smux.Stream, flowID uint64, groupID uint32, index, total, parity uint8) {

@@ -25,70 +25,110 @@ var PromoteHandshakeTimeout = 10 * time.Second
 var ErrPromoteUnavailable = errors.New("promotable pump: flow cannot be promoted")
 
 // PumpSwapper runs one flow as two independent pumps and can migrate it from
-// its plain (old) tunnel to a striped (new) one mid-stream without dropping or
-// duplicating a byte.
+// its current tunnel to a new one mid-stream, any number of times, without
+// dropping or duplicating a byte.
 //
-// Byte ownership: the upload pump exclusively owns app reads and old-tunnel
-// writes; the download pump exclusively owns old-tunnel reads and app writes.
-// The state below is guarded by mu, which is never held across I/O (only
-// non-blocking SetReadDeadline calls, used to wake an owner that is parked in a
-// blocking Read).
+// Byte ownership: the upload pump exclusively owns app reads and tunnel writes;
+// the download pump exclusively owns tunnel reads and app writes. The state
+// below is guarded by mu, which is never held across I/O (only non-blocking
+// SetReadDeadline calls, used to wake an owner that is parked in a blocking
+// Read).
 //
-// Transition:
+// Offsets: UpBytes and DlBytes count payload bytes from the START OF THE FLOW,
+// not of the current tunnel, and are what the swap handshake exchanges. A swap
+// therefore needs no per-tunnel base: "deliver until DlBytes == the peer's
+// count" means the same thing at every swap.
+//
+// One swap:
 //  1. FreezeUp asks the upload pump to stop at its next write boundary. The pump
-//     finishes any in-flight old-tunnel write, then acks; the acked count is the
-//     final number of bytes committed to the old tunnel.
+//     finishes any in-flight write, then acks; UpBytes at that moment is the
+//     final number of bytes committed to the current tunnel.
 //  2. The peer's count arrives (raw legs, before any striped wrapper exists) and
 //     Install hands over the new tunnel. The download pump then delivers exactly
-//     dlLimit bytes from the old tunnel and switches; the upload pump starts on
-//     the new tunnel.
-//  3. Once both directions have switched, the old tunnel is released.
+//     that many bytes in total from the current tunnel and switches; the upload
+//     pump starts on the new tunnel.
+//  3. Once both directions have switched, the replaced tunnel is released and the
+//     flow is ready for the next swap. FreezeUp refuses (ErrPromoteUnavailable)
+//     while a swap is still in progress.
 //
-// Failing before the freeze ack leaves the flow plain. Failing after it is not
-// recoverable (the peer may have frozen) and ends in Abort.
+// A direction that already ended (END sent or received) has nothing to stop or
+// switch: its end is simply re-sent on the new tunnel, so a half-closed flow
+// can still be moved while the other direction keeps running.
+//
+// Failing before the freeze ack leaves the flow on its current tunnel. Failing
+// after it is not recoverable (the peer may have frozen) and ends in Abort.
 type PumpSwapper struct {
 	app net.Conn
-	old net.Conn // plain tunnel, immutable
 
-	upBytes atomic.Uint64
-	dlBytes atomic.Uint64
-	phases  atomic.Int32 // directions still on the old tunnel
+	upBytes atomic.Uint64 // payload bytes committed to a tunnel, from the start of the flow
+	dlBytes atomic.Uint64 // payload bytes delivered to the app, from the start of the flow
 	done    chan struct{}
 
-	mu        sync.Mutex
-	newTunnel net.Conn
-	freezeReq bool // FreezeUp asked; upload pump must stop at the next boundary
-	frozen    bool // upload pump acked; upLimit is final
-	installed bool
-	ended     bool // a direction finished on the old tunnel: no promotion any more
-	aborted   bool
-	upLimit   uint64
-	dlLimit   uint64
+	mu  sync.Mutex
+	cur net.Conn // tunnel in service; replaced when a swap completes
+
+	// The swap in progress (zero values = none).
+	freezeReq  bool // FreezeUp asked; upload pump must stop at the next boundary
+	frozen     bool // upload acked (or had already ended); upLimit is final
+	installed  bool
+	upSwitched bool // the upload direction is on next (or has ended)
+	dlSwitched bool // the download direction is on next (or has ended)
+	next       net.Conn
+	upLimit    uint64
+	dlLimit    uint64
+
+	upEnded bool // the upload direction finished normally
+	dlEnded bool // the download direction finished normally
+	aborted bool
+	swaps   uint64 // completed swaps
 
 	upAck     chan struct{} // closed when the upload pump acks the freeze
 	installCh chan struct{} // closed by Install
 	abortCh   chan struct{} // closed by Abort
-
-	oldOnce sync.Once
 }
 
 func (p *PumpSwapper) DoneWait() <-chan struct{} {
 	return p.done
 }
 
+// UpBytes is the number of payload bytes committed to a tunnel since the start
+// of the flow.
 func (p *PumpSwapper) UpBytes() uint64 { return p.upBytes.Load() }
+
+// DlBytes is the number of payload bytes delivered to the app since the start of
+// the flow.
 func (p *PumpSwapper) DlBytes() uint64 { return p.dlBytes.Load() }
 
-// phaseDone records that one direction has switched to the new tunnel; the last
-// one releases the old tunnel, outside any lock.
-func (p *PumpSwapper) phaseDone() {
-	if p.phases.Add(-1) == 0 {
-		go p.closeOld()
-	}
+// Swaps is the number of swaps that have fully completed.
+func (p *PumpSwapper) Swaps() uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.swaps
 }
 
-func (p *PumpSwapper) closeOld() {
-	p.oldOnce.Do(func() { p.old.Close() })
+// switched records that one direction is on the new tunnel; the second one
+// completes the swap: the replaced tunnel is released (outside any lock) and the
+// swap state is reset for the next one.
+func (p *PumpSwapper) switched(up bool) {
+	p.mu.Lock()
+	if up {
+		p.upSwitched = true
+	} else {
+		p.dlSwitched = true
+	}
+	if !p.upSwitched || !p.dlSwitched {
+		p.mu.Unlock()
+		return
+	}
+	old := p.cur
+	p.cur, p.next = p.next, nil
+	p.freezeReq, p.frozen, p.installed = false, false, false
+	p.upSwitched, p.dlSwitched = false, false
+	p.upAck = make(chan struct{})
+	p.installCh = make(chan struct{})
+	p.swaps++
+	p.mu.Unlock()
+	go old.Close()
 }
 
 // Abort tears the whole flow down: every conn is closed (destinations that can
@@ -103,7 +143,7 @@ func (p *PumpSwapper) Abort() {
 	}
 	p.aborted = true
 	close(p.abortCh)
-	conns := [3]net.Conn{p.app, p.old, p.newTunnel}
+	conns := [3]net.Conn{p.app, p.cur, p.next}
 	p.mu.Unlock()
 
 	for _, c := range conns {
@@ -124,6 +164,8 @@ func PromotablePump(
 ) *PumpSwapper {
 
 	if proxyProtocol {
+		// Written before any pump runs and counted by neither offset: it is not
+		// payload and must never be replayed on a later tunnel.
 		if err := WriteProxyProtocol(app, tunnel); err != nil {
 			logger.Error(err)
 			app.Close()
@@ -134,13 +176,12 @@ func PromotablePump(
 
 	p := &PumpSwapper{
 		app:       app,
-		old:       tunnel,
+		cur:       tunnel,
 		done:      make(chan struct{}),
 		upAck:     make(chan struct{}),
 		installCh: make(chan struct{}),
 		abortCh:   make(chan struct{}),
 	}
-	p.phases.Store(2)
 
 	go func() {
 		select {
@@ -153,13 +194,13 @@ func PromotablePump(
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// App -> Tunnel (Upload direction relative to the plain tunnel's writes)
+	// App -> Tunnel (Upload direction relative to the tunnel's writes)
 	go func() {
 		defer wg.Done()
 		p.pumpAppToTunnel(usage, remotePort, sniffer)
 	}()
 
-	// Tunnel -> App (Download direction relative to the plain tunnel's reads)
+	// Tunnel -> App (Download direction relative to the tunnel's reads)
 	go func() {
 		defer wg.Done()
 		p.pumpTunnelToApp(usage, remotePort, sniffer)
@@ -169,12 +210,14 @@ func PromotablePump(
 		wg.Wait()
 		close(p.done)
 		app.Close()
-		p.closeOld()
 		p.mu.Lock()
-		nt := p.newTunnel
+		cur, next := p.cur, p.next
 		p.mu.Unlock()
-		if nt != nil {
-			nt.Close()
+		if cur != nil {
+			cur.Close()
+		}
+		if next != nil {
+			next.Close()
 		}
 	}()
 
@@ -182,18 +225,30 @@ func PromotablePump(
 }
 
 // FreezeUp stops the upload direction at a write boundary and returns the final
-// number of bytes committed to the old tunnel. It blocks until the upload pump
-// has completed any in-flight old-tunnel write, bounded by ctx. On failure it
-// withdraws the request: the flow keeps running plain (ErrPromoteUnavailable,
-// ctx error, or an aborted/finished flow).
+// number of bytes committed to the current tunnel (counted from the start of the
+// flow). It blocks until the upload pump has completed any in-flight write,
+// bounded by ctx. On failure it withdraws the request: the flow keeps running on
+// its current tunnel (ErrPromoteUnavailable, ctx error, or an aborted/finished
+// flow). A swap that is still in progress also yields ErrPromoteUnavailable.
 func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	p.mu.Lock()
-	if p.aborted || p.ended || p.freezeReq {
-		err := fmt.Errorf("%w (aborted=%v ended=%v freeze pending=%v)", ErrPromoteUnavailable, p.aborted, p.ended, p.freezeReq)
+	if p.aborted || p.freezeReq || (p.upEnded && p.dlEnded) {
+		err := fmt.Errorf("%w (aborted=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.upEnded && p.dlEnded, p.freezeReq)
 		p.mu.Unlock()
 		return 0, err
 	}
 	p.freezeReq = true
+	ack := p.upAck
+	if p.upEnded {
+		// The upload already ended on the current tunnel: there is nothing to stop
+		// and the count is final. Install re-sends the end on the new tunnel.
+		p.frozen = true
+		p.upLimit = p.upBytes.Load()
+		n := p.upLimit
+		p.mu.Unlock()
+		close(ack)
+		return n, nil
+	}
 	// The upload pump may be parked in app.Read: wake it. It owns that read
 	// direction and clears the deadline itself.
 	_ = p.app.SetReadDeadline(time.Unix(1, 0))
@@ -201,7 +256,7 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 
 	var cause error
 	select {
-	case <-p.upAck:
+	case <-ack:
 		p.mu.Lock()
 		n := p.upLimit
 		p.mu.Unlock()
@@ -217,7 +272,7 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	select {
-	case <-p.upAck: // the ack raced the failure: the freeze did happen
+	case <-ack: // the ack raced the failure: the freeze did happen
 		return p.upLimit, nil
 	default:
 	}
@@ -227,22 +282,35 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 }
 
 // Install hands over the new tunnel after a successful freeze. dlLimit is the
-// peer's committed old-tunnel byte count: exactly that many bytes are delivered
-// from the old tunnel before the download switches. An error means the flow
-// ended or was aborted meanwhile; the caller must then Abort (post-freeze).
+// peer's committed byte count, from the start of the flow: exactly that many
+// bytes in total are delivered before the download switches. An error means the
+// flow ended or was aborted meanwhile; the caller must then Abort (post-freeze).
 func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.aborted || p.ended || !p.frozen || p.installed {
+	if p.aborted || !p.frozen || p.installed || (p.upEnded && p.dlEnded) {
+		p.mu.Unlock()
 		return ErrPromoteUnavailable
 	}
-	p.newTunnel = newTunnel
+	p.next = newTunnel
 	p.dlLimit = dlLimit
 	p.installed = true
-	// A download read already sitting at the boundary would wait forever for
-	// bytes the peer will never send: wake it.
-	_ = p.old.SetReadDeadline(time.Unix(1, 0))
-	close(p.installCh)
+	resendEnd := p.upEnded
+	if p.upEnded {
+		p.upSwitched = true // no pump left to switch
+	}
+	if p.dlEnded {
+		p.dlSwitched = true
+	} else {
+		// A download read already sitting at the boundary would wait forever for
+		// bytes the peer will never send: wake it.
+		_ = p.cur.SetReadDeadline(time.Unix(1, 0))
+	}
+	ic := p.installCh
+	p.mu.Unlock()
+	close(ic)
+	if resendEnd {
+		closeWrite(newTunnel) // the upload's EOF goes to the new tunnel too
+	}
 	return nil
 }
 
@@ -329,215 +397,178 @@ func writeFull(dst net.Conn, b []byte) (int, error) {
 }
 
 func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer bool) {
-	app, old := p.app, p.old
+	app := p.app
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer copyBufferPool.Put(bufPtr)
 
-	var total uint64 // bytes committed to the old tunnel
+	p.mu.Lock()
+	dst := p.cur
+	p.mu.Unlock()
 	var srcErr error // how the app read ended; delivered to whichever tunnel is current
 
-	// Phase 1: app -> old tunnel, until the app ends or a freeze is requested.
-	for {
-		if srcErr == nil {
-			n, err := app.Read(buf)
-			if n > 0 {
-				w, werr := writeFull(old, buf[:n])
-				total += uint64(w)
-				p.upBytes.Add(uint64(w))
-				if sniffer {
-					usage.AddOrUpdatePort(remotePort, uint64(n))
-				}
-				if werr != nil {
-					p.Abort()
-					return
-				}
-			}
-			srcErr = err
-		}
+	for { // one pass per tunnel the flow is carried on
+		var installCh chan struct{}
 
-		p.mu.Lock()
-		if p.freezeReq {
-			// Boundary: every byte read from the app so far is written to the old
-			// tunnel, so total is final. A timeout here is our own wakeup.
-			p.frozen = true
-			p.upLimit = total
-			_ = app.SetReadDeadline(time.Time{})
-			close(p.upAck)
-			p.mu.Unlock()
-			if isTimeout(srcErr) {
+		// app -> dst, until the app ends or a freeze is requested.
+	run:
+		for {
+			if srcErr == nil {
+				n, err := app.Read(buf)
+				if n > 0 {
+					w, werr := writeFull(dst, buf[:n])
+					p.upBytes.Add(uint64(w))
+					if sniffer {
+						usage.AddOrUpdatePort(remotePort, uint64(n))
+					}
+					if werr != nil {
+						p.Abort()
+						return
+					}
+				}
+				srcErr = err
+			}
+
+			p.mu.Lock()
+			if p.freezeReq && !p.frozen {
+				// Boundary: every byte read from the app so far is written to the
+				// tunnel, so UpBytes is final. A timeout here is our own wakeup.
+				p.frozen = true
+				p.upLimit = p.upBytes.Load()
+				_ = app.SetReadDeadline(time.Time{})
+				ack := p.upAck
+				installCh = p.installCh
+				p.mu.Unlock()
+				close(ack)
+				if isTimeout(srcErr) {
+					srcErr = nil
+				}
+				break run
+			}
+			if srcErr != nil && isTimeout(srcErr) {
+				// A wakeup whose freeze was withdrawn: not an application error.
+				_ = app.SetReadDeadline(time.Time{})
 				srcErr = nil
 			}
-			break
-		}
-		if srcErr != nil && isTimeout(srcErr) {
-			// A wakeup whose freeze was withdrawn: not an application error.
-			_ = app.SetReadDeadline(time.Time{})
-			srcErr = nil
-		}
-		if srcErr != nil {
-			p.ended = true
-			p.mu.Unlock()
-			if srcErr == io.EOF {
-				closeWrite(old) // the upload's EOF goes to its destination
-			} else {
-				p.Abort()
-			}
-			return
-		}
-		p.mu.Unlock()
-	}
-
-	// Frozen: wait for the peer's count and the new tunnel (or the flow's end).
-	select {
-	case <-p.installCh:
-	case <-p.abortCh:
-		return
-	}
-	dst := p.newTunnel // published by Install before installCh was closed
-	p.phaseDone()
-
-	// Phase 2: app -> new tunnel.
-	for {
-		if srcErr == nil {
-			n, err := app.Read(buf)
-			if n > 0 {
-				_, werr := writeFull(dst, buf[:n])
-				p.upBytes.Add(uint64(n))
-				if sniffer {
-					usage.AddOrUpdatePort(remotePort, uint64(n))
-				}
-				if werr != nil {
+			if srcErr != nil {
+				p.upEnded = true
+				p.mu.Unlock()
+				if srcErr == io.EOF {
+					closeWrite(dst) // the upload's EOF goes to its destination
+				} else {
 					p.Abort()
-					return
 				}
+				return
 			}
-			srcErr = err
+			p.mu.Unlock()
 		}
-		if srcErr != nil {
-			if srcErr == io.EOF {
-				closeWrite(dst)
-			} else {
-				p.Abort()
-			}
+
+		// Frozen: wait for the peer's count and the new tunnel (or the flow's end).
+		select {
+		case <-installCh:
+		case <-p.abortCh:
 			return
 		}
+		p.mu.Lock()
+		dst = p.next // published by Install before installCh was closed
+		p.mu.Unlock()
+		p.switched(true)
 	}
 }
 
 func (p *PumpSwapper) pumpTunnelToApp(usage *web.Usage, remotePort int, sniffer bool) {
-	app, old := p.app, p.old
+	app := p.app
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	buf := *bufPtr
 	defer copyBufferPool.Put(bufPtr)
 
-	var total uint64 // bytes delivered to the app
-	var src net.Conn
-
-	// Phase 1: old tunnel -> app. Before Install there is no limit (the peer
-	// can never have written more than its final count); after it, never read
-	// past the limit.
-	for {
-		p.mu.Lock()
-		installed, limit := p.installed, p.dlLimit
-		p.mu.Unlock()
-		if installed {
-			if total > limit {
-				p.Abort() // the peer promised fewer bytes than were already delivered
-				return
-			}
-			if total == limit {
-				break
-			}
-		}
-
-		toRead := len(buf)
-		if installed {
-			if rem := limit - total; rem < uint64(toRead) {
-				toRead = int(rem)
-			}
-		}
-		n, err := old.Read(buf[:toRead])
-		if n > 0 {
-			w, werr := writeFull(app, buf[:n])
-			total += uint64(w)
-			p.dlBytes.Add(uint64(w))
-			if sniffer {
-				usage.AddOrUpdatePort(remotePort, uint64(n))
-			}
-			if werr != nil {
-				p.Abort()
-				return
-			}
-		}
-		if err == nil {
-			continue
-		}
-		if isTimeout(err) {
-			_ = old.SetReadDeadline(time.Time{}) // Install's wakeup; re-evaluate
-			continue
-		}
-
-		// The old stream ended. If our upload is already frozen this is the
-		// peer releasing its old tunnel after its own transition, which can
-		// overtake our Install: the promised count is not known yet, so decide
-		// once it is. Otherwise the plain flow is over.
-		p.mu.Lock()
-		waitInstall := !p.installed && p.frozen && err == io.EOF
-		if !p.installed && !waitInstall {
-			p.ended = true
-		}
-		p.mu.Unlock()
-		if waitInstall {
-			select {
-			case <-p.installCh:
-			case <-p.abortCh:
-				return
-			}
-		}
-		p.mu.Lock()
-		installed, limit = p.installed, p.dlLimit
-		p.mu.Unlock()
-		switch {
-		case installed && total >= limit:
-			// The whole promised prefix arrived; a late EOF/error on the old
-			// stream is irrelevant.
-		case !installed && err == io.EOF:
-			closeWrite(app) // clean end of the plain download
-			return
-		default:
-			p.Abort() // truncation or transport error
-			return
-		}
-		break
-	}
-
 	p.mu.Lock()
-	src = p.newTunnel
+	src := p.cur
 	p.mu.Unlock()
-	p.phaseDone()
 
-	// Phase 2: new tunnel -> app.
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			_, werr := writeFull(app, buf[:n])
-			p.dlBytes.Add(uint64(n))
-			if sniffer {
-				usage.AddOrUpdatePort(remotePort, uint64(n))
+	for { // one pass per tunnel the flow is carried on
+		// src -> app. Before Install there is no limit (the peer can never have
+		// written more than its final count); after it, never read past the limit.
+		for {
+			p.mu.Lock()
+			installed, limit := p.installed && !p.dlSwitched, p.dlLimit
+			p.mu.Unlock()
+			total := p.dlBytes.Load()
+			if installed {
+				if total > limit {
+					p.Abort() // the peer promised fewer bytes than were already delivered
+					return
+				}
+				if total == limit {
+					break
+				}
 			}
-			if werr != nil {
-				p.Abort()
+
+			toRead := len(buf)
+			if installed {
+				if rem := limit - total; rem < uint64(toRead) {
+					toRead = int(rem)
+				}
+			}
+			n, err := src.Read(buf[:toRead])
+			if n > 0 {
+				w, werr := writeFull(app, buf[:n])
+				p.dlBytes.Add(uint64(w))
+				if sniffer {
+					usage.AddOrUpdatePort(remotePort, uint64(n))
+				}
+				if werr != nil {
+					p.Abort()
+					return
+				}
+			}
+			if err == nil {
+				continue
+			}
+			if isTimeout(err) {
+				_ = src.SetReadDeadline(time.Time{}) // Install's wakeup; re-evaluate
+				continue
+			}
+
+			// The stream ended. If our upload is already frozen this is the peer
+			// releasing its old tunnel after its own transition, which can overtake
+			// our Install: the promised count is not known yet, so decide once it
+			// is. Otherwise this direction is over.
+			p.mu.Lock()
+			waitInstall := !p.installed && p.frozen && err == io.EOF
+			installCh := p.installCh
+			p.mu.Unlock()
+			if waitInstall {
+				select {
+				case <-installCh:
+				case <-p.abortCh:
+					return
+				}
+			}
+			p.mu.Lock()
+			installed, limit = p.installed && !p.dlSwitched, p.dlLimit
+			p.mu.Unlock()
+			total = p.dlBytes.Load()
+			switch {
+			case installed && total >= limit:
+				// The whole promised prefix arrived; a late EOF/error on the
+				// stream is irrelevant.
+			case !installed && err == io.EOF:
+				p.mu.Lock()
+				p.dlEnded = true
+				p.mu.Unlock()
+				closeWrite(app) // clean end of the download
+				return
+			default:
+				p.Abort() // truncation or transport error
 				return
 			}
+			break
 		}
-		if err != nil {
-			if err == io.EOF {
-				closeWrite(app)
-			} else {
-				p.Abort()
-			}
-			return
-		}
+
+		p.mu.Lock()
+		src = p.next
+		p.mu.Unlock()
+		p.switched(false)
 	}
 }

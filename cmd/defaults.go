@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/utils/handlers"
 
 	"github.com/sirupsen/logrus"
 )
@@ -20,8 +21,10 @@ const ( // Default values
 	deafultHeartbeat      = 40 // 40 seconds
 	defaultDialTimeout    = 10 // 10 seconds
 	// related to smux
-	defaultMuxVersion       = 1
-	defaultMaxFrameSize     = 32768   // 32KB
+	defaultMuxVersion = 1
+	// A full half-close record (32 KiB payload + its 3-byte header), so an enveloped
+	// flow's record fits one smux frame instead of spilling a tiny second one.
+	defaultMaxFrameSize     = handlers.HalfCloseRecordSize
 	defaultMaxReceiveBuffer = 4194304 // 4MB
 	// minMaxStreamBuffer is the floor for the *derived* per-stream receive
 	// window (see deriveStreamBuffer). It is the value that used to be the

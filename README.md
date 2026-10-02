@@ -93,7 +93,7 @@ To start using the solution, you'll need to configure both server and client com
     heartbeat = 40                # In seconds. Ping interval for tunnel stability. Min: 1s. (Optional, default: 40s)
     mux_con = 8                   # Mux concurrency. Number of connections that can be multiplexed into a single stream (optional, default: 8).
     mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
-    mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
+    mux_framesize = 32771         # 32 KiB + 3. The maximum size of a frame that can be sent over a connection. The default is a full half-close record (32768-byte payload + 3-byte header) so resumable and half-close flows fit one frame per record; lowering it makes every full record spill a tiny second frame. (optional)
     mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
     mux_streambuffer = 0          # The per-stream receive window: the most data smux will keep in flight on ONE stream before it must wait a full tunnel round-trip for the peer's window update. A stream therefore tops out at mux_streambuffer/RTT, so a small value is the throughput ceiling of every individual flow on mux_version = 2. Leave it unset/0 and it is derived as mux_recievebuffer / mux_con (4 MB / 8 = 512 KB by default), which is each stream's fair share of the session budget the pool already reserves - raising it costs no extra memory, because smux caps everything a connection buffers at mux_recievebuffer regardless. Set it explicitly only to override that. (optional, default: derived, floor 65536)
     mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping. Every pool connection pings on the same fixed interval, which is a traffic-pattern signal; disabling it relies on TCP keepalive instead. (optional, default: false)
@@ -158,7 +158,7 @@ To start using the solution, you'll need to configure both server and client com
    retry_interval = 3            # Retry interval in seconds (optional, default: 3s).
    dial_timeout = 10             # Sets the max wait time for establishing a network connection. (optional, default: 10s)
    mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
-   mux_framesize = 32768         # 32 KB. The maximum size of a frame that can be sent over a connection. (optional)
+   mux_framesize = 32771         # 32 KiB + 3. The maximum size of a frame that can be sent over a connection. The default is a full half-close record (32768-byte payload + 3-byte header) so resumable and half-close flows fit one frame per record; lowering it makes every full record spill a tiny second frame. (optional)
    mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
    mux_streambuffer = 0          # The per-stream receive window; see the server config above. Leave it unset/0 to get the derived default (mux_recievebuffer / 8 = 512 KB), which is what keeps a single flow from being pinned to 64 KB per round-trip. (optional, default: derived, floor 65536)
    mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping (see server config for details). (optional, default: false)
@@ -248,7 +248,7 @@ To start using the solution, you'll need to configure both server and client com
    channel_size = 2048
    mux_con = 8
    mux_version = 1
-   mux_framesize = 32768 
+   mux_framesize = 32771 
    mux_recievebuffer = 4194304
    mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
@@ -271,7 +271,7 @@ To start using the solution, you'll need to configure both server and client com
    retry_interval = 3
    nodelay = true 
    mux_version = 1
-   mux_framesize = 32768 
+   mux_framesize = 32771 
    mux_recievebuffer = 4194304
    mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
@@ -421,7 +421,7 @@ To start using the solution, you'll need to configure both server and client com
    channel_size = 2048
    mux_con = 8
    mux_version = 1
-   mux_framesize = 32768 
+   mux_framesize = 32771 
    mux_recievebuffer = 4194304
    mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
@@ -445,7 +445,7 @@ To start using the solution, you'll need to configure both server and client com
    nodelay = true
    retry_interval = 3
    mux_version = 1
-   mux_framesize = 32768 
+   mux_framesize = 32771 
    mux_recievebuffer = 4194304
    mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 
@@ -469,7 +469,7 @@ To start using the solution, you'll need to configure both server and client com
    accept_udp = false            # Also forward UDP on each mapped port over the mux tunnel (requires mux_version = 2 on both ends). Enables carrying UDP services such as L2TP/IPsec over wssmux.
    mux_con = 8
    mux_version = 1
-   mux_framesize = 32768 
+   mux_framesize = 32771 
    mux_recievebuffer = 4194304
    mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    tls_cert = "/root/server.crt"      
@@ -495,7 +495,7 @@ To start using the solution, you'll need to configure both server and client com
    connection_pool = 8
    aggressive_pool = false
    mux_version = 1
-   mux_framesize = 32768 
+   mux_framesize = 32771 
    mux_recievebuffer = 4194304
    mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
    sniffer = false 

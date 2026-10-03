@@ -5,7 +5,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 // transportEvent is one recorded disruption: what happened, when, and any

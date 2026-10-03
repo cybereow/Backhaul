@@ -13,8 +13,8 @@ import (
 
 	clienttransport "github.com/musix/backhaul/internal/client/transport"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 func TestExpandPorts(t *testing.T) {

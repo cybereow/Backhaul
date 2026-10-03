@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/gobwas/ws"
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 const streamTestTimeout = 10 * time.Second

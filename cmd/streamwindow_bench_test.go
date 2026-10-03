@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 // --- a duplex net.Conn pair with a fixed one-way delay ----------------------

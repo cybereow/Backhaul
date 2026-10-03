@@ -29,11 +29,11 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
 	client_transport "github.com/musix/backhaul/internal/client/transport"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/sirupsen/logrus"
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
-	"github.com/xtaci/smux"
 )
 
 // TestShouldStripePlainMode verifies the shouldStripe predicate for a plain

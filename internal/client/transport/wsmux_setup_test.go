@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/striping"
-	"github.com/xtaci/smux"
 )
 
 // setupHeaderWait is the client's initial-header deadline in these tests

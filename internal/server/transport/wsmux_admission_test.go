@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // setupRig is a server transport with only its dispatch loop running: no

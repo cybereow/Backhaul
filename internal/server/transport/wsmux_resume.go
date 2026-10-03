@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
-	"github.com/xtaci/smux"
 )
 
 // Resumable flows (docs/resumable-flows-plan.md, level A).

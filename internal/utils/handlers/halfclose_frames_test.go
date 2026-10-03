@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 // frameConn records the payload length of every smux PSH frame written to its

@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 const (

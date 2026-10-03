@@ -45,6 +45,10 @@ const (
 	// (64 KiB reads), so resumable ones must too: see HalfCloseReadSize.
 	hcMaxData = 32768 - hcHeaderLen
 
+	// hcMaxDataRecv is the largest DATA payload accepted: the 32768 earlier builds
+	// wrote, though this one writes at most hcMaxData.
+	hcMaxDataRecv = 32768
+
 	// HalfCloseRecordSize is the largest record the envelope writes (header plus a
 	// full DATA payload), the smux frame size it fits in.
 	HalfCloseRecordSize = hcHeaderLen + hcMaxData
@@ -178,7 +182,7 @@ func (c *halfCloseConn) readHeader() error {
 	typ, length := c.hdr[0], int(binary.BigEndian.Uint16(c.hdr[1:]))
 	c.hdrN = 0
 	switch {
-	case typ == hcData && length >= 1 && length <= hcMaxData:
+	case typ == hcData && length >= 1 && length <= hcMaxDataRecv:
 		c.remaining = length
 	case typ == hcAck && length == 8 && c.hasAckFn():
 		c.inAck, c.ackN = true, 0

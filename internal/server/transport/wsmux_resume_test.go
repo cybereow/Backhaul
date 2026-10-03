@@ -11,8 +11,8 @@ import (
 
 	"github.com/musix/backhaul/config"
 	client_transport "github.com/musix/backhaul/internal/client/transport"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // startResumeClient runs the real wsmux client against h.

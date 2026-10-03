@@ -15,10 +15,10 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
 	client_transport "github.com/musix/backhaul/internal/client/transport"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // Plan 024: mux_half_close, the halfclose-v1 capability, and the FlowPlainHC

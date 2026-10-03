@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 // hcTestTimeout bounds every wait in the half-close tests; nothing here uses a

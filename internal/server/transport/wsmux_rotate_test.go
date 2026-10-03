@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // newRotateTestTransport builds the minimum retireSession touches: ctx, logger,

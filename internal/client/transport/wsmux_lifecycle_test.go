@@ -14,9 +14,9 @@ import (
 
 	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 const (

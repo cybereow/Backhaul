@@ -11,9 +11,9 @@ import (
 
 	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // livePoolSession returns a real, open smux session registered on s, plus a

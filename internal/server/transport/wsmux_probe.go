@@ -3,8 +3,8 @@ package transport
 import (
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
-	"github.com/xtaci/smux"
 )
 
 // probeSessionRTT keeps a session's RTT estimate current by opening a tiny ping

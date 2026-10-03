@@ -527,19 +527,26 @@ func writeFull(dst net.Conn, b []byte) (int, error) {
 	return written, nil
 }
 
+// readBufFor is the part of full an app read should use when its bytes go to dst:
+// two whole records on an envelope (so every write to smux is 64 KiB, see hcMaxData),
+// all of it otherwise.
+func readBufFor(dst net.Conn, full []byte) []byte {
+	if _, ok := dst.(*halfCloseConn); ok {
+		return full[:min(len(full), HalfCloseReadSize)]
+	}
+	return full
+}
+
 func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer bool) {
 	app := p.app
 	bufPtr := copyBufferPool.Get().(*[]byte)
-	buf := *bufPtr
+	full := *bufPtr // what a read may use; buf below is the part it uses on this tunnel
+	buf := full
 	defer copyBufferPool.Put(bufPtr)
 
 	p.mu.Lock()
 	dst := p.cur
 	p.mu.Unlock()
-	if _, ok := dst.(*halfCloseConn); ok {
-		// Whole records, 64 KiB on the wire per write: see hcMaxData.
-		buf = buf[:min(len(buf), HalfCloseReadSize)]
-	}
 	var srcErr error // how the app read ended; delivered to whichever tunnel is current
 	pend := 0        // bytes of buf read from the app but not yet retained or sent
 
@@ -550,6 +557,10 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	run:
 		for {
 			if srcErr == nil || pend > 0 {
+				// Reads are sized for the tunnel the flow is on now, which a swap or a
+				// resume may have changed: whole records on an envelope (64 KiB on the
+				// wire per write, see hcMaxData), the full buffer otherwise.
+				buf = readBufFor(dst, full)
 				var n int
 				var err error
 				if pend > 0 {
@@ -577,11 +588,11 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 							// read instead of letting the ring grow past its limit.
 							pend = n
 						} else {
-							p.replay.ring.append(buf[:n])
+							p.replay.ring.append(full[:n])
 						}
 					}
 					if !interrupted {
-						w, werr := writeFull(dst, buf[:n])
+						w, werr := writeFull(dst, full[:n])
 						p.upBytes.Add(uint64(w))
 						if sniffer {
 							usage.AddOrUpdatePort(remotePort, uint64(n))

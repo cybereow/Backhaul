@@ -5,9 +5,9 @@ import (
 	"net"
 	"testing"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // newHeaderTestTransport returns a transport with just enough state for the

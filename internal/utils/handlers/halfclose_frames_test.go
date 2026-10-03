@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 // frameConn records the payload length of every smux PSH frame written to its
@@ -76,23 +76,45 @@ func recordFrames(t *testing.T, frame int) []int {
 	a, b := openStreamPair(t, client, server)
 	wa, wb := NewHalfCloseConn(a), NewHalfCloseConn(b)
 
-	if _, err := wa.Write(make([]byte, 32768)); err != nil {
+	if _, err := wa.Write(make([]byte, hcMaxData)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.ReadFull(wb, make([]byte, 32768)); err != nil {
+	if _, err := io.ReadFull(wb, make([]byte, hcMaxData)); err != nil {
 		t.Fatal(err)
 	}
 	return cc.payloads()
 }
 
-// With the frame size at HalfCloseRecordSize a full record travels in one frame;
-// at the stock 32768 it leaves a tail frame carrying just its last 3 bytes.
+// A full record travels in one frame at the stock frame size (which is the record
+// size), and splits in two when the frame is smaller.
 func TestHalfCloseRecordFitsOneFrame(t *testing.T) {
+	if HalfCloseRecordSize != 32768 {
+		t.Fatalf("HalfCloseRecordSize = %d: a full record must be one stock-size, power-of-two write", HalfCloseRecordSize)
+	}
 	if got := recordFrames(t, HalfCloseRecordSize); len(got) != 1 || got[0] != HalfCloseRecordSize {
 		t.Fatalf("frame size %d: a full record went out as frames %v, want one frame of %d", HalfCloseRecordSize, got, HalfCloseRecordSize)
 	}
-	// Guards the premise: if smux stops splitting at 32768, the first check proves nothing.
-	if got := recordFrames(t, 32768); len(got) != 2 || got[0] != 32768 || got[1] != 3 {
-		t.Fatalf("frame size 32768: a full record went out as frames %v, want [32768 3]; has smux's framing changed?", got)
+	// Guards the premise: if smux stops splitting at the frame size, the first check proves nothing.
+	if got := recordFrames(t, 16384); len(got) != 2 || got[0] != 16384 || got[1] != 16384 {
+		t.Fatalf("frame size 16384: a full record went out as frames %v, want two of 16384; has smux's framing changed?", got)
+	}
+}
+
+// The size of an app read follows the tunnel the flow is on, so a flow that starts
+// on a plain tunnel and is swapped onto an envelope (or the other way) reads whole
+// records from then on.
+func TestReadBufFollowsTheTunnel(t *testing.T) {
+	full := make([]byte, copyBufferSize)
+	plain, _ := net.Pipe()
+	defer plain.Close()
+	if got := len(readBufFor(plain, full)); got != len(full) {
+		t.Fatalf("plain tunnel: read size %d, want %d", got, len(full))
+	}
+	env := NewHalfCloseConn(plain)
+	if got := len(readBufFor(env, full)); got != HalfCloseReadSize {
+		t.Fatalf("envelope: read size %d, want %d", got, HalfCloseReadSize)
+	}
+	if HalfCloseReadSize != 2*(HalfCloseRecordSize-hcHeaderLen) {
+		t.Fatalf("HalfCloseReadSize %d is not two full records", HalfCloseReadSize)
 	}
 }

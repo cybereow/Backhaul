@@ -8,8 +8,8 @@ import (
 	"time"
 
 	"github.com/gobwas/ws"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils/network"
-	"github.com/xtaci/smux"
 )
 
 // countingConn counts real read syscalls on a real socket.

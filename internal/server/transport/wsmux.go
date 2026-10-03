@@ -14,10 +14,10 @@ import (
 
 	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config" // for mode
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
-	"github.com/xtaci/smux"
 
 	"github.com/sirupsen/logrus"
 )

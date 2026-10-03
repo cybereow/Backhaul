@@ -7,11 +7,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/utils/striping"
-	"github.com/xtaci/smux"
 )
 
 // sleepCtx waits d, or until ctx ends; it reports whether the full wait elapsed.

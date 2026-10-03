@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
-	"github.com/xtaci/smux"
 )
 
 // speedtestResult is the JSON returned by the speedtest endpoint. In "best"

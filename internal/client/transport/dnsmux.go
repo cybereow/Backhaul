@@ -15,8 +15,8 @@ import (
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/web"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // DnsMuxConfig configures the dnsmux client: it reaches the server ONLY through

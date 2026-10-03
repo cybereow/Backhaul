@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xtaci/smux"
+	"github.com/musix/backhaul/internal/smux"
 )
 
 // The type must satisfy the hooks the handler already uses, with no handler change.
@@ -559,5 +559,24 @@ func TestHalfCloseShortWritePoisonsSendSide(t *testing.T) {
 	pc2.n = hcHeaderLen + 4
 	if n, err := c2.Write([]byte("more")); err != nil || n != 4 {
 		t.Fatalf("retry after a write that put nothing on the wire = %d, %v", n, err)
+	}
+}
+
+// A DATA record with the 32768-byte payload earlier builds wrote is still accepted
+// (this build writes at most hcMaxData).
+func TestHalfCloseAcceptsLegacyFullRecord(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	rd := NewHalfCloseConn(b)
+	payload := genPayload(32768)
+	go func() {
+		rec := append([]byte{hcData, 0x80, 0x00}, payload...)
+		a.Write(rec)
+		a.Write([]byte{hcEnd, 0, 0})
+	}()
+	got, err := io.ReadAll(rd)
+	if err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("read %d bytes, err %v; want the 32768-byte legacy record", len(got), err)
 	}
 }

@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // placementTimeout bounds every wait in these tests. It is generous next to the

@@ -75,7 +75,7 @@ func TestReplayRingBackpressure(t *testing.T) {
 
 	ctx := context.Background()
 	got := make(chan error, 1)
-	go func() { got <- r.waitFree(ctx, nil, nil, 10000) }()
+	go func() { got <- r.waitFree(ctx, nil, nil, nil, 10000) }()
 	select {
 	case err := <-got:
 		t.Fatalf("waitFree returned %v on a full ring", err)
@@ -94,22 +94,22 @@ func TestReplayRingBackpressure(t *testing.T) {
 	// A waiter is released by abort and by ctx.
 	r.append(make([]byte, r.free()))
 	abort := make(chan struct{})
-	go func() { got <- r.waitFree(ctx, abort, nil, 1) }()
+	go func() { got <- r.waitFree(ctx, abort, nil, nil, 1) }()
 	close(abort)
 	if err := <-got; err == nil {
 		t.Fatal("abort did not release the waiter")
 	}
 	cctx, cancel := context.WithCancel(ctx)
-	go func() { got <- r.waitFree(cctx, nil, nil, 1) }()
+	go func() { got <- r.waitFree(cctx, nil, nil, nil, 1) }()
 	cancel()
 	if err := <-got; err == nil {
 		t.Fatal("ctx did not release the waiter")
 	}
-	if err := r.waitFree(ctx, nil, nil, 1<<20); err == nil {
+	if err := r.waitFree(ctx, nil, nil, nil, 1<<20); err == nil {
 		t.Fatal("a write larger than the limit must fail, not wait forever")
 	}
 	wake := make(chan struct{}, 1)
-	go func() { got <- r.waitFree(ctx, nil, wake, 1) }()
+	go func() { got <- r.waitFree(ctx, nil, wake, nil, 1) }()
 	wake <- struct{}{}
 	if err := <-got; err != errReplayWake {
 		t.Fatalf("a wake signal: %v, want errReplayWake", err)

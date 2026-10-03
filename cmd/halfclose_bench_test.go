@@ -6,8 +6,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils/handlers"
-	"github.com/xtaci/smux"
 )
 
 // benchEnvelope is benchStreamWindow (streamwindow_bench_test.go) with the flow

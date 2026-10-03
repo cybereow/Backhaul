@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
-	"github.com/xtaci/smux"
 )
 
 // Rotation is derived from one number, the max connection age of the CDN/LB in

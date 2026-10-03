@@ -15,8 +15,8 @@ import (
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/web"
 
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // DnsMuxConfig configures the dnsmux server: the authoritative end of the DNS

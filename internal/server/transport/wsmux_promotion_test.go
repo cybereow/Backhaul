@@ -13,11 +13,11 @@ import (
 
 	"github.com/musix/backhaul/config"
 	client_transport "github.com/musix/backhaul/internal/client/transport"
+	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/striping"
 	"github.com/sirupsen/logrus"
-	"github.com/xtaci/smux"
 )
 
 // Plan 005: plain-to-striped promotion. TestWSMuxPromotionHandshake drives the

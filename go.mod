@@ -7,11 +7,11 @@ require (
 	github.com/gobwas/ws v1.4.0
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/libp2p/go-openssl v0.1.0
+	github.com/miekg/dns v1.1.63
 	github.com/refraction-networking/utls v1.8.2
 	github.com/shirou/gopsutil/v4 v4.24.8
 	github.com/sirupsen/logrus v1.9.3
 	github.com/stretchr/testify v1.9.0
-	github.com/xtaci/smux v1.5.27
 	golang.org/x/sys v0.41.0
 )
 
@@ -25,7 +25,6 @@ require (
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
-	github.com/miekg/dns v1.1.63 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20210106213030-5aafc221ea8c // indirect
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect

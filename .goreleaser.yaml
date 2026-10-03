@@ -1,57 +1,31 @@
-# .goreleaser.yml
-version: 2  # Specify the config version
+version: 2
 project_name: backhaul
+
+# One build: linux/amd64, dynamically linked against the system OpenSSL
+# (cgo + libssl). The server terminates wss/wssmux TLS with it.
 builds:
-  # Default, pure-Go static binary (no cgo) for every supported platform.
   - id: backhaul
     main: ./main.go
     binary: backhaul
     goos:
       - linux
-      - darwin
-    goarch:
-      - amd64
-      - arm64
-    flags:
-      - -ldflags=-s -w
-    env:
-       - CGO_ENABLED=0
-
-  # OpenSSL TLS-engine variant (linux/amd64 only). Needs cgo + libssl, so it is
-  # dynamically linked against libssl.so.3 and built only for the native runner
-  # architecture. Enable at runtime with tls_engine = "openssl".
-  - id: backhaul-openssl
-    main: ./main.go
-    binary: backhaul
-    goos:
-      - linux
     goarch:
       - amd64
     flags:
-      - -tags=openssl
       - -ldflags=-s -w
     env:
-       - CGO_ENABLED=1
-
+      - CGO_ENABLED=1
 
 archives:
-  - id: default
+  - id: backhaul
     ids:
       - backhaul
-    format: tar.gz
+    formats:
+      - tar.gz
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
-  - id: openssl
-    ids:
-      - backhaul-openssl
-    format: tar.gz
-    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}_openssl"
 
-
-release:
-   github:
-    owner: codesjd
-    name: Backhaul
 checksum:
   name_template: "checksums.txt"
+
 changelog:
   use: git

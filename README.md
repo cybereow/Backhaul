@@ -1,564 +1,460 @@
 # Backhaul
 
-Welcome to the **`Backhaul`** project! This project provides a high-performance reverse tunneling solution optimized for handling massive concurrent connections through NAT and firewalls. This README will guide you through setting up and configuring both server and client components, including details on different transport protocols.
+A reverse tunnel for getting at services behind NAT and firewalls, built to carry
+many concurrent connections. A **server** (publicly reachable) listens on the
+ports you map; a **client** (behind the NAT) dials out to it, and every
+connection to a mapped port is carried through that outbound tunnel to the
+target the client can reach.
 
----
-
-## Table of Contents
-
-1. [Introduction](#introduction)
-2. [Features](#features)
-3. [Installation](#installation)
-4. [Usage](#usage)
-   - [Configuration Options](#configuration-options)
-   - [Detailed Configuration](#detailed-configuration)
-      - [TCP Configuration](#tcp-configuration)
-      - [TCP Multiplexing Configuration](#tcp-multiplexing-configuration)
-      - [UDP Configuration](#udp-configuration)
-      - [WebSocket Configuration](#websocket-configuration)
-      - [Secure WebSocket Configuration](#secure-websocket-configuration)
-      - [WS Multiplexing Configuration](#ws-multiplexing-configuration)
-      - [WSS Multiplexing Configuration](#wss-multiplexing-configuration)
-5. [Generating a Self-Signed TLS Certificate with OpenSSL](#generating-a-self-signed-tls-certificate-with-openssl)
-6. [Running backhaul as a service](#running-backhaul-as-a-service)
-7. [FAQ](#faq)
-8. [Benchmark](#benchmark)
-9. [License](#license)
-10. [Donation](#donation)
-
----
-
-## Introduction
-
-This project offers a robust reverse tunneling solution to overcome NAT and firewall restrictions, supporting various transport protocols. It’s engineered for high efficiency and concurrency.
-
-
-## Features
-
-* **High Performance**: Optimized for handling massive concurrent connections efficiently.
-* **Protocol Flexibility**: Supports TCP, WebSocket (WS), and Secure WebSocket (WSS) transports.
-* **UDP over TCP**: Implements UDP traffic encapsulation and forwarding over a TCP connection for reliable delivery with built-in congestion control.
-* **Multiplexing**: Enables multiple connections over a single transport with SMUX.
-* **NAT & Firewall Bypass**: Overcomes restrictions with reverse tunneling.
-* **Traffic Sniffing**: Optional network traffic monitoring with logging support.
-* **Configurable Keepalive**: Adjustable keep-alive and heartbeat intervals for stable connections.
-* **TLS Encryption**: Secure connections via WSS with support for custom TLS certificates.
-* **Web Interface**: Real-time monitoring through a lightweight web interface.
-* **Hot Reload Configuration**: Supports dynamic configuration reloading without server restarts.
-
-
-## Installation
-
-1. **Download** the latest release from the [GitHub releases page](https://github.com/musixal/backhaul/releases).
-2. **Extract** the archive (adjust the `filename` if needed):  
-
-   ```bash
-   tar -xzf backhaul_linux_amd64.tar.gz
-   ``` 
-3. **Run** the executable:  
-
-   ```bash
-   ./backhaul
-   ```
-4. You can also build from source if preferred:  
-
-   ```bash
-   git clone https://github.com/musixal/backhaul.git
-   cd backhaul
-   go build
-   ./backhaul
-   ```
-
-## Usage
-
-The main executable for this project is `backhaul`. It requires a TOML configuration file for both the server and client components.
-
-### Configuration Options
-
-To start using the solution, you'll need to configure both server and client components. Here’s how to set up basic configurations:
-
-* **Server Configuration**
-
-   Create a configuration file named `config.toml`:
-
-    ```toml
-    [server]# Local, IRAN
-    bind_addr = "0.0.0.0:3080"    # Address and port for the server to listen on (mandatory).
-    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
-    accept_udp = false             # Enable forwarding UDP alongside TCP on every mapped port. Works with the "tcp" transport (UDP over the raw TCP tunnel) and with "wsmux"/"wssmux" (UDP over the mux tunnel, which requires mux_version = 2 on both server and client). This is what lets a single wssmux tunnel also carry UDP services such as L2TP/IPsec (UDP 500/1701/4500) - list those UDP ports in `ports` and set accept_udp = true. (optional, default: false)
-    token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
-    keepalive_period = 75         # Interval in seconds to send keep-alive packets.(optional, default: 75s)
-    nodelay = false               # Enable TCP_NODELAY (optional, default: false).
-    channel_size = 2048           # Tunnel and Local channel size. Excess connections are discarded. (optional, default: 2048).
-    heartbeat = 40                # In seconds. Ping interval for tunnel stability. Min: 1s. (Optional, default: 40s)
-    mux_con = 8                   # Mux concurrency. Number of connections that can be multiplexed into a single stream (optional, default: 8).
-    mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
-    mux_framesize = 32768         # 32 KiB. The maximum size of a frame that can be sent over a connection. The default is also the size of a full half-close record (32765-byte payload + 3-byte header), so resumable and half-close flows fit one frame per record; lowering it makes every full record split in two. (optional)
-    mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
-    mux_streambuffer = 0          # The per-stream receive window: the most data smux will keep in flight on ONE stream before it must wait a full tunnel round-trip for the peer's window update. A stream therefore tops out at mux_streambuffer/RTT, so a small value is the throughput ceiling of every individual flow on mux_version = 2. Leave it unset/0 and it is derived as mux_recievebuffer / mux_con (4 MB / 8 = 512 KB by default), which is each stream's fair share of the session budget the pool already reserves - raising it costs no extra memory, because smux caps everything a connection buffers at mux_recievebuffer regardless. Set it explicitly only to override that. (optional, default: derived, floor 65536)
-    mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping. Every pool connection pings on the same fixed interval, which is a traffic-pattern signal; disabling it relies on TCP keepalive instead. (optional, default: false)
-    mux_stripe = 1                 # wsmux/wssmux: split a single flow's data across this many pool connections instead of pinning it to one, so one flow isn't capped by a single connection's congestion window/RTT (the win on a lossy, high-RTT link). Must match on both server and client. 1 disables it (default). The earlier deadlock, tail data-loss, silent-truncation, and connection-pool leak bugs are fixed and covered by tests (incl. -race and end-to-end concurrent load). Still newer than the single-connection path; on its own (mux_stripe_parity = 0) it has no leg-failure recovery - if a pool connection drops mid-transfer the flow ends (surfacing as a reset, never silent corruption) - see mux_stripe_parity below to tolerate that. Because each striped flow is reassembled in order, one leg whose transport backs up can briefly head-of-line-stall that single flow under very high concurrency; it no longer degrades the whole tunnel. Raise it above 1 when the bottleneck is genuinely one long-lived throughput-bound flow. Valid range 1-255: the stripe header carries the leg count in a single byte, so mux_stripe + mux_stripe_parity may not exceed 255 (a wider value is rejected at startup). (optional, default: 1)
-    mux_stripe_parity = 0          # wsmux/wssmux: Reed-Solomon parity legs added on top of mux_stripe, so up to this many of the mux_stripe+mux_stripe_parity pool legs carrying a striped flow can die mid-transfer (a CDN/LB resetting a pooled connection, a mobile handover) without the flow ending - the missing legs' data is reconstructed from the survivors instead. Requires mux_stripe >= 2 and must match on both server and client. Costs bandwidth (mux_stripe_parity/mux_stripe extra data sent) and a little latency (a chunk can't be delivered until mux_stripe of its shards arrive). 0 disables it (default, and the only value that changes nothing about the wire format). The Reed-Solomon library allows 256 total shards, but backhaul's stripe header carries index, total and parity as single bytes, so the limit here is mux_stripe + mux_stripe_parity <= 255; a wider configuration is rejected at startup rather than truncated on the wire.
-    mux_half_close = false         # wsmux/wssmux (requires mux_version = 2): let a client half-close its side of a forwarded connection (send its request, then shut down its writing end) and still receive the full reply, which a plain smux stream cannot do (it has no directional EOF, so the shutdown ends both directions and a delayed reply is lost). Plain (non-promotable) flows then carry a small negotiated envelope (a 3-byte header per write), negotiated per upgrade with the `X-Backhaul-Cap: halfclose-v1` header that every current client sends. STRICT: with this on, the server rejects (HTTP 400, and the log names the fix) any upgrade from a client that does not send that capability, so upgrade the clients first. Server-only setting (the client needs no key). Flows that can be promoted mid-stream (`promote_bytes` > 0 together with `mux_stripe` >= 2) and striped flows keep today's full-close behavior. Ignored by every other transport. See "What is `mux_half_close`" in the FAQ. (optional, default: false)
-    mux_ws_framing = true          # wsmux/wssmux: carry every mux connection as standards-framed WebSocket binary messages (RFC 6455), negotiated during the upgrade with the `Sec-WebSocket-Protocol: backhaul-mux-v1` header. STRICT: a server with this on rejects any wsmux/wssmux upgrade that does not offer that subprotocol (HTTP 400, and the log says to upgrade the client or set mux_ws_framing = false on both ends). Must match the client. Setting it to false selects the legacy raw mode (smux bytes written straight onto the connection after the HTTP upgrade), on both ends - see "wsmux/wssmux framing and upgrading" in the FAQ. Ignored by every other transport. (optional, default: true)
-    sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
-    web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
-    sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
-    tls_cert = "/root/server.crt" # Path to the TLS certificate file for wss/wssmux. (mandatory).
-    tls_key = "/root/server.key"  # Path to the TLS private key file for wss/wssmux. (mandatory).
-    tls_certs = []                # wss/wssmux: optional list of certificate files for serving MULTIPLE domains via SNI (e.g. one backhaul origin behind several CDNs/hostnames). Pairs by index with tls_keys. The server picks the cert whose names match the client's SNI, falling back to the first when none match. Works with both tls_engine values (including "openssl", via its SNI callback). Leave empty to use the single tls_cert/tls_key above. e.g. ["/root/a.crt", "/root/b.crt"]. (optional, default: none)
-    tls_keys = []                 # wss/wssmux: private key files aligned by index with tls_certs. (optional, default: none)
-    path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. (optional, default: none)
-    fallback = ""                 # ws/wss/wsmux/wssmux: host:port of a decoy web backend. Requests that aren't valid tunnel traffic (wrong/absent token, or any non-tunnel path such as "/") are reverse-proxied here instead of getting a 401, so a single backhaul origin can carry the tunnel under a secret path AND look like an ordinary website to probes - no separate nginx needed in the data path. e.g. "127.0.0.1:8080". (optional, default: none)
-    tls_engine = "go"             # wss/wssmux: TLS stack that terminates the connection. "go" (default) uses Go's crypto/tls and keeps the pure-Go static binary. "openssl" terminates with the system OpenSSL so the server's TLS handshake fingerprint matches a same-version nginx (Go's stack e.g. always picks AES-128-GCM for TLS 1.3 where nginx/OpenSSL picks AES-256-GCM). "openssl" ONLY works in a binary built with `-tags openssl` (CGO_ENABLED=1); see the OpenSSL build note. Use it when the origin IP is directly reachable and could be fingerprinted. (optional, default: "go")
-    cdn_max_age = 0               # ws/wss/wsmux/wssmux, in seconds. The SHORTEST max connection age among the CDNs/LBs in front of the server (e.g. 300 if one of them resets at 5 minutes). Pool connections are then rotated make-before-break ahead of it: each is retired at 70% of this age (+/-10% jitter so the initial pool does not rotate in lockstep), only once a replacement has actually joined the pool (if the client cannot dial, nothing is retired and the pool never shrinks), and a retired connection stops taking new streams but is drained for the remaining 30% of the age, after which it is closed (the CDN would cut it anyway). A flow pinned to one connection (SSH, a big download) therefore lives at most until the CDN limit; smux cannot migrate a live stream. On ws/wss the same age retires idle pool connections (replaced first, so the pool never shrinks) so a flow is never handed a connection the CDN already dropped. Server-side only. 0 disables rotation (default). With mux_version = 2 on both ends, plain flows are opened as resumable: when their connection is retired the flow is moved byte-for-byte to a stream on another pool connection instead of being cut, so it can outlive the CDN limit (SSH, long downloads). Striped and UDP flows are not moved; promote_bytes takes precedence over this for plain flows. Replaces max_conn_age and max_drain, which are now rejected at startup. (optional, default: 0)
-    resume_window = 0             # wsmux/wssmux with cdn_max_age (mux_version = 2), in seconds. How long a flow whose pool connection was cut WITHOUT warning (a CDN reset, a network drop) waits to be resumed on another connection before it is dropped; 0 = 30. -1 turns it off (flows then only survive the planned moves of cdn_max_age). Each such flow keeps its unacknowledged data in each direction so it can be replayed: a ring that starts at 256 KiB and grows (doubling) up to 16 MiB only for flows that fill it, within a process-wide budget of 256 MiB (a flow that cannot get even the start just runs without resume); idle flows hold nothing. A flow's rate is bounded by its ring per round trip (16 MiB at 80 ms is about 200 MB/s). The client has the same key (client.resume_window, default 30 s) for how long it waits on its side. (optional, default: 0)
-    log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
-    skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
-    mss = 1360                    # TCP/TCPMux: Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. (default: system-defined)
-    so_rcvbuf = 4194304           # TCP/TCPMux: Socket receive buffer size (bytes); larger buffer allows higher throughput on receive side. (default: system-defined)
-    so_sndbuf = 1048576           # TCP/TCPMux: Socket send buffer size (bytes); controls send queue size to manage outgoing data flow. (default: system-defined)
-
-
-
-    ports = [
-    "443-600",                  # Listen on all ports in the range 443 to 600
-    "443-600=5201",             # Listen on all ports in the range 443 to 600 and forward traffic to 5201
-    "443-600=1.1.1.1:5201",     # Listen on all ports in the range 443 to 600 and forward traffic to 1.1.1.1:5201
-    "443",                      # Listen on local port 443 and forward to remote port 443 (default forwarding).
-    "4000=5000",                # Listen on local port 4000 (bind to all local IPs) and forward to remote port 5000.
-    "127.0.0.2:443=5201",       # Bind to specific local IP (127.0.0.2), listen on port 443, and forward to remote port 5201.
-    "443=1.1.1.1:5201",         # Listen on local port 443 and forward to a specific remote IP (1.1.1.1) on port 5201.
-    "127.0.0.2:443=1.1.1.1:5201",  # Bind to specific local IP (127.0.0.2), listen on port 443, and forward to remote IP (1.1.1.1) on port 5201.
-   ]
-
-    ```
-
-   To start the `server`:
-
-   ```sh
-   ./backhaul -c config.toml
-   ```
-* **Client Configuration**
-
-   Create a configuration file named `config.toml` for the client:
-   ```toml
-   [client]  # Behind NAT, firewall-blocked
-   remote_addr = "0.0.0.0:3080"  # Server address and port (mandatory).
-   remote_addrs = []             # ws/wss/wsmux/wssmux: optional list of tunnel endpoints (e.g. the same origin fronted by several CDNs/domains). The connection pool spreads across all of them round-robin, so the tunnel aggregates every CDN at once instead of one. Each entry dials with its own host as the TLS SNI. Leave empty to use the single remote_addr above. e.g. ["aosky.ir:443", "nekocafe.sbs:443", "onionchips.sbs:443"]. (optional, default: none)
-   edge_ip = "188.114.96.0"      # Edge IP used for CDN connection, specifically for WebSocket-based transports.(Optional, default none)
-   edge_ips = []                 # ws/wss/wsmux/wssmux: optional edge IP to dial per remote_addrs entry (aligned by index); empty entries resolve/dial the domain directly. (optional, default: none)
-   path = ""                     # Custom base path prepended to the /channel and /tunnel endpoints, for ws/wss/wsmux/wssmux. Must match the server. (optional, default: none)
-   tls_verify = true             # wss/wssmux: verify the server's TLS certificate chain and hostname (normal PKI validation, not pinning). Enabled by default; omit it to keep verification on. Set to false ONLY for self-signed setups: while off, an on-path party can impersonate the server and read the auth token. Plain ws/wsmux has no TLS at all (no confidentiality); use verified wss/wssmux when that protection is needed. (optional, default: true)
-   transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
-   token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
-   connection_pool = 8           # Number of pre-established connections.(optional, default: 8).
-   aggressive_pool = false       # Enables aggressive connection pool management.(optional, default: false).
-   keepalive_period = 75         # Interval in seconds to send keep-alive packets. (optional, default: 75s)
-   nodelay = false               # Use TCP_NODELAY (optional, default: false).
-   retry_interval = 3            # Retry interval in seconds (optional, default: 3s).
-   dial_timeout = 10             # Sets the max wait time for establishing a network connection. (optional, default: 10s)
-   mux_version = 1               # SMUX protocol version (1 or 2). Version 2 may have extra features. (optional)
-   mux_framesize = 32768         # 32 KiB. The maximum size of a frame that can be sent over a connection. The default is also the size of a full half-close record (32765-byte payload + 3-byte header), so resumable and half-close flows fit one frame per record; lowering it makes every full record split in two. (optional)
-   mux_recievebuffer = 4194304   # 4 MB. The maximum buffer size for incoming data per connection. (optional)
-   mux_streambuffer = 0          # The per-stream receive window; see the server config above. Leave it unset/0 to get the derived default (mux_recievebuffer / 8 = 512 KB), which is what keeps a single flow from being pinned to 64 KB per round-trip. (optional, default: derived, floor 65536)
-   mux_keepalive_disabled = false # wsmux/wssmux: disable smux's built-in per-connection keepalive ping (see server config for details). (optional, default: false)
-   mux_stripe = 1                 # wsmux/wssmux (prototype): split a single flow's data across this many pool connections (see server config for details). Must match the server. Valid range 1-255, and mux_stripe + mux_stripe_parity <= 255. (optional, default: 1)
-   mux_stripe_parity = 0          # wsmux/wssmux: Reed-Solomon parity legs on top of mux_stripe, tolerating that many dead legs per flow (see server config for details). Must match the server. Requires mux_stripe >= 2, and mux_stripe + mux_stripe_parity <= 255 (the wire limit, below Reed-Solomon's own 256-shard ceiling). (optional, default: 0)
-   mux_ws_framing = true          # wsmux/wssmux: standards-framed WebSocket mux connections (see the server config for details). FAIL-LOUDLY: the client offers `backhaul-mux-v1` on every upgrade and, if the server does not confirm it, closes the connection and logs an error naming the fix - it never falls back to raw mode by itself. Must match the server. false selects the legacy raw mode. Ignored by every other transport. (optional, default: true)
-   mux_stealth_handshake = true   # wsmux/wssmux: derive the framing subprotocol and the half-close capability from the auth token instead of sending the project-named `Sec-WebSocket-Protocol: backhaul-mux-v1` and `X-Backhaul-Cap: halfclose-v1`, so no handshake string names the project (the subprotocol becomes a generic value such as `mqtt`/`json`; the capability rides in an `X-Request-Id` header whose value is a per-request nonce plus a MAC). Servers always accept both forms, so upgrade the servers first, then the clients; a new client against an old server fails loudly like any framing mismatch - set false to keep the legacy names. Ignored by every other transport. (optional, default: true)
-   sniffer = false               # Enable or disable network sniffing for monitoring data. (optional, default false)
-   web_port = 2060               # Port number for the web interface or monitoring interface. (optional, set to 0 to disable).
-   sniffer_log ="/root/log.json" # Filename used to store network traffic and usage data logs. (optional, default backhaul.json)
-   log_level = "info"            # Log level ("panic", "fatal", "error", "warn", "info", "debug", "trace", optional, default: "info").
-   skip_optz = true              # Skip optimizations performed by Backhaul (default: false)
-   mss = 1360                    # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Maximum Segment Size in bytes; controls max TCP payload size to avoid fragmentation. Previously silently ignored for ws/wss/wsmux/wssmux - now respected the same as TCP/TCPMux. (default: system-defined)
-   so_rcvbuf = 1048576           # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Socket receive buffer size (bytes) for the pool/tunnel connections; larger buffer allows higher throughput on receive side. Previously silently ignored for ws/wss/wsmux/wssmux, which always used a fixed 1MB or 2MB regardless of this setting - now respected the same as TCP/TCPMux. (default: system-defined)
-   so_sndbuf = 4194304           # TCP/TCPMux/WS/WSS/WSMux/WSSMux (client): Socket send buffer size (bytes) for the pool/tunnel connections; controls send queue size to manage outgoing data flow. Same ws/wss/wsmux/wssmux caveat as so_rcvbuf above. (default: system-defined)
-   ```
-
-   To start the `client`:
-
-   ```sh
-   ./backhaul -c config.toml
-   ```
-
-### Detailed Configuration
-#### TCP Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:3080"
-   transport = "tcp"
-   accept_udp = false 
-   token = "your_token"
-   keepalive_period = 75  
-   nodelay = true 
-   heartbeat = 40 
-   channel_size = 2048
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:3080"
-   transport = "tcp"
-   token = "your_token" 
-   connection_pool = 8
-   aggressive_pool = false
-   keepalive_period = 75
-   dial_timeout = 10
-   nodelay = true 
-   retry_interval = 3
-   sniffer = false
-   web_port = 2060 
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-
-   ```
-* **Details**:
-
-   `remote_addr`: The IPv4, IPv6, or domain address of the server to which the client connects.
-
-   `token`: An authentication token used to securely validate and authenticate the connection between the client and server within the tunnel.
-
-   `channel_size`: The queue size for forwarding packets from server to the client. If the limit is exceeded, packets will be dropped.
-
-   `connection_pool`: Set the number of pre-established connections for better latency.
-   
-   `nodelay`: Refers to a TCP socket option (TCP_NODELAY) that improve the latency but decrease the bandwidth
-
-
-#### TCP Multiplexing Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:3080"
-   transport = "tcpmux"
-   token = "your_token" 
-   keepalive_period = 75
-   nodelay = true 
-   heartbeat = 40 
-   channel_size = 2048
-   mux_con = 8
-   mux_version = 1
-   mux_framesize = 32768 
-   mux_recievebuffer = 4194304
-   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:3080"
-   transport = "tcpmux"
-   token = "your_token" 
-   connection_pool = 8
-   aggressive_pool = false
-   keepalive_period = 75
-   dial_timeout = 10
-   retry_interval = 3
-   nodelay = true 
-   mux_version = 1
-   mux_framesize = 32768 
-   mux_recievebuffer = 4194304
-   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ```
-* **Details**:
-
-   `mux_session`: Number of multiplexed sessions. Increase this if you need to handle more simultaneous sessions over a single connection.
-   
-   * Refer to TCP configuration for more information.
-
-
-#### UDP Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:3080"
-   transport = "udp"
-   token = "your_token"
-   heartbeat = 20 
-   channel_size = 2048
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:3080"
-   transport = "udp"
-   token = "your_token" 
-   connection_pool = 8
-   aggressive_pool = false
-   retry_interval = 3
-   sniffer = false
-   web_port = 2060 
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-
-   ```
-   
-#### WebSocket Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:8080"
-   transport = "ws"
-   token = "your_token" 
-   channel_size = 2048
-   keepalive_period = 75 
-   heartbeat = 40
-   nodelay = true 
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:8080"
-   edge_ip = "" 
-   transport = "ws"
-   token = "your_token" 
-   connection_pool = 8
-   aggressive_pool = false
-   keepalive_period = 75 
-   dial_timeout = 10
-   retry_interval = 3
-   nodelay = true 
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ```
-
-* **Details**:
-
-   * Refer to TCP configuration for more information.
-
-#### Secure WebSocket Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:8443"
-   transport = "wss"
-   token = "your_token" 
-   channel_size = 2048
-   keepalive_period = 75 
-   nodelay = true 
-   tls_cert = "/root/server.crt"      
-   tls_key = "/root/server.key"
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:8443"
-   edge_ip = "" 
-   transport = "wss"
-   token = "your_token" 
-   connection_pool = 8
-   aggressive_pool = false
-   keepalive_period = 75
-   dial_timeout = 10
-   retry_interval = 3  
-   nodelay = true 
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ```
-
-* **Details**:
-
-   * Refer to the next section for instructions on generating `tls_cert` and `tls_key`.
-
-
-#### WS Multiplexing Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:3080"
-   transport = "wsmux"
-   token = "your_token" 
-   keepalive_period = 75
-   nodelay = true 
-   heartbeat = 40 
-   channel_size = 2048
-   mux_con = 8
-   mux_version = 1
-   mux_framesize = 32768 
-   mux_recievebuffer = 4194304
-   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:3080"
-   edge_ip = "" 
-   transport = "wsmux"
-   token = "your_token" 
-   connection_pool = 8
-   aggressive_pool = false
-   keepalive_period = 75
-   dial_timeout = 10
-   nodelay = true
-   retry_interval = 3
-   mux_version = 1
-   mux_framesize = 32768 
-   mux_recievebuffer = 4194304
-   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ```
-
-#### WSS Multiplexing Configuration
-* **Server**:
-
-   ```toml
-   [server]
-   bind_addr = "0.0.0.0:443"
-   transport = "wssmux"
-   token = "your_token" 
-   keepalive_period = 75
-   nodelay = true 
-   heartbeat = 40 
-   channel_size = 2048
-   accept_udp = false            # Also forward UDP on each mapped port over the mux tunnel (requires mux_version = 2 on both ends). Enables carrying UDP services such as L2TP/IPsec over wssmux.
-   mux_con = 8
-   mux_version = 1
-   mux_framesize = 32768 
-   mux_recievebuffer = 4194304
-   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
-   tls_cert = "/root/server.crt"      
-   tls_key = "/root/server.key"
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ports = []
-   ```
-* **Client**:
-
-   ```toml
-   [client]
-   remote_addr = "0.0.0.0:443"
-   edge_ip = "" 
-   transport = "wssmux"
-   token = "your_token" 
-   keepalive_period = 75
-   dial_timeout = 10
-   nodelay = true
-   retry_interval = 3
-   connection_pool = 8
-   aggressive_pool = false
-   mux_version = 1
-   mux_framesize = 32768 
-   mux_recievebuffer = 4194304
-   mux_streambuffer = 0          # derived (mux_recievebuffer / mux_con); see the option reference
-   sniffer = false 
-   web_port = 2060
-   sniffer_log = "/root/backhaul.json"
-   log_level = "info"
-   ```
-
-## Generating a Self-Signed TLS Certificate with OpenSSL
-
-To generate a TLS certificate and key, you can use tools like OpenSSL. Here’s a step-by-step guide on how to create a self-signed certificate and key using OpenSSL:
-
-### Step 1: Install OpenSSL
-
-If you don't already have OpenSSL installed, you can install it using your system's package manager.
-
-- **On Ubuntu/Debian**:
-  ```bash
-  sudo apt-get install openssl
-  ```
-### Step 2: Generate a Private Key
-To generate a 2048-bit RSA private key, run the following command:
-  ```bash
-openssl genpkey -algorithm RSA -out server.key -pkeyopt rsa_keygen_bits:2048
-  ```
-This will create a file named `server.key`, which is your private key.
-### Step 3: Generate a Certificate Signing Request (CSR)
-
-Create a Certificate Signing Request (CSR) using the private key. This CSR is used to generate the SSL certificate:
-  ```bash
-openssl req -new -key server.key -out server.csr
-  ```
-
-You will be prompted to enter information for the CSR. For the common name (CN), use the domain name or IP address where your server will be hosted. Example:
 ```
-Country Name (2 letter code) [AU]:US
-State or Province Name (full name) [Some-State]:California
-Locality Name (eg, city) []:San Francisco
-Organization Name (eg, company) [Internet Widgits Pty Ltd]:Your Company Name
-Organizational Unit Name (eg, section) []:
-Common Name (e.g. server FQDN or YOUR name) []:example.com
-Email Address []:
+ user ──► server :443 ══ tunnel ══ client ──► 127.0.0.1:8080
+          (public)     (ws/wss/wsmux/wssmux/dns/dnsmux)   (behind NAT)
 ```
 
-### Step 4: Generate a Self-Signed Certificate
+## Contents
 
-Use the CSR and private key to generate a self-signed certificate. Specify the validity period (in days):
-  ```bash
-openssl x509 -req -in server.csr -signkey server.key -out server.crt -days 365
-  ```
-This will generate a certificate named `server.crt`, valid for 365 days.
-### Recap of the Files Generated:
+- [Transports](#transports)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Configuration reference](#configuration-reference)
+- [Port mappings](#port-mappings)
+- [TLS (wss / wssmux)](#tls-wss--wssmux)
+- [Hiding behind a decoy site](#hiding-behind-a-decoy-site)
+- [DNS transport (dns / dnsmux)](#dns-transport-dns--dnsmux)
+- [Multiplexing, rotation and resume (wsmux / wssmux)](#multiplexing-rotation-and-resume-wsmux--wssmux)
+- [Running as a service](#running-as-a-service)
+- [Tuning and troubleshooting](#tuning-and-troubleshooting)
+- [Development and releases](#development-and-releases)
+- [Benchmark](#benchmark)
+- [License](#license)
 
-* `server.key`: Your private key.
-* `server.csr`: The certificate signing request (used to generate the certificate).
-* `server.crt`: Your self-signed TLS certificate.
+## Transports
 
-## Running backhaul as a service
+Exactly six transports are supported. `transport` must be the same on both ends.
 
-To create a service file for your backhaul project that ensures the service restarts automatically, you can use the following template for a systemd service file. Assuming your project runs a reverse tunnel and the main executable file is located in a certain path, here's a basic example:
+| transport | carrier | multiplexed | encrypted | typical use |
+|---|---|---|---|---|
+| `ws` | WebSocket over TCP | no — one WebSocket per forwarded connection | no | behind a CDN/reverse proxy that terminates TLS |
+| `wss` | WebSocket over TLS | no | yes | direct or CDN-fronted, one TLS connection per flow |
+| `wsmux` | WebSocket over TCP + smux | yes — many flows per WebSocket | no | as `ws`, with far fewer connections |
+| `wssmux` | WebSocket over TLS + smux | yes | yes | the general-purpose choice: CDN-friendly, encrypted, pooled |
+| `dns` / `dnsmux` | DNS queries through recursive resolvers + smux | yes (always) | **no** (authenticated only) | networks where nothing else gets through; very low throughput |
 
-1. Create the service file `/etc/systemd/system/backhaul.service`:
+Notes:
+
+- `dns` and `dnsmux` are the same transport: the DNS carrier is always
+  multiplexed, so either name selects it.
+- Plain `ws` / `wsmux` send the upgrade request and the token in the clear. Use
+  them only behind something that terminates TLS in front of the origin.
+- `wss` / `wssmux` clients present a Chrome-like TLS ClientHello (uTLS) and
+  browser-like upgrade headers; the server terminates TLS with **OpenSSL** (see
+  [TLS](#tls-wss--wssmux)).
+- The former `tcp`, `tcpmux` and `udp` transports were removed. A config that
+  names one is rejected at startup.
+- UDP services can still be forwarded: set `accept_udp = true` on a `wsmux` /
+  `wssmux` server (needs `mux_version = 2` on both ends).
+
+## Install
+
+Backhaul is built for **linux/amd64** only. The server terminates TLS with the
+system OpenSSL (via cgo), so the binary is dynamically linked against
+`libssl.so.3` (OpenSSL 3.x) and the host needs that library.
+
+### Release binary
+
+```bash
+# Debian/Ubuntu: apt-get install -y libssl3
+tar -xzf backhaul_linux_amd64.tar.gz
+./backhaul -v
+```
+
+Download it from the [releases page](https://github.com/cybereow/backhaul/releases).
+
+### Docker
+
+```bash
+docker run -d --name backhaul --network host \
+  -v /etc/backhaul:/config:ro \
+  <dockerhub-user>/backhaul:latest          # runs: backhaul -c /config/config.toml
+```
+
+The image is linux/amd64, based on `debian:bookworm-slim` with `libssl3` and CA
+certificates. Use `--network host` (or publish the mapped ports) so the tunnel's
+listeners are reachable.
+
+### Build from source
+
+Needs Go (see `go.mod`), a C toolchain and the OpenSSL headers:
+
+```bash
+sudo apt-get install -y gcc libssl-dev
+git clone https://github.com/cybereow/backhaul.git
+cd backhaul
+CGO_ENABLED=1 go build -ldflags="-s -w" -o backhaul ./main.go
+```
+
+## Quick start
+
+A `wssmux` tunnel that exposes the client's local web server on the server's
+port 8443.
+
+**Server** (public host) — `server.toml`:
+
+```toml
+[server]
+bind_addr = "0.0.0.0:443"
+transport = "wssmux"
+token = "change-me"
+tls_cert = "/etc/backhaul/server.crt"
+tls_key = "/etc/backhaul/server.key"
+ports = ["8443=127.0.0.1:80"]    # listen on :8443, the client dials 127.0.0.1:80
+```
+
+**Client** (behind NAT) — `client.toml`:
+
+```toml
+[client]
+remote_addr = "server.example.com:443"
+transport = "wssmux"
+token = "change-me"
+connection_pool = 8
+```
+
+```bash
+./backhaul -c server.toml      # on the server
+./backhaul -c client.toml      # on the client
+```
+
+- A config is a **server** if `[server].bind_addr` is set and a **client** if
+  `[client].remote_addr` (or `remote_addrs`) is set. With `dns`/`dnsmux`, the
+  role is given by `dns_domain` instead.
+- `token` is mandatory on both ends and must match; there is no default.
+- The config file is watched: saving it restarts the tunnel with the new values.
+- `./backhaul -v` prints the version.
+
+## Configuration reference
+
+Only keys marked **required** must be set. Everything else has the default shown.
+
+### Server — `[server]`
+
+| key | default | applies to | description |
+|---|---|---|---|
+| `bind_addr` | — **required** | ws\*, wss\* | address the tunnel listens on, e.g. `"0.0.0.0:443"` |
+| `transport` | — **required** | all | one of `ws`, `wss`, `wsmux`, `wssmux`, `dns`, `dnsmux` |
+| `token` | — **required** | all | shared secret; must equal the client's |
+| `ports` | `[]` | all | port mappings, see [Port mappings](#port-mappings) |
+| `log_level` | `"info"` | all | `panic`, `fatal`, `error`, `warn`, `info`, `debug`, `trace` |
+| `keepalive_period` | `75` | ws\* | TCP keepalive period, seconds |
+| `heartbeat` | `40` | ws\* | control-channel ping interval, seconds (min 1) |
+| `nodelay` | `false` | all | set `TCP_NODELAY` |
+| `channel_size` | `2048` | ws\* | queue of connections waiting for a tunnel; excess is dropped |
+| `proxy_protocol` | `false` | all | send a PROXY protocol header so the target sees the real client address |
+| `path` | `""` | ws\* | base path for the tunnel endpoints (`<path>/channel`, `<path>/tunnel`) |
+| `fallback` | `""` | ws\* | `host:port` of a decoy web backend, see [decoy site](#hiding-behind-a-decoy-site) |
+| `tls_cert`, `tls_key` | — | wss, wssmux | certificate and key (PEM) |
+| `tls_certs`, `tls_keys` | `[]` | wss, wssmux | several cert/key pairs, chosen by SNI |
+| `sniffer` | `false` | all | record per-port traffic to `sniffer_log` |
+| `web_port` | `0` | all | port of the web monitor (0 disables) |
+| `sniffer_log` | `"backhaul.json"` | all | file the sniffer writes |
+| `skip_optz` | `false` | all | skip the Linux sysctl / ulimit tuning applied at startup |
+| `pprof` | `false` | all | pprof on `127.0.0.1:6060` (loopback only) |
+| `so_rcvbuf`, `so_sndbuf` | OS default | wsmux, wssmux | socket buffer sizes in bytes |
+| `mss` | OS default | ws\* | TCP maximum segment size |
+| `cdn_max_age` | `0` (off) | ws\* | shortest max connection age of any CDN/LB in front (seconds); see [rotation](#multiplexing-rotation-and-resume-wsmux--wssmux) |
+| `resume_window` | `30` with `cdn_max_age` | wsmux, wssmux | seconds a cut flow waits to be resumed; `-1` disables |
+| `mux_con` | `8` | wsmux, wssmux, dns | streams per tunnel connection |
+| `mux_version` | `1` | wsmux, wssmux, dns | smux protocol version (1 or 2); 2 is needed for UDP, resume, half-close, promotion, speedtest |
+| `mux_framesize` | `32768` | wsmux, wssmux, dns | largest smux frame |
+| `mux_recievebuffer` | `4194304` | wsmux, wssmux, dns | per-connection receive budget, bytes |
+| `mux_streambuffer` | derived | wsmux, wssmux, dns | per-stream window; default `mux_recievebuffer / mux_con` (min 64 KiB) |
+| `mux_keepalive_disabled` | `false` | wsmux, wssmux | turn off smux's keepalive ping |
+| `mux_stripe` | `1` | wsmux, wssmux | split one flow across this many connections (1–255); must match the client |
+| `mux_stripe_parity` | `0` | wsmux, wssmux | Reed-Solomon parity legs on top of `mux_stripe`; needs `mux_stripe ≥ 2`; `mux_stripe + mux_stripe_parity ≤ 255` |
+| `stripe_ports` | `[]` | wsmux, wssmux | ports whose flows are striped |
+| `promote_bytes` | `0` (off) | wsmux, wssmux | after this many bytes, move a plain flow onto a striped group; needs `mux_version = 2` |
+| `mux_ws_framing` | `true` | wsmux, wssmux | carry legs as standard RFC 6455 binary messages; must match the client |
+| `mux_half_close` | `false` | wsmux, wssmux | directional EOF for plain flows; needs `mux_version = 2` |
+| `accept_udp` | `false` | wsmux, wssmux | also forward UDP on each mapped port; needs `mux_version = 2` |
+| `udp_buffer` | `2048` | wsmux, wssmux | datagrams queued per UDP flow before dropping |
+| `speedtest` | `false` | wsmux, wssmux | enable the token-gated `<path>/speedtest` endpoint |
+| `dns_domain` | — **required for dns** | dns, dnsmux | tunnel domain this server is authoritative for |
+| `dns_listen` | `"0.0.0.0:53"` | dns, dnsmux | UDP+TCP address of the DNS responder |
+| `dns_key` | = `token` | dns, dnsmux | secret for the per-query MAC |
+
+### Client — `[client]`
+
+| key | default | applies to | description |
+|---|---|---|---|
+| `remote_addr` | — **required** | ws\* | server address, `host:port` |
+| `remote_addrs` | `[]` | ws\* | several endpoints (e.g. one origin behind several CDN domains); the pool spreads across them round-robin, each with its own SNI |
+| `edge_ip` | `""` | ws\* | IP to dial instead of resolving `remote_addr` (CDN edge) |
+| `edge_ips` | `[]` | ws\* | edge IP per `remote_addrs` entry, by index |
+| `transport` | — **required** | all | same as the server |
+| `token` | — **required** | all | same as the server |
+| `path` | `""` | ws\* | must match the server |
+| `connection_pool` | `8` (`1` for dns) | all | tunnel connections kept open |
+| `aggressive_pool` | `false` | ws\* | refill the pool more eagerly |
+| `retry_interval` | `3` | all | seconds between reconnect attempts |
+| `dial_timeout` | `10` | all | seconds to establish a connection |
+| `keepalive_period` | `75` | all | TCP keepalive period, seconds |
+| `nodelay` | `false` | all | set `TCP_NODELAY` |
+| `tls_verify` | `true` | wss, wssmux | verify the server certificate. `false` is for self-signed setups only: while off, an on-path party can read the token |
+| `resume_window` | `30` | wsmux, wssmux | seconds to wait for a cut flow to be resumed |
+| `mux_*`, `so_*`, `mss`, `log_level`, `sniffer`, `web_port`, `sniffer_log`, `skip_optz`, `pprof` | as server | | same meaning as on the server; `mux_stripe`, `mux_stripe_parity`, `mux_ws_framing`, `mux_version` must match |
+| `mux_stealth_handshake` | `true` | wsmux, wssmux | derive the framing subprotocol and half-close capability from the token instead of project-named strings; upgrade servers before clients, or set `false` |
+| `dns_domain` | — **required for dns** | dns, dnsmux | tunnel domain |
+| `dns_key` | = `token` | dns, dnsmux | per-query MAC secret |
+| `dns_resolvers` | `[]` (auto) | dns, dnsmux | recursive resolvers to use; empty or `"auto"` tests a built-in list at startup |
+| `dns_record_types` | all | dns, dnsmux | limit the RR types tried (`TXT`, `NULL`, `A`, `AAAA`, `CNAME`, `MX`, `SRV`, `PTR`) |
+| `dns_timeout_ms` | `2000` | dns, dnsmux | per-query timeout |
+| `dns_workers` | `16` | dns, dnsmux | queries in flight per tunnel connection |
+| `dns_resolver_cidrs` | `[]` | dns, dnsmux | extra candidate resolvers (CIDRs/IPs, max 4096 addresses) |
+| `dns_resolver_cache` | `""` | dns, dnsmux | file caching the discovered resolvers for 30 minutes |
+| `dns_no_hedge` | `false` | dns, dnsmux | disable hedged (duplicate) queries |
+
+`ws*` means `ws`, `wss`, `wsmux` and `wssmux`.
+
+### Per-transport examples
+
+`ws` / `wss` — one WebSocket per forwarded connection:
+
+```toml
+[server]
+bind_addr = "0.0.0.0:8443"
+transport = "wss"                 # or "ws"
+token = "change-me"
+tls_cert = "/etc/backhaul/server.crt"
+tls_key = "/etc/backhaul/server.key"
+ports = ["2222=127.0.0.1:22"]
+
+[client]                          # in the client's own file
+remote_addr = "server.example.com:8443"
+transport = "wss"
+token = "change-me"
+connection_pool = 8
+```
+
+`wsmux` / `wssmux` — pooled and multiplexed:
+
+```toml
+[server]
+bind_addr = "0.0.0.0:443"
+transport = "wssmux"              # or "wsmux"
+token = "change-me"
+mux_version = 2
+mux_con = 8
+tls_cert = "/etc/backhaul/server.crt"
+tls_key = "/etc/backhaul/server.key"
+ports = ["443-600=5201"]
+
+[client]                          # in the client's own file
+remote_addr = "server.example.com:443"
+transport = "wssmux"
+token = "change-me"
+connection_pool = 8
+mux_version = 2
+```
+
+`dnsmux` — see [DNS transport](#dns-transport-dns--dnsmux) and
+[`examples/dnsmux.toml`](examples/dnsmux.toml).
+
+## Port mappings
+
+`ports` entries are `local[=target]`. The server listens on `local`; the client
+dials `target` (which defaults to the same port on the client's host).
+
+| entry | meaning |
+|---|---|
+| `"443"` | listen on :443, client dials its own port 443 |
+| `"4000=5000"` | listen on :4000, client dials port 5000 |
+| `"443=1.1.1.1:5201"` | listen on :443, client dials `1.1.1.1:5201` |
+| `"127.0.0.2:443=5201"` | bind only 127.0.0.2, client dials port 5201 |
+| `"127.0.0.2:443=1.1.1.1:5201"` | bind 127.0.0.2, client dials `1.1.1.1:5201` |
+| `"443-600"` | every port in the range, same port on the client |
+| `"443-600=5201"` | every port in the range → port 5201 |
+| `"443-600=1.1.1.1:5201"` | every port in the range → `1.1.1.1:5201` |
+
+## TLS (wss / wssmux)
+
+**The server always terminates TLS with the system OpenSSL**, never Go's
+`crypto/tls`. The SSL context mirrors a stock nginx: TLS 1.2 and 1.3, server
+cipher preference, ALPN `http/1.1`. On OpenSSL 3 that makes TLS 1.3 negotiate
+`TLS_AES_256_GCM_SHA384`, exactly like nginx, whereas Go's stack always prefers
+AES-128-GCM — a difference a censor probing a directly reachable origin could
+fingerprint. A test in `internal/utils/network` asserts the cipher choice.
+
+Caveats:
+
+- For the closest match, run the same OpenSSL **major** version as your nginx.
+- nginx's `http2` also advertises `h2` in ALPN; this listener speaks HTTP/1.1
+  only (the WebSocket tunnel needs it).
+- This closes the largest observable gap, not every one. Verify with a
+  fingerprinting tool (e.g. JARM) against a real nginx before relying on it.
+- If the origin is only reachable through a CDN, the censor sees the CDN's TLS
+  and none of this matters.
+- `tls_engine` no longer exists. A config that still sets it logs a warning and
+  the value is ignored.
+
+### Several domains (SNI)
+
+```toml
+tls_certs = ["/etc/backhaul/a.crt", "/etc/backhaul/b.crt"]
+tls_keys  = ["/etc/backhaul/a.key", "/etc/backhaul/b.key"]
+```
+
+The server picks the certificate whose names match the client's SNI and falls
+back to the first when none match.
+
+### A self-signed certificate
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  -keyout server.key -out server.crt -subj "/CN=example.com" \
+  -addext "subjectAltName=DNS:example.com"
+```
+
+Clients then need `tls_verify = false`, or a certificate their system trusts.
+
+## Hiding behind a decoy site
+
+With `fallback`, backhaul is itself the web origin: requests that are not valid
+tunnel traffic (wrong or missing token, any non-tunnel path such as `/`) are
+reverse-proxied to a decoy backend instead of getting a 401, so probes see an
+ordinary website. No nginx has to sit in the data path.
+
+```toml
+[server]
+bind_addr = "0.0.0.0:443"
+transport = "wssmux"
+tls_cert = "/etc/backhaul/site.crt"
+tls_key  = "/etc/backhaul/site.key"
+path = "/your-secret-path"        # the tunnel lives here
+fallback = "127.0.0.1:8080"       # everything else → your decoy site
+token = "..."
+```
+
+Putting nginx in front instead costs CPU: nginx has no zero-copy path for a
+proxied WebSocket and copies every byte in userspace, roughly a core per Gbps.
+
+## DNS transport (dns / dnsmux)
+
+Carries the tunnel inside DNS queries sent **only through recursive resolvers**;
+the client never contacts the server directly. Payload is authenticated
+(token challenge-response, per-query HMAC) but **not encrypted** — encrypt
+anything sensitive end to end. Throughput is low by design (about 100 bytes per
+query upstream, 400 bytes per reply); use it where nothing else works.
+
+Prerequisites:
+
+1. A domain you control, and a sub-zone for the tunnel, e.g. `ttt.example.com`.
+2. An `NS` record delegating that sub-zone to a host you own
+   (`ttt.example.com. NS tns.example.com.`) and an `A` glue record for it
+   pointing at the **server's** public IP.
+3. UDP **and** TCP port 53 reachable on the server and free (on Ubuntu, disable
+   `systemd-resolved`'s stub listener).
+
+```bash
+dig +norec @<server-ip> SOA ttt.example.com   # the server answers authoritatively
+dig NS ttt.example.com                        # the delegation is publicly visible
+```
+
+```toml
+# server
+[server]
+transport = "dnsmux"
+token = "change-me"
+dns_domain = "ttt.example.com"
+ports = ["8080=127.0.0.1:80"]
+
+# client
+[client]
+transport = "dnsmux"
+token = "change-me"
+dns_domain = "ttt.example.com"
+dns_resolvers = []        # empty/"auto": test a built-in list and keep the ones that work
+```
+
+How it behaves: the client polls (fast while data is pending, ~500 ms idle); it
+measures resolvers and record types live and picks the best (`dns_record_types`
+restricts them); queries unanswered for ~3× the typical round trip are hedged;
+a SACK block avoids resending bytes that arrived behind a gap.
+
+### Prober
+
+`./backhaul -probe probe.toml` runs a standalone diagnostic (no tunnel) that
+tests which resolver / record type / transport combinations actually carry bytes
+in your network, from a `[dns_probe]` config. Run the responder role on the
+server and the prober role on the client side. See
+[`internal/transport/dns/README.md`](internal/transport/dns/README.md).
+
+## Multiplexing, rotation and resume (wsmux / wssmux)
+
+**mux_version.** smux version 2 adds per-stream flow control and is required for
+UDP forwarding, resume, half-close, promotion and the speedtest. A single stream
+tops out at `mux_streambuffer / RTT`, so the derived default
+(`mux_recievebuffer / mux_con`, 512 KiB) matters on high-RTT links.
+
+**Striping.** `mux_stripe = N` splits one flow across N pool connections, which
+helps one long, throughput-bound flow on a lossy high-RTT link. It does not help
+many short flows. `mux_stripe_parity = P` adds P Reed-Solomon legs so up to P
+legs can die mid-flow without ending it, at the cost of P/N extra bandwidth.
+Both ends must agree.
+
+**Connection rotation (`cdn_max_age`).** Set it on the server to the shortest
+max connection age among the CDNs/load balancers in front (e.g. `300`).
+Connections are retired at ~70 % of that age (±10 % jitter) only after a
+replacement has joined the pool, then drained for the rest of the age. With
+`mux_version = 2` on both ends, a flow on a retired connection is moved
+byte-for-byte to another connection instead of being cut, so it can outlive the
+CDN limit (SSH, long downloads).
+
+**Resume (`resume_window`).** A flow whose connection is cut *without* warning
+waits up to `resume_window` seconds to be resumed elsewhere, replaying
+unacknowledged data from a ring that grows from 256 KiB to 16 MiB within a
+256 MiB process-wide budget. Requires `cdn_max_age` and `mux_version = 2`.
+
+**Half-close (`mux_half_close`, server, `mux_version = 2`).** Lets a client send
+its request, shut down its writing end and still get the full reply — a plain
+smux stream cannot (the shutdown ends both directions). Plain flows then carry a
+3-byte-header envelope. **Strict:** the server rejects upgrades from clients that
+do not offer the capability, so upgrade clients first. Promotable and striped
+flows keep full-close behaviour.
+
+**Framing (`mux_ws_framing`, default on).** Every mux leg is a stream of
+standard RFC 6455 binary messages negotiated with a subprotocol, so an
+intermediary that parses WebSocket messages (a CDN) can carry it. It is strict
+and never falls back silently: a mismatch fails loudly. It must be set the same
+on both ends (`false` on both selects the legacy raw mode). No specific CDN has
+been tested; verify yours.
+
+**Handshake stealth (`mux_stealth_handshake`, client, default on).** Derives the
+subprotocol and capability header from the token so no handshake string names the
+project. Servers accept both forms: upgrade servers first, then clients.
+
+**Setup limit.** Every accepted user connection has a fixed 3-second budget to be
+handed to a tunnel stream (queueing, pool growth, retries and header write all
+count). When it runs out the connection is closed. Concurrent setups are capped
+at `channel_size`.
+
+**Diagnostics.** The server's `<path>/pool` and `<path>/diag` endpoints (header
+`Authorization: Bearer <token>`) report pool and control-channel state.
+
+**Speedtest.** With `speedtest = true` on the server and `mux_version = 2` on
+both ends:
+
+```bash
+curl -H "Authorization: Bearer <token>" \
+  "https://server/<path>/speedtest?dir=both&scope=all&seconds=10"
+```
+
+`dir` is `down`, `up` or `both`; `scope` is `best` or `all`; `seconds` is 1–30.
+Per-path rates use the receiver-measured data window; aggregate rates divide by
+the local phase wall time, so they differ by design.
+
+## Running as a service
+
+`/etc/systemd/system/backhaul.service`:
 
 ```ini
 [Unit]
@@ -567,7 +463,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/root/backhaul -c /root/config.toml
+ExecStart=/usr/local/bin/backhaul -c /etc/backhaul/config.toml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -575,165 +471,70 @@ LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 ```
-2. After creating the service file, enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable backhaul.service
-sudo systemctl start backhaul.service
+sudo systemctl enable --now backhaul
+journalctl -u backhaul -e -f
 ```
-3. To verify if the service is running:
+
+## Tuning and troubleshooting
+
+**CPU saturated on a small box, can't reach line rate.** The per-byte cost is
+almost all TLS/AES. Check AES-NI (`grep -m1 -o aes /proc/cpuinfo`) — cheap VPSes
+often hide it. Take nginx out of the tunnel's data path (see
+[decoy site](#hiding-behind-a-decoy-site)). Don't wrap already-encrypted traffic
+(VLESS/Reality, etc.) in a second TLS layer if you control both ends.
+
+**High-latency link stalls below line rate.** Enable BBR
+(`net.ipv4.tcp_congestion_control=bbr`, `net.core.default_qdisc=fq`); backhaul
+applies this at startup unless `skip_optz = true`. Size `so_rcvbuf` / `so_sndbuf`
+to the bandwidth-delay product (about 8 MB for 1 Gbps at 40 ms).
+
+**Upload much slower than download on wsmux/wssmux.** Use `mux_version = 2` and
+leave `mux_streambuffer` unset so the per-stream window is derived from the
+session budget.
+
+**One core pinned, another idle.** A single big flow is bound to one
+connection. `mux_stripe = N` spreads it. If every core is already busy, striping
+won't help.
+
+**A flow resets mid-transfer on wsmux/wssmux.** Almost never packet loss — a
+whole pooled connection died (CDN idle/max-age reset, mobile handover). Set
+`cdn_max_age` for planned rotation, and `mux_stripe_parity` to survive legs
+dying.
+
+**`mux_*` settings have no effect on `ws`/`wss`.** Each forwarded connection is
+its own WebSocket there; switch to `wsmux`/`wssmux` to use them.
+
+## Development and releases
+
 ```bash
-sudo systemctl status backhaul.service
-```
-4. View the most recent log entries for the backhaul.service unit:
-```bash
-journalctl -u backhaul.service -e -f
+sudo apt-get install -y gcc libssl-dev
+go vet ./...
+go test -race ./...
 ```
 
-## FAQ
+Real-binary end-to-end tests with a no-tunnel baseline and an emulated WAN live
+in [`e2e/`](e2e/README.md).
 
-**Q: How do I decide which transport protocol to use?**
+CI is deliberately narrow — **linux/amd64 only**:
 
-* `tcp`: Use if you need straightforward TCP connections.
-* `tcpmux`: Use if you need to handle multiple sessions over a single connection.
-* `ws`: Use if you need to traverse HTTP-based firewalls or proxies.
-* `wss`: Use this for secure WebSocket connections that need to traverse HTTP-based firewalls or proxies. It encrypts data for added security, similar to WS but with encryption. Its TLS ClientHello is generated with uTLS to mimic Chrome, for CDN edges/DPI that fingerprint the TLS handshake itself.
-
-**Q: My CPU saturates (~95%) on a low-core box and I can't reach line rate (e.g. 1Gbps). Why, and what actually helps?**
-
-On these boxes the per-byte CPU cost is almost entirely **TLS/AES**, not moving bytes. The right fix depends on whether you're free to choose the transport or locked into WebSocket-over-TLS by a CDN.
-
-*If you control both ends and don't need a CDN/HTTP front:* prefer `tcp` or `tcpmux`. With those, both ends of each forwarded connection are raw `*net.TCPConn`, so the data pump routes straight to `splice(2)` on Linux - bytes move kernel-side without ever entering this process, so backhaul's own per-byte CPU cost is effectively zero (`ws`/`wss`/`wsmux`/`wssmux` cannot take that path). And don't wrap already-encrypted traffic (e.g. an xray/VLESS/Reality payload) in a second TLS layer - that extra AES pass costs CPU without adding confidentiality.
-
-*If you're behind a CDN (Cloudflare, etc.) and must use `ws`/`wss`/`wsmux`/`wssmux` for obfuscation:* `tcp` and `splice` are off the table, so the levers are:
-
-* **Check AES-NI first:** `grep -m1 -o aes /proc/cpuinfo`. Cheap VPS instances often don't expose it to the guest, and without it TLS termination is several times more expensive - frequently the entire reason a 2-core box stalls below 1Gbps. If it's present, make sure the negotiated cipher is AES-GCM (hardware-accelerated) rather than ChaCha20.
-* **Get nginx out of the tunnel's data path** - it's usually the real bottleneck. When nginx fronts the tunnel to serve a decoy site under the same hostname (path-based camouflage), it must terminate TLS and reverse-proxy the WebSocket, and it has **no zero-copy path for a proxied WebSocket** - it copies every byte in userspace, burning roughly a core per Gbps. On a 2-core box, a single ~1Gbps flow then eats one core in nginx and another in backhaul, saturating both. Point the CDN/origin **straight at backhaul** (`transport = "wss"`/`"wssmux"`, backhaul terminates the origin TLS itself) and let the `fallback` option (below) preserve the decoy - so the camouflage stays but nginx no longer copies the tunnel's bytes.
-* **Trim nginx waste on the tunnel vhost:** `access_log off;`, `gzip off;`, `ssl_protocols TLSv1.2 TLSv1.3;` only, and `worker_cpu_affinity auto;` so workers spread across every core. Keep `proxy_buffering off;` - that's correct for a streamed tunnel.
-* **Upload much slower than download on `wsmux`/`wssmux`?** On `mux_version = 2` smux adds *per-stream* flow control: a stream may have at most `mux_streambuffer` bytes in flight before it blocks waiting for the peer's window update, which costs a full tunnel round-trip. One stream therefore tops out at `mux_streambuffer / RTT` no matter how much bandwidth the path has - at the old fixed 64 KB and a 30 ms tunnel that is ~2.2 MB/s (~18 Mbps) per stream, measured, while the connection was already allowed to buffer `mux_recievebuffer` (4 MB). That ceiling is why raising socket buffers or `so_sndbuf` on the tunnel legs never moved upload: smux was never letting more than 64 KB per stream reach those sockets. `mux_streambuffer` now defaults to `mux_recievebuffer / mux_con` (512 KB) instead, which is each stream's fair share of the budget the pool already reserves. If you pinned `mux_streambuffer = 65536` in your config (older sample configs did), **set it to 0** to pick the derived value up. Memory does not grow either way - smux caps everything a connection buffers at `mux_recievebuffer` regardless of the per-stream window.
-
-* **`mux_*` settings only apply to the mux transports.** On plain `ws`/`wss` (and `tcp`), `mux_con`, `mux_framesize`, `mux_recievebuffer`, `mux_streambuffer`, `mux_stripe` and `mux_stripe_parity` are silently ignored - each forwarded connection is its own WebSocket. If you set large mux buffers expecting them to take effect, switch the transport to `wsmux`/`wssmux`. Note that `wsmux`/`wssmux` do NOT necessarily pass through a CDN "exactly like `ws`/`wss`": `ws`/`wss` send every forwarded connection as ordinary WebSocket messages, while the mux transports multiplex many connections over each WebSocket, and only with `mux_ws_framing = true` (the default) is every byte on the wire a standards-framed WebSocket message. See "`wsmux`/`wssmux` framing and upgrading" below.
-* **`wsmux`/`wssmux` setup limits.** Every accepted user connection has a fixed 3-second budget, counted from the moment it was accepted, to be handed to a tunnel stream: time spent queued, waiting for the pool to grow, retrying and writing its header all come out of that one budget, and a retry never restarts it. When it runs out the user connection is closed. The number of connections being set up at once is capped at `channel_size` (the rest wait in the queue, and the queue itself drops what does not fit); a running transfer does not count against that cap, and the per-flow admission limit (`mux_con` streams per pool connection) is unchanged. Waiting connections share a single request for a bigger pool instead of each asking on its own. smux cannot cancel a stream open that is already in progress (it can take up to its own 30-second internal timeout when a pool connection has stalled): the user connection is still closed at 3 seconds, but the setup's bookkeeping is released only when that open returns, and a stream that arrives late is closed unused. No pool connection is closed to cancel one flow. On the client, the first bytes of every stream the server opens (flow kind and header) must arrive within `dial_timeout`, otherwise the stream is closed; headers are read one stream at a time, so a stalled header can delay the streams behind it by up to that long. A flow kind the client does not know closes the stream.
-* **`wsmux`/`wssmux` pool diagnostics.** The server's existing `<path>/pool` and `<path>/diag` endpoints (both need `Authorization: Bearer <token>`; without it they answer 401 like any other probe) keep every JSON key they had and gain one nested `diagnostics` object. It reports ownership state the transport already tracks and adds no counters of its own: `control_state` (`connected`, `reconnecting` while the control channel is lost and the pool is held for reattach, `restarting`, or `waiting` before the first control channel) with `control_grace_elapsed_ms` while a loss is being held; `sessions_owned` (open pool connections the current run owns), `sessions_eligible` (registered and open: what new flows can be placed on), `sessions_queued` (upgraded, waiting for admission) and `sessions_draining` (owned and open but no longer eligible, i.e. rotated out and finishing its streams; derived, so approximate); `setups_active`, `setups_queued`, `setup_limit` and `setups_saturated` (connections being set up versus the `channel_size` ceiling, and those waiting behind it); `pending_opens` (stream opens that have picked a pool connection and not returned yet); `replacement_waiting` (a rotation is waiting for its replacement connection). A value the transport does not track is omitted rather than guessed; there is no generation ID. The fields are read from independently locked parts one after another, so the snapshot is best effort and not a consistent global view: while things are changing they can disagree for a moment (never negative). Taking a snapshot does no network I/O and records nothing. `/diag` events stay a ring of the latest 128 and now also record the end of a control-loss hold (`control_reattached`) and, once per rotation, `rotation_retired` (plus a single `rotation_deferred` when the replacement is late); none of the new fields or events contains the token, the Authorization header, the configured path, payload bytes or where a connection was going. `per_cdn`'s `cdn` is the remote IP a pool connection arrived from, not a verified configured endpoint or provider: two providers behind one IP group together and one provider behind several IPs is split.
-* **If one core is pinned while the other is idle** (a single big flow bottlenecked on one connection's copy/decrypt), the mux transports' `mux_stripe = N` splits that one flow across N pooled connections so it can use more than one core - or, more commonly on an intercontinental link, across N congestion windows so per-flow packet loss doesn't cap it. The earlier deadlock and tail data-loss bugs are fixed (see the option docs). If *both* cores are already saturated (aggregate-bound), striping won't help anyway - you're out of CPU, so reduce per-byte cost with the points above instead.
-  * **Striping targets a *single* fat flow, not many connections.** Each striped flow is reassembled in order across its legs, so a leg whose transport backs up (smux flow control filling under load) can head-of-line-block *that one flow* until the byte it's carrying arrives. That's inherent to reassembling one ordered stream across independent legs, so the gain is on a single long-lived, throughput-bound flow on a lossy/high-RTT link - not on many short parallel connections. (A separate bug where striping never released connection-pool slots, so heavy concurrent load leaked smux sessions until the whole tunnel stalled, is fixed - concurrency no longer degrades the tunnel, though a single flow can still see the occasional head-of-line latency spike.) When the workload is many connections rather than one fat flow, `mux_stripe = 1` (the default) is the right choice.
-* **A flow resetting mid-transfer on `wsmux`/`wssmux` even though the tunnel underneath is TCP** is almost never real packet loss - TCP already hides that by retransmitting. It's a whole pooled *connection* dying (a CDN/LB idle-killing or max-age-resetting a WebSocket, a mobile network handover), which drops whatever byte range was in flight on it. Plain `mux_stripe` has no recovery for that - the flow just ends. `mux_stripe_parity = N` (with `mux_stripe >= 2`, matched on both sides) adds N Reed-Solomon parity legs so up to N of the `mux_stripe + mux_stripe_parity` legs carrying a flow can die mid-transfer and the flow keeps going, reconstructed from the survivors - at the cost of N/mux_stripe extra bandwidth and a little added latency per chunk.
-
-**Q: How much does the handshake look like a browser, and what does `ws`/`wsmux` hide?**
-
-*What the upgrade request carries.* The tunnel's WebSocket upgrade now sends the headers a browser's does (`Origin`, `Accept-Language`, `Accept-Encoding`, `Cache-Control`/`Pragma`), a `User-Agent` that is always desktop Chrome at the version the wss TLS ClientHello impersonates (so the two never contradict each other), and no custom `X-User-Id` header (the random id is already in the tunnel path). With `mux_stealth_handshake = true` (default) the wsmux/wssmux subprotocol and capability names are derived from the token rather than naming the project. The header order of the upgrade request is Chrome's (Host, Connection, Pragma, Cache-Control, User-Agent, Upgrade, Origin, Sec-WebSocket-Version, Accept-Encoding, Accept-Language, then the tunnel's own `Authorization`/capability headers where a Cookie would sit, then Sec-WebSocket-Key and Sec-WebSocket-Protocol), as captured from a real Chromium 141 opening a WebSocket. Remaining differences from a real browser: `Sec-WebSocket-Extensions: permessage-deflate` is not offered (the tunnel does not implement it, and a CDN that accepted it would corrupt the stream), and the `Authorization: Bearer` header is browser-atypical but required. `wss` offers ALPN `http/1.1` only, which is what Chrome itself sends on a WebSocket connection (verified against Chromium 141), so no HTTP/2 layer is needed for that.
-
-*`ws`/`wsmux` are not obfuscated.* Without TLS, the upgrade request, the token and every header are readable on the wire. Use them only behind a CDN/reverse proxy that terminates TLS in front of the origin; use `wss`/`wssmux` for anything that crosses an untrusted network.
-
-**Q: What is `mux_ws_framing` (`wsmux`/`wssmux` framing), and how do I upgrade to it?**
-
-*What it changes.* Older builds used WebSocket only as an HTTP upgrade vector for `wsmux`/`wssmux`: after the `101 Switching Protocols` response the tunnel legs carried raw smux bytes, which are **not** WebSocket frames (the control channel always used real frames). That works when nothing in the path looks past the upgrade (a direct connection, a TCP-passthrough proxy), but an intermediary that parses or reassembles WebSocket messages (a CDN in WebSocket-proxy mode) can reject or corrupt such a stream - so the old claim that `wsmux`/`wssmux` pass through a CDN exactly like `ws`/`wss` was not correct. With `mux_ws_framing = true` (the default) every mux tunnel leg is a stream of RFC 6455 binary messages: one message per smux write, client-to-server frames masked, server-to-client frames unmasked, Ping answered with a Pong that echoes its payload, Close answered with a Close. It is negotiated in the HTTP upgrade with `Sec-WebSocket-Protocol: backhaul-mux-v1` on every `wsmux`/`wssmux` upgrade (control channel and tunnel legs). Control-channel frames, `mux_version` and plain `ws`/`wss` are unchanged.
-
-*Strict, and it never falls back silently.*
-
-| client \ server | `mux_ws_framing = true` | `mux_ws_framing = false` |
+| workflow | runs when | does |
 |---|---|---|
-| **true** (new) | framed, works | client closes the connection and logs `server did not confirm the backhaul-mux-v1 websocket subprotocol: ... set mux_ws_framing=false on both ends` on every attempt |
-| **false**, or a build without the option | server rejects the upgrade with HTTP 400 and logs the fix (unauthorized requests and the `fallback` decoy behave exactly as before - the check comes after authorization) | legacy raw, works as before |
+| `ci.yml` | a commit is pushed to a branch | gofmt, vet, build, `go test -race`, then the e2e matrix (`ws`, `wss`, `wsmux`, `wssmux` × net off/wan) |
+| `release.yml` | a `v*` tag is pushed | GoReleaser publishes `backhaul_linux_amd64.tar.gz` and checksums; the Docker image is pushed to Docker Hub |
 
-Each side logs its mode once at startup: `wsmux framing: standards-framed (backhaul-mux-v1)` or `wsmux framing: legacy raw (mux_ws_framing=false)`.
-
-*Upgrading is a flag day.* The server and every client must run the new build; a mixed set will not work, by design (that is what "strict" and "fail loudly" mean - the alternative is a stream that silently corrupts). To keep the old behaviour while you roll out, set `mux_ws_framing = false` in **both** the server and the client configs (on the old build the key is simply ignored). To roll back after upgrading, set `mux_ws_framing = false` on both ends (or reinstall the previous build on both). Do not leave it on for one end only.
-
-*What is and is not verified.* The framing is validated locally: the test suite parses every outer frame with the gobwas/ws frame parser for both plain `wsmux` and `wssmux` with a locally issued, fully verified certificate, checks the mask bit in each direction, and feeds the payloads to smux. **No specific CDN has been tested**; whether a given CDN carries the tunnel is still something to verify in your deployment. Framing costs 2-14 header bytes per smux write, client-side masking, and one WebSocket message per smux frame; on a CPU-bound loopback benchmark (no network latency, 4 streams of 32 MiB, smux frames of 32 KiB) throughput was within about 10% of the raw legacy mode (server-to-client roughly 10% lower, client-to-server within measurement noise); the benchmark is `BenchmarkSmuxLeg` in `internal/utils/network`. The legacy raw mode remains available only for paths where no intermediary inspects WebSocket frames.
-
-**Q: What is `mux_half_close`, and when do I need it?**
-
-*The problem.* An application that sends its whole request, shuts down its writing end (TCP half-close) and only then expects the reply works over a direct connection, plain `tcp`, `tcpmux`, `ws` and `wsmux` flows whose legs are real TCP. But on a `wsmux`/`wssmux` tunnel each forwarded connection is one smux stream, and smux (as pinned here) has no directional close: closing the stream to signal "no more request bytes" also ends the reverse direction, so a reply that is still to come is lost. That is the legacy behavior and it is unchanged unless you opt in.
-
-*The opt-in.* `mux_half_close = true` in the **server** config (`wsmux`/`wssmux` with `mux_version = 2`; the server refuses to start otherwise). Plain flows then carry a per-stream envelope of `type (1 byte) | length (2 bytes, big-endian) | payload`, with `DATA` (0x01, 1-32768 bytes), `END` (0x02, directional EOF) and `ABORT` (0x03, the sender abandoned the flow) records, so each direction ends independently and an aborted or truncated flow reaches the other end as an error, never as a clean end of stream. The cost is a 3-byte header and one extra buffer copy per write, on those flows only.
-
-*Negotiation is strict and separate from `mux_ws_framing`.* Every current `wsmux`/`wssmux` client sends `X-Backhaul-Cap: halfclose-v1` on every upgrade (control channel and tunnel legs), whatever its own settings; a server without the option ignores it. A server with `mux_half_close = true` opens the new flow kind (`0x06`) only on sessions that offered the capability, and rejects every upgrade that did not (HTTP 400; the log says to upgrade the client or set `mux_half_close = false`). It is a different header from the `Sec-WebSocket-Protocol: backhaul-mux-v1` token of `mux_ws_framing`: a client offers both when framing is on, and either check can reject on its own with its own message. Authorization is checked first, so unauthorized requests and the `fallback` decoy behave as before.
-
-| client \ server | `mux_half_close = false` (default) | `mux_half_close = true` |
-|---|---|---|
-| old build (no header) | works, legacy full-close semantics | upgrade rejected with a clear error (control channel and tunnel) |
-| current build | works, legacy semantics (the offer is ignored) | works; plain non-promotable flows use the envelope |
-
-*Limits.* Flows that can be promoted mid-stream (`promote_bytes` > 0 with `mux_stripe` >= 2, on a port that is not striped) keep the legacy `FlowPlain` kind and its full-close behavior, so a request-EOF-then-reply pattern is not protected on those ports; striped flows keep their own end-of-stream framing; plain `ws`/`wss`/`tcp`/`tcpmux` are untouched. *Rollback:* set `mux_half_close = false` on the server; current clients keep working. *Rollout:* upgrade every client first (an old client is rejected the moment the server turns the option on), then enable it on the server.
-
-**Q: But I need the decoy site for obfuscation - that's why nginx is there. How do I drop it without losing camouflage?**
-
-Use the server's `fallback` option so backhaul itself is the CDN origin and plays both roles:
-
-```toml
-[server]
-bind_addr = "0.0.0.0:443"          # backhaul is the origin, terminates TLS itself
-transport = "wss"                  # or "wssmux"
-tls_cert = "/root/certs/site.crt"  # reuse the cert nginx was using
-tls_key  = "/root/certs/site.key"
-path = "/your-secret-path"         # tunnel lives here
-fallback = "127.0.0.1:8080"        # everything else -> your decoy site
-token = "..."
-ports = ["..."]
-```
-
-Run your decoy web server on `127.0.0.1:8080` (a tiny static site is fine). Now:
-
-* A real WebSocket client with the token, hitting `path`, gets the tunnel.
-* A probe/crawler/browser hitting `/` (or any other path, or without the token) is reverse-proxied to the decoy and sees a normal website - the same camouflage nginx gave you, minus the 401 tell.
-
-Because the tunnel bytes now flow **straight through backhaul** instead of being copied by an extra nginx hop, this is the change that most directly frees a CPU core on a low-core box. The decoy traffic still passes through a local server, but that's a negligible trickle - the 1Gbps of tunnel traffic no longer touches it. (Path-based camouflage inherently needs an L7/TLS-terminating router; `fallback` just makes backhaul be that router instead of a separate nginx.)
-
-**Q: If backhaul terminates TLS itself, doesn't its handshake fingerprint differ from nginx's - and give it away to a censor probing my origin directly?**
-
-Yes - and that's a real limitation of the default build, worth being precise about. When backhaul terminates `wss`/`wssmux` with Go's `crypto/tls`, its ServerHello differs from nginx's: most concretely, for TLS 1.3 Go's stack always selects `AES-128-GCM` when AES-NI is present and does not expose TLS 1.3 ciphersuite ordering, whereas nginx (OpenSSL) selects `AES-256-GCM`. A censor who can reach your origin IP directly (e.g. because it also serves users on another port) can fingerprint that difference.
-
-Two things determine whether it matters:
-
-* **If your origin is only reachable through a CDN** (its real IP isn't exposed), the censor sees the CDN's TLS, not backhaul's - so the default Go engine is fine and none of the below is needed.
-* **If your origin IP is directly reachable**, use the OpenSSL TLS engine: set `tls_engine = "openssl"` and run a binary built with OpenSSL. Because it terminates with the *same* OpenSSL library nginx links, the ServerHello - cipher selection and extension order - matches nginx's. (`internal/utils/network` ships a test that asserts the OpenSSL engine negotiates `TLS_AES_256_GCM_SHA384` exactly like nginx while the Go engine negotiates `TLS_AES_128_GCM_SHA256`.)
-
-Honest caveats for the OpenSSL engine:
-
-* It requires cgo, so the binary is **no longer a pure-Go static one**: build with `CGO_ENABLED=1 go build -tags openssl`, and the target servers need a compatible `libssl` installed. Build against and run on the **same OpenSSL major version** your nginx uses for the closest match.
-* nginx's `http2` directive also advertises `h2` in ALPN; this listener speaks HTTP/1.1 only (the WebSocket tunnel needs it), so for tightest parity drop `http2` from any nginx you compare against.
-* It closes the biggest, directly-observable gap (the TLS 1.3 cipher), but "byte-identical to nginx in every respect" is not a claim to lean on - verify your own setup with a fingerprinting tool (e.g. JARM) against a real nginx before relying on it.
-
-Building the OpenSSL variant:
-
-```bash
-# needs a C toolchain and libssl headers, e.g. on Debian/Ubuntu:
-#   apt-get install -y gcc libssl-dev
-CGO_ENABLED=1 go build -tags openssl -o backhaul .
-```
-
-The default `go build` (and the released binaries) remain pure-Go and static; `tls_engine = "openssl"` in one of those exits with a clear error rather than silently downgrading.
-
-**Q: My link is high-latency / intercontinental and throughput stalls well below the line rate even though CPU is fine. What helps?**
-
-Enable **BBR** congestion control (`net.ipv4.tcp_congestion_control=bbr` with `net.core.default_qdisc=fq`). On a high-RTT, mildly-lossy path the default cubic/reno collapses its window on every stray loss and never fills the pipe. BBR paces to the measured bottleneck bandwidth instead, at no extra CPU cost. Backhaul enables this automatically at startup unless `skip_optz = true`. Also size `so_rcvbuf`/`so_sndbuf` to the bandwidth-delay product of the link (e.g. ~8MB for 1Gbps at ~40ms RTT) so the window has room to open.
-
+Pull requests do not trigger anything by themselves. To cut a release, bump
+`version` in `main.go`, then `git tag vX.Y.Z && git push --tags`. Docker
+publishing needs the repository secrets `DOCKERHUB_USERNAME` and
+`DOCKERHUB_TOKEN`; the image is `<username>/backhaul`, tagged with the version,
+`major.minor`, the commit SHA and `latest`.
 
 ## Benchmark
 
-For in-depth information, please visit the dedicated [Benchmark page](./benchmark/).
-
-**Built-in speedtest** (`wsmux`/`wssmux` with `mux_version ≥ 2`): hit `GET /speedtest?dir=both&scope=all&seconds=10` on the server's `web_port`. Two measurement concepts deliberately differ:
-
-- **Per-path rate** (`per_cdn[].down_mbps` / `up_mbps`): bytes received by the far end divided by the *receiver-measured* data-window elapsed — the goodput of that individual connection, excluding setup overhead.
-- **Aggregate rate** (`total_down_mbps` / `total_up_mbps`): sum of all receivers' bytes divided by the *local phase wall time* (from just before launching all concurrent goroutines to after all return), which includes launch and drain overhead. This is the effective whole-phase throughput and will differ from the sum of per-path rates by design — it captures real contention on shared bottlenecks rather than an inflated arithmetic sum of isolated windows.
-
-Requested `seconds` is the workload duration only, never the rate denominator.
-
+See the [benchmark page](./benchmark/).
 
 ## License
 
-This project is licensed under the AGPL-3.0 license. See the LICENSE file for details.
-
-## Donation
-
-Donate TRX (TRC-20) to support our project:
-``` wallet
-TMVBGzX4qpt12R1qWsJMpT1ttoKH1kus1H
-```
-Thanks for your support! 
-
-## Stargazers over time
-[![Stargazers over time](https://starchart.cc/Musixal/Backhaul.svg?variant=light)](https://starchart.cc/Musixal/Backhaul)
+AGPL-3.0. See [LICENSE](LICENSE).

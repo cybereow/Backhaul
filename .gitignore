@@ -36,4 +36,4 @@ dist/
 *.json
 server.*
 backhaul
-*.log
+*.log!examples/*.toml

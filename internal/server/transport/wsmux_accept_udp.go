@@ -28,7 +28,7 @@ const udpFlowIdleTimeout = 120 * time.Second
 const defaultUDPPayloadBuffer = 2048
 
 // udpFlow is one UDP pseudo-connection: all datagrams from a single source
-// address, carried over one smux stream. Unlike the TCP-transport accept_udp
+// address, carried over one smux stream. Unlike the removed tcp-transport accept_udp
 // path this carries no timestamp/congestion metadata - smux already gives the
 // stream reliability, ordering and flow control, and the cross-machine
 // timestamp comparison that path uses false-positives on any clock skew between

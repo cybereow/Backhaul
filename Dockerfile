@@ -1,9 +1,13 @@
 # syntax=docker/dockerfile:1
 
 # ---- build stage ----
-# Build on the native builder arch and cross-compile to the target, so
-# multi-arch builds don't run the Go compiler under slow QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+# Debian 12 ships OpenSSL 3.0, the same major as the runtime image below, so the
+# binary links against the library it will actually run with.
+FROM golang:1.24-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
@@ -13,19 +17,18 @@ RUN go mod download
 
 COPY . .
 
-# Pure-Go static binary (CGO disabled). The optional OpenSSL TLS engine is a
-# build-tagged extra that needs libssl and is intentionally left out of the
-# default image to keep it portable and cgo-free.
-ARG TARGETOS
-ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+# The server terminates TLS with OpenSSL through cgo, so CGO must be on.
+RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /out/backhaul ./main.go
 
 # ---- runtime stage ----
-FROM alpine:3.20
+FROM debian:bookworm-slim
 
-# Root CA bundle is required for outbound TLS (wss/wssmux to a CDN, etc.).
-RUN apk add --no-cache ca-certificates && update-ca-certificates
+# libssl3: the OpenSSL the binary links against. ca-certificates: outbound TLS
+# verification (wss/wssmux clients).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/backhaul /usr/local/bin/backhaul
 

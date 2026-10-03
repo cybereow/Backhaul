@@ -10,7 +10,7 @@ import (
 func TestServerConfig(t *testing.T) {
 	tomlData := `
 bind_addr = "127.0.0.1:8080"
-transport = "tcp"
+transport = "wssmux"
 token = "secret123"
 nodelay = true
 keepalive_period = 30
@@ -45,7 +45,6 @@ so_sndbuf = 4194304
 proxy_protocol = true
 path = "/ws"
 fallback = "http://127.0.0.1:8081"
-tls_engine = "standard"
 cdn_max_age = 300
 `
 
@@ -54,7 +53,7 @@ cdn_max_age = 300
 	assert.NoError(t, err)
 
 	assert.Equal(t, "127.0.0.1:8080", serverCfg.BindAddr)
-	assert.Equal(t, TCP, serverCfg.Transport)
+	assert.Equal(t, WSSMUX, serverCfg.Transport)
 	assert.Equal(t, "secret123", serverCfg.Token)
 	assert.True(t, serverCfg.Nodelay)
 	assert.Equal(t, 30, serverCfg.Keepalive)
@@ -89,7 +88,6 @@ cdn_max_age = 300
 	assert.True(t, serverCfg.ProxyProtocol)
 	assert.Equal(t, "/ws", serverCfg.Path)
 	assert.Equal(t, "http://127.0.0.1:8081", serverCfg.Fallback)
-	assert.Equal(t, "standard", serverCfg.TLSEngine)
 	assert.Equal(t, 300, serverCfg.CDNMaxAge)
 }
 
@@ -188,11 +186,12 @@ remote_addr = "127.0.0.1:443"
 func TestConfigTypesParseCorrectly(t *testing.T) {
 	tomlData := `
 [server]
-transport = "udp"
+transport = "dns"
 `
 	var cfg Config
 	_, err := toml.Decode(tomlData, &cfg)
 	assert.NoError(t, err)
 
-	assert.Equal(t, UDP, cfg.Server.Transport)
+	assert.Equal(t, DNS, cfg.Server.Transport)
+	assert.True(t, cfg.Server.Transport.IsDNS())
 }

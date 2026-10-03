@@ -1,3 +1,4 @@
+// Package server wires a [server] configuration to the transport that serves it.
 package server
 
 import (
@@ -12,6 +13,15 @@ import (
 
 	"github.com/sirupsen/logrus"
 )
+
+// pprofAddr is loopback-only: pprof serves heap dumps from a process holding the
+// tunnel token and TLS keys, so it must never be reachable off-host. Reach it
+// through an SSH tunnel if you need it remotely.
+const pprofAddr = "127.0.0.1:6060"
+
+// defaultDNSListen is where the authoritative DNS responder binds when
+// dns_listen is not set.
+const defaultDNSListen = "0.0.0.0:53"
 
 type Server struct {
 	config *config.ServerConfig
@@ -30,189 +40,28 @@ func NewServer(cfg *config.ServerConfig, parentCtx context.Context) *Server {
 	}
 }
 
+// Start launches the configured transport and blocks until the server is stopped.
 func (s *Server) Start() {
-	// for pprof and debugging. Bind to loopback only: pprof serves heap dumps
-	// from a process holding the tunnel token and TLS keys, so it must never be
-	// reachable off-host. Reach it via an SSH tunnel if you need it remotely.
 	if s.config.PPROF {
 		go func() {
-			s.logger.Info("pprof started at 127.0.0.1:6060")
-			http.ListenAndServe("127.0.0.1:6060", nil)
+			s.logger.Infof("pprof started at %s", pprofAddr)
+			http.ListenAndServe(pprofAddr, nil)
 		}()
 	}
 
-	switch s.config.Transport {
-	case config.TCP:
-		tcpConfig := &transport.TcpConfig{
-			BindAddr:      s.config.BindAddr,
-			Nodelay:       s.config.Nodelay,
-			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,
-			Heartbeat:     time.Duration(s.config.Heartbeat) * time.Second,
-			Token:         s.config.Token,
-			ChannelSize:   s.config.ChannelSize,
-			Ports:         s.config.Ports,
-			Sniffer:       s.config.Sniffer,
-			WebPort:       s.config.WebPort,
-			SnifferLog:    s.config.SnifferLog,
-			AcceptUDP:     s.config.AcceptUDP,
-			MSS:           s.config.MSS,
-			SO_RCVBUF:     s.config.SO_RCVBUF,
-			SO_SNDBUF:     s.config.SO_SNDBUF,
-			ProxyProtocol: s.config.ProxyProtocol,
-		}
-
-		tcpServer := transport.NewTCPServer(s.ctx, tcpConfig, s.logger)
-		go tcpServer.Start()
-
-	case config.TCPMUX:
-		tcpMuxConfig := &transport.TcpMuxConfig{
-			BindAddr:         s.config.BindAddr,
-			Nodelay:          s.config.Nodelay,
-			KeepAlive:        time.Duration(s.config.Keepalive) * time.Second,
-			Heartbeat:        time.Duration(s.config.Heartbeat) * time.Second,
-			Token:            s.config.Token,
-			ChannelSize:      s.config.ChannelSize,
-			Ports:            s.config.Ports,
-			MuxCon:           s.config.MuxCon,
-			MuxVersion:       s.config.MuxVersion,
-			MaxFrameSize:     s.config.MaxFrameSize,
-			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
-			MaxStreamBuffer:  s.config.MaxStreamBuffer,
-			Sniffer:          s.config.Sniffer,
-			WebPort:          s.config.WebPort,
-			SnifferLog:       s.config.SnifferLog,
-			MSS:              s.config.MSS,
-			SO_RCVBUF:        s.config.SO_RCVBUF,
-			SO_SNDBUF:        s.config.SO_SNDBUF,
-			ProxyProtocol:    s.config.ProxyProtocol,
-		}
-
-		tcpMuxServer := transport.NewTcpMuxServer(s.ctx, tcpMuxConfig, s.logger)
-		go tcpMuxServer.Start()
-
-	case config.DNSMUX:
-		dnsKey := s.config.DNSKey
-		if dnsKey == "" {
-			dnsKey = s.config.Token
-		}
-		dnsListen := s.config.DNSListen
-		if dnsListen == "" {
-			dnsListen = "0.0.0.0:53"
-		}
-		dnsMuxServer := transport.NewDnsMuxServer(s.ctx, &transport.DnsMuxConfig{
-			Domain:           s.config.DNSDomain,
-			Key:              dnsKey,
-			Listen:           dnsListen,
-			Token:            s.config.Token,
-			Ports:            s.config.Ports,
-			Nodelay:          s.config.Nodelay,
-			Sniffer:          s.config.Sniffer,
-			WebPort:          s.config.WebPort,
-			SnifferLog:       s.config.SnifferLog,
-			ProxyProtocol:    s.config.ProxyProtocol,
-			MuxVersion:       s.config.MuxVersion,
-			MaxFrameSize:     s.config.MaxFrameSize,
-			MaxReceiveBuffer: s.config.MaxReceiveBuffer,
-			MaxStreamBuffer:  s.config.MaxStreamBuffer,
-		}, s.logger)
-		go dnsMuxServer.Start()
-
-	case config.WS, config.WSS:
-		wsMaxConnAge, _ := transport.RotationPlan(time.Duration(s.config.CDNMaxAge) * time.Second)
-		wsConfig := &transport.WsConfig{
-			MaxConnAge:    wsMaxConnAge,
-			BindAddr:      s.config.BindAddr,
-			Nodelay:       s.config.Nodelay,
-			KeepAlive:     time.Duration(s.config.Keepalive) * time.Second,
-			Heartbeat:     time.Duration(s.config.Heartbeat) * time.Second,
-			Token:         s.config.Token,
-			ChannelSize:   s.config.ChannelSize,
-			Ports:         s.config.Ports,
-			Sniffer:       s.config.Sniffer,
-			WebPort:       s.config.WebPort,
-			SnifferLog:    s.config.SnifferLog,
-			Mode:          s.config.Transport,
-			TLSCertFile:   s.config.TLSCertFile,
-			TLSKeyFile:    s.config.TLSKeyFile,
-			TLSCerts:      s.config.TLSCerts,
-			TLSKeys:       s.config.TLSKeys,
-			Path:          s.config.Path,
-			Fallback:      s.config.Fallback,
-			TLSEngine:     s.config.TLSEngine,
-			ProxyProtocol: s.config.ProxyProtocol,
-		}
-
-		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)
-		go wsServer.Start()
-
-	case config.WSMUX, config.WSSMUX:
-		maxConnAge, maxDrain := transport.RotationPlan(time.Duration(s.config.CDNMaxAge) * time.Second)
-		wsMuxConfig := &transport.WsMuxConfig{
-			BindAddr:             s.config.BindAddr,
-			Nodelay:              s.config.Nodelay,
-			KeepAlive:            time.Duration(s.config.Keepalive) * time.Second,
-			Heartbeat:            time.Duration(s.config.Heartbeat) * time.Second,
-			Token:                s.config.Token,
-			ChannelSize:          s.config.ChannelSize,
-			Ports:                s.config.Ports,
-			MuxCon:               s.config.MuxCon,
-			AcceptUDP:            s.config.AcceptUDP,
-			UDPBuffer:            s.config.UDPBuffer,
-			Speedtest:            s.config.Speedtest,
-			MuxVersion:           s.config.MuxVersion,
-			MaxFrameSize:         s.config.MaxFrameSize,
-			MaxReceiveBuffer:     s.config.MaxReceiveBuffer,
-			MaxStreamBuffer:      s.config.MaxStreamBuffer,
-			MuxKeepaliveDisabled: s.config.MuxKeepaliveDisabled,
-			StripeFactor:         s.config.StripeFactor,
-			StripeParity:         s.config.StripeParity,
-			StripePorts:          s.config.StripePorts,
-			PromoteBytes:         s.config.PromoteBytes,
-			SO_RCVBUF:            s.config.SO_RCVBUF,
-			SO_SNDBUF:            s.config.SO_SNDBUF,
-			Sniffer:              s.config.Sniffer,
-			WebPort:              s.config.WebPort,
-			SnifferLog:           s.config.SnifferLog,
-			Mode:                 s.config.Transport,
-			TLSCertFile:          s.config.TLSCertFile,
-			TLSKeyFile:           s.config.TLSKeyFile,
-			TLSCerts:             s.config.TLSCerts,
-			TLSKeys:              s.config.TLSKeys,
-			ProxyProtocol:        s.config.ProxyProtocol,
-			Path:                 s.config.Path,
-			Fallback:             s.config.Fallback,
-			TLSEngine:            s.config.TLSEngine,
-			MaxConnAge:           maxConnAge,
-			MaxDrain:             maxDrain,
-			ResumeWindow:         time.Duration(s.config.ResumeWindow) * time.Second,
-			WSFraming:            s.config.MuxWSFraming,
-			HalfClose:            s.config.MuxHalfClose,
-		}
-
-		wsMuxServer := transport.NewWSMuxServer(s.ctx, wsMuxConfig, s.logger)
-		go wsMuxServer.Start()
-
-	case config.UDP:
-		udpConfig := &transport.UdpConfig{
-			BindAddr:    s.config.BindAddr,
-			Heartbeat:   time.Duration(s.config.Heartbeat) * time.Second,
-			Token:       s.config.Token,
-			ChannelSize: s.config.ChannelSize,
-			Ports:       s.config.Ports,
-			Sniffer:     s.config.Sniffer,
-			WebPort:     s.config.WebPort,
-			SnifferLog:  s.config.SnifferLog,
-		}
-
-		udpServer := transport.NewUDPServer(s.ctx, udpConfig, s.logger)
-		go udpServer.Start()
-
+	t := s.config.Transport
+	switch {
+	case t == config.WS || t == config.WSS:
+		s.startWS()
+	case t == config.WSMUX || t == config.WSSMUX:
+		s.startWSMux()
+	case t.IsDNS():
+		s.startDNS()
 	default:
-		s.logger.Fatal("invalid transport type: ", s.config.Transport)
+		s.logger.Fatal("invalid transport type: ", t)
 	}
 
 	<-s.ctx.Done()
-
 	s.logger.Info("all workers stopped successfully")
 
 	// suppress other logs
@@ -224,4 +73,108 @@ func (s *Server) Stop() {
 	if s.cancel != nil {
 		s.cancel()
 	}
+}
+
+func (s *Server) seconds(n int) time.Duration { return time.Duration(n) * time.Second }
+
+func (s *Server) startWS() {
+	c := s.config
+	maxConnAge, _ := transport.RotationPlan(s.seconds(c.CDNMaxAge))
+	srv := transport.NewWSServer(s.ctx, &transport.WsConfig{
+		MaxConnAge:    maxConnAge,
+		BindAddr:      c.BindAddr,
+		Nodelay:       c.Nodelay,
+		KeepAlive:     s.seconds(c.Keepalive),
+		Heartbeat:     s.seconds(c.Heartbeat),
+		Token:         c.Token,
+		ChannelSize:   c.ChannelSize,
+		Ports:         c.Ports,
+		Sniffer:       c.Sniffer,
+		WebPort:       c.WebPort,
+		SnifferLog:    c.SnifferLog,
+		Mode:          c.Transport,
+		TLSCertFile:   c.TLSCertFile,
+		TLSKeyFile:    c.TLSKeyFile,
+		TLSCerts:      c.TLSCerts,
+		TLSKeys:       c.TLSKeys,
+		Path:          c.Path,
+		Fallback:      c.Fallback,
+		ProxyProtocol: c.ProxyProtocol,
+	}, s.logger)
+	go srv.Start()
+}
+
+func (s *Server) startWSMux() {
+	c := s.config
+	maxConnAge, maxDrain := transport.RotationPlan(s.seconds(c.CDNMaxAge))
+	srv := transport.NewWSMuxServer(s.ctx, &transport.WsMuxConfig{
+		BindAddr:             c.BindAddr,
+		Nodelay:              c.Nodelay,
+		KeepAlive:            s.seconds(c.Keepalive),
+		Heartbeat:            s.seconds(c.Heartbeat),
+		Token:                c.Token,
+		ChannelSize:          c.ChannelSize,
+		Ports:                c.Ports,
+		MuxCon:               c.MuxCon,
+		AcceptUDP:            c.AcceptUDP,
+		UDPBuffer:            c.UDPBuffer,
+		Speedtest:            c.Speedtest,
+		MuxVersion:           c.MuxVersion,
+		MaxFrameSize:         c.MaxFrameSize,
+		MaxReceiveBuffer:     c.MaxReceiveBuffer,
+		MaxStreamBuffer:      c.MaxStreamBuffer,
+		MuxKeepaliveDisabled: c.MuxKeepaliveDisabled,
+		StripeFactor:         c.StripeFactor,
+		StripeParity:         c.StripeParity,
+		StripePorts:          c.StripePorts,
+		PromoteBytes:         c.PromoteBytes,
+		SO_RCVBUF:            c.SO_RCVBUF,
+		SO_SNDBUF:            c.SO_SNDBUF,
+		Sniffer:              c.Sniffer,
+		WebPort:              c.WebPort,
+		SnifferLog:           c.SnifferLog,
+		Mode:                 c.Transport,
+		TLSCertFile:          c.TLSCertFile,
+		TLSKeyFile:           c.TLSKeyFile,
+		TLSCerts:             c.TLSCerts,
+		TLSKeys:              c.TLSKeys,
+		ProxyProtocol:        c.ProxyProtocol,
+		Path:                 c.Path,
+		Fallback:             c.Fallback,
+		MaxConnAge:           maxConnAge,
+		MaxDrain:             maxDrain,
+		ResumeWindow:         s.seconds(c.ResumeWindow),
+		WSFraming:            c.MuxWSFraming,
+		HalfClose:            c.MuxHalfClose,
+	}, s.logger)
+	go srv.Start()
+}
+
+func (s *Server) startDNS() {
+	c := s.config
+	key := c.DNSKey
+	if key == "" {
+		key = c.Token
+	}
+	listen := c.DNSListen
+	if listen == "" {
+		listen = defaultDNSListen
+	}
+	srv := transport.NewDnsMuxServer(s.ctx, &transport.DnsMuxConfig{
+		Domain:           c.DNSDomain,
+		Key:              key,
+		Listen:           listen,
+		Token:            c.Token,
+		Ports:            c.Ports,
+		Nodelay:          c.Nodelay,
+		Sniffer:          c.Sniffer,
+		WebPort:          c.WebPort,
+		SnifferLog:       c.SnifferLog,
+		ProxyProtocol:    c.ProxyProtocol,
+		MuxVersion:       c.MuxVersion,
+		MaxFrameSize:     c.MaxFrameSize,
+		MaxReceiveBuffer: c.MaxReceiveBuffer,
+		MaxStreamBuffer:  c.MaxStreamBuffer,
+	}, s.logger)
+	go srv.Start()
 }

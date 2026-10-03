@@ -1,5 +1,3 @@
-//go:build openssl
-
 package network
 
 import (
@@ -12,33 +10,30 @@ import (
 	openssl "github.com/libp2p/go-openssl"
 )
 
-// newOpenSSLListener terminates TLS with the system OpenSSL library instead of
-// Go's crypto/tls. The SSL_CTX is configured to mirror a stock nginx:
+// TLS termination for wss/wssmux. The server always terminates TLS with the
+// system OpenSSL library (cgo), never Go's crypto/tls. Every SSL_CTX is
+// configured to mirror a stock nginx:
 //
 //   - TLS 1.2 + 1.3 only (SSLv2/3 disabled).
 //   - Server cipher preference on - nginx's `ssl_prefer_server_ciphers on`. On
 //     OpenSSL 3.0 this makes TLS 1.3 negotiate AES-256-GCM first, the same
-//     choice nginx makes and the one Go's stack cannot be configured to make
-//     (Go hardcodes AES-128-GCM first when AES-NI is present, and does not
-//     expose TLS 1.3 ciphersuite ordering at all).
+//     choice nginx makes and the one Go's stack cannot be configured to make.
 //   - ALPN advertising http/1.1.
 //
 // Because this is the same OpenSSL that nginx links, the ServerHello it emits -
 // extension order included - matches nginx's, so a direct probe of the origin
-// can't distinguish them on the TLS handshake. That is the whole reason this
-// path exists.
+// cannot distinguish them on the TLS handshake.
 //
-// Caveats, stated plainly:
-//   - Match nginx's OpenSSL *major* version for the closest fingerprint; build
-//     against and run on the same one.
+// Caveats:
+//   - Match nginx's OpenSSL *major* version for the closest fingerprint.
 //   - nginx's `http2` directive also advertises h2 in ALPN. This listener
-//     speaks HTTP/1.1 only (the WebSocket tunnel needs it), so for the tightest
-//     parity drop `http2` from any nginx you benchmark against.
-//   - The TLS 1.3 ciphersuite list is left at OpenSSL's default on purpose - it
+//     speaks HTTP/1.1 only (the WebSocket tunnel needs it), so drop `http2`
+//     from any nginx you compare against.
+//   - The TLS 1.3 ciphersuite list is left at OpenSSL's default on purpose: it
 //     already leads with AES-256-GCM exactly as nginx does.
-//
+
 // newConfiguredCtx builds an SSL_CTX for one cert/key pair, tuned to mirror a
-// stock nginx (see the type comment above). Each SNI-selectable certificate
+// stock nginx (see the package comment above). Each SNI-selectable certificate
 // gets its own ctx; they are configured identically apart from the keypair.
 func newConfiguredCtx(certFile, keyFile string) (*openssl.Ctx, error) {
 	ctx, err := openssl.NewCtxFromFiles(certFile, keyFile)
@@ -78,13 +73,16 @@ func leafFromPEM(certFile string) (*x509.Certificate, error) {
 	return nil, fmt.Errorf("no CERTIFICATE block found in %q", certFile)
 }
 
-// newOpenSSLListener terminates TLS with OpenSSL. With a single cert/key pair
+// NewTLSListener terminates TLS with the system OpenSSL library. With a single cert/key pair
 // it behaves exactly as before. With several, it selects a certificate by the
 // client's SNI via a servername callback: the first cert whose leaf validates
 // for the requested host wins; certFiles[0] is the fallback when nothing
 // matches. Every cert gets an identically-tuned ctx, so the nginx-matching
 // fingerprint is preserved whichever one is chosen.
-func newOpenSSLListener(addr string, certFiles, keyFiles []string, rcvBuf, sndBuf int, sndForce bool) (net.Listener, error) {
+func NewTLSListener(addr string, certFiles, keyFiles []string, rcvBuf, sndBuf int, sndForce bool) (net.Listener, error) {
+	if len(certFiles) == 0 || len(certFiles) != len(keyFiles) {
+		return nil, fmt.Errorf("tls: need matching cert/key file lists (got %d certs, %d keys)", len(certFiles), len(keyFiles))
+	}
 	base, err := newConfiguredCtx(certFiles[0], keyFiles[0])
 	if err != nil {
 		return nil, err

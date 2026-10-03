@@ -341,7 +341,6 @@ type WsMuxConfig struct {
 	StripeParity         int
 	StripePorts          []string
 	Fallback             string        // decoy backend for non-tunnel requests (host:port), optional
-	TLSEngine            string        // "go" (default) or "openssl" for wssmux TLS termination
 	MaxConnAge           time.Duration // retire pool connections at this age (0 = never); see retireSession
 	ResumeWindow         time.Duration // flows survive a cut without warning for this long (0 = off, only planned moves); needs MaxConnAge
 	MaxDrain             time.Duration // longest a retired connection waits for its streams to finish before it is closed (0 = unbounded)
@@ -955,11 +954,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 		})
 	} else {
 		g.start(func() {
-			engine := s.config.TLSEngine
-			if engine == "" {
-				engine = network.TLSEngineGo
-			}
-			s.logger.Infof("%s server starting, listening on %s (tls engine: %s)", s.config.Mode, addr, engine)
+			s.logger.Infof("%s server starting, listening on %s", s.config.Mode, addr)
 			s.controlMu.Lock()
 			noControl := s.controlChannel == nil
 			s.controlMu.Unlock()
@@ -968,7 +963,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
 			sndBuf, sndForce := s.tunnelLegSendBuf()
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, sndBuf, sndForce)
+			ln, err := network.NewTLSListener(addr, certs, keys, s.config.SO_RCVBUF, sndBuf, sndForce)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}

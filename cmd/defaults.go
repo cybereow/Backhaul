@@ -69,9 +69,9 @@ func applyDefaults(cfg *config.Config) {
 	}
 
 	// Connection pool
-	// dnsmux keeps its own default of one tunnel: DNS capacity is scarce and each
+	// the DNS transports keep their own default of one tunnel: DNS capacity is scarce and each
 	// tunnel probes and polls the resolvers on its own.
-	if cfg.Client.ConnectionPool <= 0 && cfg.Client.Transport != config.DNSMUX {
+	if cfg.Client.ConnectionPool <= 0 && !cfg.Client.Transport.IsDNS() {
 		cfg.Client.ConnectionPool = defaultConnectionPool
 	}
 

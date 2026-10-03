@@ -152,15 +152,14 @@ Only keys marked **required** must be set. Everything else has the default shown
 | `proxy_protocol` | `false` | all | send a PROXY protocol header so the target sees the real client address |
 | `path` | `""` | ws\* | base path for the tunnel endpoints (`<path>/channel`, `<path>/tunnel`) |
 | `fallback` | `""` | ws\* | `host:port` of a decoy web backend, see [decoy site](#hiding-behind-a-decoy-site) |
-| `tls_cert`, `tls_key` | — | wss, wssmux | certificate and key (PEM) |
-| `tls_certs`, `tls_keys` | `[]` | wss, wssmux | several cert/key pairs, chosen by SNI |
+| `tls_cert`, `tls_key` | — **required for wss/wssmux** (unless `tls_certs`/`tls_keys` is set) | wss, wssmux | certificate and key (PEM) |
+| `tls_certs`, `tls_keys` | `[]` | wss, wssmux | several cert/key pairs of equal length, chosen by SNI; used instead of `tls_cert`/`tls_key` when non-empty |
 | `sniffer` | `false` | all | record per-port traffic to `sniffer_log` |
 | `web_port` | `0` | all | port of the web monitor (0 disables) |
 | `sniffer_log` | `"backhaul.json"` | all | file the sniffer writes |
 | `skip_optz` | `false` | all | skip the Linux sysctl / ulimit tuning applied at startup |
 | `pprof` | `false` | all | pprof on `127.0.0.1:6060` (loopback only) |
 | `so_rcvbuf`, `so_sndbuf` | OS default | wsmux, wssmux | socket buffer sizes in bytes |
-| `mss` | OS default | ws\* | TCP maximum segment size |
 | `cdn_max_age` | `0` (off) | ws\* | shortest max connection age of any CDN/LB in front (seconds); see [rotation](#multiplexing-rotation-and-resume-wsmux--wssmux) |
 | `resume_window` | `30` with `cdn_max_age` | wsmux, wssmux | seconds a cut flow waits to be resumed; `-1` disables |
 | `mux_con` | `8` | wsmux, wssmux, dns | streams per tunnel connection |
@@ -201,7 +200,8 @@ Only keys marked **required** must be set. Everything else has the default shown
 | `nodelay` | `false` | all | set `TCP_NODELAY` |
 | `tls_verify` | `true` | wss, wssmux | verify the server certificate. `false` is for self-signed setups only: while off, an on-path party can read the token |
 | `resume_window` | `30` | wsmux, wssmux | seconds to wait for a cut flow to be resumed |
-| `mux_*`, `so_*`, `mss`, `log_level`, `sniffer`, `web_port`, `sniffer_log`, `skip_optz`, `pprof` | as server | | same meaning as on the server; `mux_stripe`, `mux_stripe_parity`, `mux_ws_framing`, `mux_version` must match |
+| `mss` | OS default | ws\* | TCP maximum segment size (client only) |
+| `mux_*`, `so_*`, `log_level`, `sniffer`, `web_port`, `sniffer_log`, `skip_optz`, `pprof` | as server | | same meaning as on the server; `mux_stripe`, `mux_stripe_parity`, `mux_ws_framing`, `mux_version` must match |
 | `mux_stealth_handshake` | `true` | wsmux, wssmux | derive the framing subprotocol and half-close capability from the token instead of project-named strings; upgrade servers before clients, or set `false` |
 | `dns_domain` | — **required for dns** | dns, dnsmux | tunnel domain |
 | `dns_key` | = `token` | dns, dnsmux | per-query MAC secret |

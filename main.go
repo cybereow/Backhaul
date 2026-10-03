@@ -83,12 +83,16 @@ type reloadingRunner struct {
 	done   bool
 }
 
-// start launches a fresh instance from the config file.
+// start launches a fresh instance from the config file, unless stop has been
+// called: a permanent stop must never be undone by a reload that was mid-delay.
 func (r *reloadingRunner) start() {
-	ctx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	r.cancel = cancel
-	r.mu.Unlock()
 	go cmd.Run(r.path, ctx)
 }
 

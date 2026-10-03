@@ -17,11 +17,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -143,8 +145,9 @@ func origin(l net.Listener) {
 	}
 }
 
-func run(pub string, mode byte, total int64) float64 {
+func run(pub string, mode byte, total int64) (float64, bool) {
 	var wg sync.WaitGroup
+	var failed atomic.Int32
 	start := time.Now()
 	for i := 0; i < *flows; i++ {
 		wg.Add(1)
@@ -153,6 +156,7 @@ func run(pub string, mode byte, total int64) float64 {
 			c, err := net.Dial("tcp", pub)
 			if err != nil {
 				fmt.Println("dial:", err)
+				failed.Add(1)
 				return
 			}
 			defer c.Close()
@@ -164,6 +168,7 @@ func run(pub string, mode byte, total int64) float64 {
 				n, err := io.Copy(io.Discard, c)
 				if err != nil || n != total {
 					fmt.Printf("download: %d of %d bytes, %v\n", n, total, err)
+					failed.Add(1)
 				}
 				return
 			}
@@ -175,6 +180,7 @@ func run(pub string, mode byte, total int64) float64 {
 				}
 				if _, err := c.Write(buf[:n]); err != nil {
 					fmt.Println("upload:", err)
+					failed.Add(1)
 					return
 				}
 				left -= n
@@ -182,11 +188,12 @@ func run(pub string, mode byte, total int64) float64 {
 			var b [1]byte
 			if _, err := io.ReadFull(c, b[:]); err != nil {
 				fmt.Println("upload ack:", err)
+				failed.Add(1)
 			}
 		}()
 	}
 	wg.Wait()
-	return float64(total*int64(*flows)) / time.Since(start).Seconds() / 1e6
+	return float64(total*int64(*flows)) / time.Since(start).Seconds() / 1e6, failed.Load() == 0
 }
 
 func main() {
@@ -195,9 +202,15 @@ func main() {
 	total := int64(*mb) << 20
 	dir, _ := os.MkdirTemp("", "wanbulk")
 	defer os.RemoveAll(dir)
-	eo, _ := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", O))
+	eo, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", O))
+	if err != nil {
+		log.Fatalf("origin listener: %v", err)
+	}
+	pl, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", P))
+	if err != nil {
+		log.Fatalf("proxy listener: %v", err)
+	}
 	go origin(eo)
-	pl, _ := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", P))
 	go proxy(pl, fmt.Sprintf("127.0.0.1:%d", T), *delay)
 
 	nl := func(s string) string {
@@ -231,17 +244,27 @@ mux_version = 2
 log_level = "error"
 %s`, P, *tr, nl(*cliExtra))), 0644)
 	sv := exec.Command(*bin, "-c", filepath.Join(dir, "s.toml"))
-	sv.Start()
+	if err := sv.Start(); err != nil {
+		log.Fatalf("starting the server: %v", err)
+	}
+	defer sv.Process.Kill()
 	time.Sleep(time.Second)
 	cl := exec.Command(*bin, "-c", filepath.Join(dir, "c.toml"))
-	cl.Start()
-	defer func() { sv.Process.Kill(); cl.Process.Kill() }()
+	if err := cl.Start(); err != nil {
+		log.Fatalf("starting the client: %v", err)
+	}
+	defer cl.Process.Kill()
 	time.Sleep(4 * time.Second)
 
 	pub := fmt.Sprintf("127.0.0.1:%d", PUB)
-	run(pub, 'D', 8<<20) // warm up the pool
-	down := run(pub, 'D', total)
-	up := run(pub, 'U', total)
+	if _, ok := run(pub, 'D', 8<<20); !ok { // warm up the pool
+		log.Fatal("the tunnel did not carry the warm-up transfer; no result")
+	}
+	down, okD := run(pub, 'D', total)
+	up, okU := run(pub, 'U', total)
+	if !okD || !okU {
+		log.Fatalf("a transfer failed (download ok=%v, upload ok=%v); no result", okD, okU)
+	}
 	fmt.Printf("RESULT %s delay=%v flows=%d: download %.1f MB/s, upload %.1f MB/s\n", *label, *delay, *flows, down, up)
 }
 

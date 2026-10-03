@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // replayRing keeps the payload bytes a resumable flow has sent but the peer has
@@ -33,6 +34,7 @@ const (
 var (
 	errReplayTooLarge = errors.New("replay: write larger than the replay limit")
 	errReplayWake     = errors.New("replay: wait interrupted")
+	errReplayTimer    = errors.New("replay: waited long enough to grow")
 )
 
 // getLimit and setLimit: the limit can grow while the flow runs (see ReplayGrant).
@@ -87,7 +89,7 @@ func (r *replayRing) free() int {
 // A signal on wake (may be nil) interrupts the wait with errReplayWake: the caller
 // has something more urgent than room (a swap that needs the sender to reach its
 // next boundary) and decides whether to carry on.
-func (r *replayRing) waitFree(ctx context.Context, abort <-chan struct{}, wake <-chan struct{}, n int) error {
+func (r *replayRing) waitFree(ctx context.Context, abort <-chan struct{}, wake <-chan struct{}, timer <-chan time.Time, n int) error {
 	if n > r.getLimit() {
 		return errReplayTooLarge
 	}
@@ -99,6 +101,8 @@ func (r *replayRing) waitFree(ctx context.Context, abort <-chan struct{}, wake <
 		case <-r.space:
 		case <-wake:
 			return errReplayWake
+		case <-timer:
+			return errReplayTimer
 		case <-abort:
 			return context.Canceled
 		case <-ctx.Done():

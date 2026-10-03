@@ -33,14 +33,26 @@ const (
 	hcAck   byte = 0x04
 
 	hcHeaderLen = 3
-	hcMaxData   = 32768
+	// hcMaxData is chosen so that a full record is exactly 32768 bytes on the wire
+	// (header included): one smux frame at the stock frame size, and a power of two.
+	// That matters twice. A record that is a little more than the frame size spills
+	// a tiny second frame (doubling frames and writes: about 8% of bulk throughput).
+	// And smux's flow control only runs at its best when the sizes of the writes
+	// divide the stream window evenly; any other size settles into a pattern where
+	// the sender waits a whole round trip for every half window, halving the rate of
+	// a single flow over a long path (measured: 100 MB/s against 195 MB/s at
+	// 80 ms RTT with a 16 MiB window). Plain flows get the good pattern by accident
+	// (64 KiB reads), so resumable ones must too: see HalfCloseReadSize.
+	hcMaxData = 32768 - hcHeaderLen
 
 	// HalfCloseRecordSize is the largest record the envelope writes (header plus a
-	// full DATA payload). A smux session whose max frame size is at least this
-	// carries every record in ONE frame; with the stock 32768 each full record spills
-	// a 3-byte frame behind it, which doubles the frames (and writes to the
-	// connection) per 32 KiB and costs about 8% of bulk throughput.
+	// full DATA payload), the smux frame size it fits in.
 	HalfCloseRecordSize = hcHeaderLen + hcMaxData
+
+	// HalfCloseReadSize is how much a pump reads from the app before writing it to an
+	// enveloped tunnel: exactly two full records, 64 KiB on the wire, the same write
+	// size a plain flow produces (see hcMaxData).
+	HalfCloseReadSize = 2 * hcMaxData
 
 	// hcAbortTimeout bounds the best-effort ABORT written by Close, so a peer
 	// that stopped reading cannot wedge teardown.

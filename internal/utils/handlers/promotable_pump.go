@@ -536,6 +536,10 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	p.mu.Lock()
 	dst := p.cur
 	p.mu.Unlock()
+	if _, ok := dst.(*halfCloseConn); ok {
+		// Whole records, 64 KiB on the wire per write: see hcMaxData.
+		buf = buf[:min(len(buf), HalfCloseReadSize)]
+	}
 	var srcErr error // how the app read ended; delivered to whichever tunnel is current
 	pend := 0        // bytes of buf read from the app but not yet retained or sent
 
@@ -639,7 +643,15 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 					// flow that can resume, the resume sends it again (the upload is
 					// marked ended, so ResumeFinish replays and re-ends it).
 					if err := closeWriteErr(dst); err != nil && p.replay != nil {
-						p.Suspend()
+						// Unless a swap is moving the flow off dst right now (it closes
+						// dst and re-sends the end on the new tunnel itself): then this
+						// failure is the swap's, not the tunnel's.
+						p.mu.Lock()
+						swapping := p.freezeReq || p.cur != dst
+						p.mu.Unlock()
+						if !swapping {
+							p.Suspend()
+						}
 					}
 				} else {
 					p.Abort()
@@ -869,6 +881,10 @@ const minReplayLimit = 256 << 10
 // ring has grown.
 const replayAckEvery = 64 << 10
 
+// replayGrowAfter is how long a sender waits for room in a full ring before the ring
+// grows: long enough that only a real round trip qualifies.
+const replayGrowAfter = 3 * time.Millisecond
+
 // SetReplayGrower lets the replay ring grow when the sender finds it full: grow
 // gets the current limit and returns the new one (the same value = no more room).
 // The ring's size bounds the flow's rate to about limit per round trip, so a flow
@@ -1018,6 +1034,16 @@ func (p *PumpSwapper) flushAck() {
 // resume, so the caller holds its read back rather than overfilling the ring. ok is
 // false when the flow was aborted.
 func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
+	// The ring only grows for a sender that has waited a real round trip for room: a
+	// full ring that an ACK frees within microseconds (a LAN, a busy scheduler) is
+	// not what limits the flow, and a big ring costs cache for nothing.
+	var growTimer *time.Timer
+	var grow <-chan time.Time
+	defer func() {
+		if growTimer != nil {
+			growTimer.Stop()
+		}
+	}()
 	for {
 		p.mu.Lock()
 		suspended := p.suspended
@@ -1025,13 +1051,20 @@ func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
 		if suspended {
 			return true, true // nothing can be acknowledged until the flow resumes
 		}
-		if p.replay.ring.free() < n && p.growReplay() {
-			continue // a bigger ring may already fit it
+		if growTimer == nil && p.replayGrow != nil && p.replay.ring.free() < n {
+			growTimer = time.NewTimer(replayGrowAfter)
+			grow = growTimer.C
 		}
-		err := p.replay.ring.waitFree(p.ctx, p.abortCh, p.freezeWake, n)
+		err := p.replay.ring.waitFree(p.ctx, p.abortCh, p.freezeWake, grow, n)
 		switch {
 		case err == nil:
 			return true, false
+		case err == errReplayTimer:
+			if p.growReplay() {
+				growTimer.Reset(replayGrowAfter) // and again, if the bigger ring is full too
+			} else {
+				grow = nil // nothing more to get: just wait
+			}
 		case err == errReplayWake:
 			p.mu.Lock()
 			pending := (p.freezeReq && !p.frozen) || p.suspended

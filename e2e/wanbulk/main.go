@@ -35,6 +35,8 @@ var (
 	srvExtra = flag.String("server-extra", "", "extra [server] config lines, \\n separated")
 	cliExtra = flag.String("client-extra", "", "extra [client] config lines, \\n separated")
 	label    = flag.String("label", "", "printed with the result")
+	chunk0   = flag.Int("chunk", 256<<10, "origin write size for downloads; odd sizes with -gap make the tunnel's reads of it unaligned, like real traffic")
+	gap      = flag.Duration("gap", 0, "origin pause between writes")
 )
 
 type chunk struct {
@@ -119,7 +121,7 @@ func origin(l net.Listener) {
 			}
 			total := int64(binary.BigEndian.Uint64(m[1:]))
 			if m[0] == 'D' {
-				buf := make([]byte, 256<<10)
+				buf := make([]byte, *chunk0)
 				for left := total; left > 0; {
 					n := int64(len(buf))
 					if n > left {
@@ -129,6 +131,9 @@ func origin(l net.Listener) {
 						return
 					}
 					left -= n
+					if *gap > 0 {
+						time.Sleep(*gap)
+					}
 				}
 				return
 			}

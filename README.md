@@ -162,7 +162,7 @@ Only keys marked **required** must be set. Everything else has the default shown
 | `so_rcvbuf`, `so_sndbuf` | OS default | wsmux, wssmux | socket buffer sizes in bytes |
 | `cdn_max_age` | `0` (off) | ws\* | shortest max connection age of any CDN/LB in front (seconds); see [rotation](#multiplexing-rotation-and-resume-wsmux--wssmux) |
 | `resume_window` | `30` with `cdn_max_age` | wsmux, wssmux | seconds a cut flow waits to be resumed; `-1` disables |
-| `mux_con` | `8` | wsmux, wssmux, dns | streams per tunnel connection |
+| `mux_con` | `8` | wsmux, wssmux | streams per tunnel connection (on dns it only feeds the derived `mux_streambuffer`) |
 | `mux_version` | `1` | wsmux, wssmux, dns | smux protocol version (1 or 2); 2 is needed for UDP, resume, half-close, promotion, speedtest |
 | `mux_framesize` | `32768` | wsmux, wssmux, dns | largest smux frame |
 | `mux_recievebuffer` | `4194304` | wsmux, wssmux, dns | per-connection receive budget, bytes |
@@ -279,7 +279,7 @@ dials `target` (which defaults to the same port on the client's host).
 
 **The server always terminates TLS with the system OpenSSL**, never Go's
 `crypto/tls`. The SSL context mirrors a stock nginx: TLS 1.2 and 1.3, server
-cipher preference, ALPN `http/1.1`. On OpenSSL 3 that makes TLS 1.3 negotiate
+cipher preference. On OpenSSL 3 that makes TLS 1.3 negotiate
 `TLS_AES_256_GCM_SHA384`, exactly like nginx, whereas Go's stack always prefers
 AES-128-GCM — a difference a censor probing a directly reachable origin could
 fingerprint. A test in `internal/utils/network` asserts the cipher choice.
@@ -287,8 +287,10 @@ fingerprint. A test in `internal/utils/network` asserts the cipher choice.
 Caveats:
 
 - For the closest match, run the same OpenSSL **major** version as your nginx.
-- nginx's `http2` also advertises `h2` in ALPN; this listener speaks HTTP/1.1
-  only (the WebSocket tunnel needs it).
+- ALPN is **not** negotiated: the OpenSSL binding offers no server-side ALPN
+  selection, so a client that offers ALPN gets no protocol back, where nginx
+  would answer `http/1.1`. A direct probe can tell the two apart on that point.
+  The tunnel itself does not need ALPN and speaks HTTP/1.1 only.
 - This closes the largest observable gap, not every one. Verify with a
   fingerprinting tool (e.g. JARM) against a real nginx before relying on it.
 - If the origin is only reachable through a CDN, the censor sees the CDN's TLS

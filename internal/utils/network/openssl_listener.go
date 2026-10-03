@@ -18,13 +18,16 @@ import (
 //   - Server cipher preference on - nginx's `ssl_prefer_server_ciphers on`. On
 //     OpenSSL 3.0 this makes TLS 1.3 negotiate AES-256-GCM first, the same
 //     choice nginx makes and the one Go's stack cannot be configured to make.
-//   - ALPN advertising http/1.1.
 //
 // Because this is the same OpenSSL that nginx links, the ServerHello it emits -
 // extension order included - matches nginx's, so a direct probe of the origin
 // cannot distinguish them on the TLS handshake.
 //
 // Caveats:
+//   - ALPN is not negotiated. go-openssl exposes only the client-side
+//     SSL_CTX_set_alpn_protos, and a server needs a selection callback it does
+//     not provide, so a client offering ALPN gets no protocol back where nginx
+//     would answer http/1.1. The WebSocket tunnel does not need ALPN.
 //   - Match nginx's OpenSSL *major* version for the closest fingerprint.
 //   - nginx's `http2` directive also advertises h2 in ALPN. This listener
 //     speaks HTTP/1.1 only (the WebSocket tunnel needs it), so drop `http2`
@@ -47,9 +50,6 @@ func newConfiguredCtx(certFile, keyFile string) (*openssl.Ctx, error) {
 		return nil, fmt.Errorf("openssl: failed to set max proto version")
 	}
 	ctx.SetOptions(openssl.CipherServerPreference | openssl.NoSSLv2 | openssl.NoSSLv3)
-	if err := ctx.SetNextProtos([]string{"http/1.1"}); err != nil {
-		return nil, fmt.Errorf("openssl set alpn: %w", err)
-	}
 	return ctx, nil
 }
 
@@ -109,7 +109,7 @@ func NewTLSListener(addr string, certFiles, keyFiles []string, rcvBuf, sndBuf in
 			certs = append(certs, sniCert{leaf: leaf, ctx: ctx})
 		}
 		// SSL_set_SSL_CTX only swaps the certificate; the SSL keeps the base
-		// ctx's proto/cipher/ALPN tuning (which every ctx shares anyway), so
+		// ctx's proto/cipher tuning (which every ctx shares anyway), so
 		// the handshake fingerprint is unchanged by the selection.
 		base.SetTLSExtServernameCallback(func(ssl *openssl.SSL) openssl.SSLTLSExtErr {
 			if name := ssl.GetServername(); name != "" {

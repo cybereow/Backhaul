@@ -190,9 +190,9 @@ func TestValidateDNSMux(t *testing.T) {
 		t.Error("client without dns_domain accepted")
 	}
 
-	other := &config.Config{Server: config.ServerConfig{Transport: config.TCP}}
+	other := &config.Config{Server: config.ServerConfig{Transport: config.WSMUX}}
 	if err := validateDNSMux(other, "server"); err != nil {
-		t.Errorf("non-dnsmux transport affected: %v", err)
+		t.Errorf("non-DNS transport affected: %v", err)
 	}
 }
 
@@ -215,5 +215,31 @@ func TestValidateDNSMuxRejectsUnknownRecordTypes(t *testing.T) {
 	cli.Client.DNSRecordTypes = []string{"txt", "MX"}
 	if err := validateDNSMux(cli, "client"); err != nil {
 		t.Errorf("valid (case-insensitive) record types rejected: %v", err)
+	}
+}
+
+func TestValidateTransport(t *testing.T) {
+	for _, tr := range []config.TransportType{config.WS, config.WSS, config.WSMUX, config.WSSMUX, config.DNS, config.DNSMUX} {
+		cfg := &config.Config{Server: config.ServerConfig{Transport: tr}, Client: config.ClientConfig{Transport: tr}}
+		for _, role := range []string{"server", "client"} {
+			if err := validateTransport(cfg, role); err != nil {
+				t.Errorf("%s %s rejected: %v", role, tr, err)
+			}
+		}
+	}
+	for _, tr := range []config.TransportType{"tcp", "tcpmux", "udp", ""} {
+		cfg := &config.Config{Server: config.ServerConfig{Transport: tr}, Client: config.ClientConfig{Transport: tr}}
+		for _, role := range []string{"server", "client"} {
+			if validateTransport(cfg, role) == nil {
+				t.Errorf("%s transport %q accepted", role, tr)
+			}
+		}
+	}
+}
+
+func TestDetectConfigTypeDNSAlias(t *testing.T) {
+	cli := &config.Config{Client: config.ClientConfig{Transport: config.DNS, DNSDomain: "t.example.com"}}
+	if got := detectConfigType(cli); got != "client" {
+		t.Errorf("dns client detected as %q", got)
 	}
 }

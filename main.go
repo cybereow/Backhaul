@@ -1,3 +1,6 @@
+// Command backhaul is a reverse tunnel: a server and a client that carry
+// forwarded TCP (and, over wsmux/wssmux, UDP) connections across ws, wss, wsmux,
+// wssmux, dns or dnsmux.
 package main
 
 import (
@@ -7,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -14,115 +18,146 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 )
 
-var (
-	logger     = utils.NewLogger("info")
-	configPath *string
-	ctx        context.Context
-	cancel     context.CancelFunc
-)
-
-// Define the version of the application
 const version = "v0.7.3"
 
-func main() {
-	configPath = flag.String("c", "", "path to the configuration file (TOML format)")
-	probePath := flag.String("probe", "", "run the standalone DNS reachability/capacity prober with this [dns_probe] config and exit (Phase 1; does not start a tunnel)")
-	showVersion := flag.Bool("v", false, "print the version and exit")
+var logger = utils.NewLogger("info")
 
+const (
+	// reloadPollInterval is how often the config file's mtime is checked.
+	reloadPollInterval = 2 * time.Second
+	// reloadSettle gives the old instance time to release its ports before the
+	// new one binds them.
+	reloadSettle = 2 * time.Second
+	// shutdownGrace gives running instances time to close before the process exits.
+	shutdownGrace = 1 * time.Second
+)
+
+func main() {
+	configPath := flag.String("c", "", "path to the configuration file (TOML format)")
+	probePath := flag.String("probe", "", "run the standalone DNS reachability/capacity prober with this [dns_probe] config and exit (does not start a tunnel)")
+	showVersion := flag.Bool("v", false, "print the version and exit")
 	flag.Parse()
 
-	// If the version flag is provided, print the version and exit
 	if *showVersion {
 		fmt.Println(version)
-		os.Exit(0)
+		return
 	}
 
-	// The DNS prober/responder is a standalone diagnostic, deliberately kept off
-	// the normal server/client run path and its config hot-reload. It runs until
-	// it finishes (prober) or is interrupted (responder).
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// The DNS prober/responder is a standalone diagnostic, kept off the normal
+	// run path and its config hot-reload. It runs until it finishes (prober) or
+	// is interrupted (responder).
 	if *probePath != "" {
-		ctx, cancel = context.WithCancel(context.Background())
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
 		go func() {
 			<-sigChan
 			cancel()
 		}()
 		cmd.RunProbe(*probePath, ctx)
-		cancel()
 		return
 	}
 
-	// Check if the configPath is provided
 	if *configPath == "" {
 		logger.Fatalf("Usage: %s -c /path/to/config.toml", flag.CommandLine.Name())
 	}
 
-	// Create a context for graceful shutdown handling
-	ctx, cancel = context.WithCancel(context.Background())
-
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	go cmd.Run(*configPath, ctx)
-	go hotReload()
+	runner := &reloadingRunner{path: *configPath}
+	runner.start()
+	go runner.watch()
 
 	<-sigChan
-
-	cancel()
-
-	time.Sleep(1 * time.Second)
+	runner.stop()
+	time.Sleep(shutdownGrace)
 }
 
-func hotReload() {
-	// Get initial modification time of the config file
-	lastModTime, err := getLastModTime(*configPath)
+// reloadingRunner runs the tunnel described by a config file and restarts it
+// whenever the file changes.
+type reloadingRunner struct {
+	path string
+
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	done   bool
+}
+
+// start launches a fresh instance from the config file, unless stop has been
+// called: a permanent stop must never be undone by a reload that was mid-delay.
+func (r *reloadingRunner) start() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	r.cancel = cancel
+	go cmd.Run(r.path, ctx)
+}
+
+// stop ends the running instance for good (no further reloads).
+func (r *reloadingRunner) stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.done = true
+	if r.cancel != nil {
+		r.cancel()
+	}
+}
+
+// restart replaces the running instance with one built from the current config.
+func (r *reloadingRunner) restart() {
+	r.mu.Lock()
+	if r.done {
+		r.mu.Unlock()
+		return
+	}
+	r.cancel()
+	r.mu.Unlock()
+
+	time.Sleep(reloadSettle)
+	r.start()
+}
+
+// watch polls the config file's modification time and restarts on change.
+func (r *reloadingRunner) watch() {
+	lastMod, err := modTime(r.path)
 	if err != nil {
 		logger.Fatalf("Error getting modification time: %v", err)
 	}
 
-	ticker := time.NewTicker(2 * time.Second)
+	ticker := time.NewTicker(reloadPollInterval)
 	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
+	for range ticker.C {
+		r.mu.Lock()
+		done := r.done
+		r.mu.Unlock()
+		if done {
 			return
-		case <-ticker.C:
-			modTime, err := getLastModTime(*configPath)
-			if err != nil {
-				logger.Errorf("Error checking file modification time: %v", err)
-				continue
-			}
+		}
 
-			// If the modification time has changed, reload the app
-			if modTime.After(lastModTime) {
-				logger.Info("Config file changed, reloading application")
-
-				// Cancel the previous context to stop the old running instance
-				cancel()
-
-				time.Sleep(2 * time.Second)
-
-				// Create a new context for the new instance
-				newCtx, newCancel := context.WithCancel(context.Background())
-				go cmd.Run(*configPath, newCtx)
-
-				// Update the last modification time and the context
-				lastModTime = modTime
-				ctx = newCtx
-				cancel = newCancel
-			}
+		mod, err := modTime(r.path)
+		if err != nil {
+			logger.Errorf("Error checking file modification time: %v", err)
+			continue
+		}
+		if mod.After(lastMod) {
+			logger.Info("Config file changed, reloading application")
+			lastMod = mod
+			r.restart()
 		}
 	}
 }
 
-func getLastModTime(file string) (time.Time, error) {
-	absPath, _ := filepath.Abs(file)
-	fileInfo, err := os.Stat(absPath)
+func modTime(file string) (time.Time, error) {
+	abs, err := filepath.Abs(file)
 	if err != nil {
 		return time.Time{}, err
 	}
-	return fileInfo.ModTime(), nil
+	info, err := os.Stat(abs)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }

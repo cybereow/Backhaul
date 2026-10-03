@@ -28,12 +28,12 @@ func detectConfigType(cfg *config.Config) string {
 		return "server"
 	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
 		return "client"
-	// dnsmux has no bind_addr/remote_addr: the server is identified by the
+	// the DNS transports have no bind_addr/remote_addr: the server is identified by the
 	// domain it is authoritative for, the client by the domain it tunnels through
 	// (dns_resolvers is optional: empty means auto-discover).
-	case cfg.Server.Transport == config.DNSMUX && cfg.Server.DNSDomain != "":
+	case cfg.Server.Transport.IsDNS() && cfg.Server.DNSDomain != "":
 		return "server"
-	case cfg.Client.Transport == config.DNSMUX && cfg.Client.DNSDomain != "":
+	case cfg.Client.Transport.IsDNS() && cfg.Client.DNSDomain != "":
 		return "client"
 	default:
 		return ""
@@ -75,17 +75,32 @@ func validateStripeConfig(role string, factor, parity int) error {
 	return nil
 }
 
-// validateDNSMux checks the keys the dnsmux transport cannot run without. It
+// validateTransport rejects a transport this build does not carry. The tcp,
+// tcpmux and udp transports were removed; naming them is a configuration error
+// rather than a silent fallback.
+func validateTransport(cfg *config.Config, configType string) error {
+	t := cfg.Server.Transport
+	if configType == "client" {
+		t = cfg.Client.Transport
+	}
+	switch t {
+	case config.WS, config.WSS, config.WSMUX, config.WSSMUX, config.DNS, config.DNSMUX:
+		return nil
+	}
+	return fmt.Errorf("%s 'transport' %q is not supported: use one of ws, wss, wsmux, wssmux, dns, dnsmux", configType, t)
+}
+
+// validateDNSMux checks the keys the DNS transports cannot run without. It
 // does nothing for any other transport.
 func validateDNSMux(cfg *config.Config, configType string) error {
 	switch {
-	case configType == "server" && cfg.Server.Transport == config.DNSMUX:
+	case configType == "server" && cfg.Server.Transport.IsDNS():
 		if cfg.Server.DNSDomain == "" {
-			return fmt.Errorf("server 'dns_domain' is required for the dnsmux transport")
+			return fmt.Errorf("server 'dns_domain' is required for the dns/dnsmux transports")
 		}
-	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
+	case configType == "client" && cfg.Client.Transport.IsDNS():
 		if cfg.Client.DNSDomain == "" {
-			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")
+			return fmt.Errorf("client 'dns_domain' is required for the dns/dnsmux transports")
 		}
 		if err := dnsx.ValidateRecordTypes(cfg.Client.DNSDomain, cfg.Client.DNSRecordTypes); err != nil {
 			return fmt.Errorf("client 'dns_record_types': %w", err)
@@ -110,85 +125,82 @@ func validateHalfClose(cfg *config.Config, configType string) error {
 	return nil
 }
 
-func Run(configPath string, ctx context.Context) {
-	// Load and parse the configuration file
-	cfg, err := loadConfig(configPath)
-	if err != nil {
-		logger.Fatalf("failed to load configuration: %v", err)
-	}
-
-	// Apply default values to the configuration
-	applyDefaults(cfg)
-
-	configType := detectConfigType(cfg)
-	if configType == "" {
-		logger.Fatalf("neither server nor client configuration is properly set.")
+// validate checks a defaulted configuration and returns which role it describes
+// ("server" or "client"). Every problem is reported as an error naming the key to
+// fix, so Run can refuse to start rather than run half-configured.
+func validate(cfg *config.Config) (role string, err error) {
+	role = detectConfigType(cfg)
+	if role == "" {
+		return "", fmt.Errorf("neither server nor client configuration is properly set")
 	}
 
 	// Require an explicit token on the active side. There is no built-in
 	// default: a tokenless deployment would otherwise authenticate peers with a
 	// well-known value and act as an open relay. Both tunnel ends must share the
 	// same token.
-	if configType == "server" && cfg.Server.Token == "" {
-		logger.Fatalf("server 'token' is required: set it in the [server] config (it must match the client's token)")
+	token, peer := cfg.Server.Token, "client"
+	if role == "client" {
+		token, peer = cfg.Client.Token, "server"
 	}
-	if configType == "client" && cfg.Client.Token == "" {
-		logger.Fatalf("client 'token' is required: set it in the [client] config (it must match the server's token)")
+	if token == "" {
+		return "", fmt.Errorf("%s 'token' is required: set it in the [%s] config (it must match the %s's token)", role, role, peer)
 	}
 
 	// mux_stripe and mux_stripe_parity share one set of bounds for both roles
 	// (see validateStripeConfig); parity only does anything once striping is on,
 	// because the plain, non-striped session path never looks at it.
-	var stripeErr error
-	switch configType {
-	case "server":
-		stripeErr = validateStripeConfig("server", cfg.Server.StripeFactor, cfg.Server.StripeParity)
-	case "client":
-		stripeErr = validateStripeConfig("client", cfg.Client.StripeFactor, cfg.Client.StripeParity)
+	factor, parity := cfg.Server.StripeFactor, cfg.Server.StripeParity
+	if role == "client" {
+		factor, parity = cfg.Client.StripeFactor, cfg.Client.StripeParity
 	}
-	if stripeErr != nil {
-		logger.Fatalf("%v", stripeErr)
+	for _, check := range []error{
+		validateStripeConfig(role, factor, parity),
+		validateTransport(cfg, role),
+		validateHalfClose(cfg, role),
+		validateDNSMux(cfg, role),
+	} {
+		if check != nil {
+			return "", check
+		}
 	}
+	return role, nil
+}
 
-	if err := validateHalfClose(cfg, configType); err != nil {
+// Run loads the configuration at configPath and runs the server or client it
+// describes until ctx is cancelled.
+func Run(configPath string, ctx context.Context) {
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		logger.Fatalf("failed to load configuration: %v", err)
+	}
+	applyDefaults(cfg)
+
+	role, err := validate(cfg)
+	if err != nil {
 		logger.Fatalf("%v", err)
 	}
-	if err := validateDNSMux(cfg, configType); err != nil {
-		logger.Fatalf("%v", err)
-	}
 
-	// Determine whether to run as a server or client
-	switch configType {
+	switch role {
 	case "server":
-		// Apply temporary TCP optimizations at startup
 		if !cfg.Server.SkipOptz {
 			ApplyTCPTuning()
 		}
-
-		srv := server.NewServer(&cfg.Server, ctx) // server
+		srv := server.NewServer(&cfg.Server, ctx)
 		go srv.Start()
 
-		// Wait for shutdown signal
 		<-ctx.Done()
 		srv.Stop()
 		logger.Println("shutting down server...")
 	case "client":
-		// Apply temporary TCP optimizations at startup
 		if !cfg.Client.SkipOptz {
 			ApplyTCPTuning()
 		}
-
-		clnt := client.NewClient(&cfg.Client, ctx) // client
+		clnt := client.NewClient(&cfg.Client, ctx)
 		go clnt.Start()
 
-		// Wait for shutdown signal
 		<-ctx.Done()
 		clnt.Stop()
 		logger.Println("shutting down client...")
-
-	default:
-		logger.Fatalf("neither server nor client configuration is properly set.")
-
 	}
 }
 
@@ -206,6 +218,13 @@ func loadConfig(configPath string) (*config.Config, error) {
 		if meta.IsDefined("server", key) {
 			return &cfg, fmt.Errorf("server.%s was removed; set server.cdn_max_age (seconds, the shortest max connection age of your CDNs) instead", key)
 		}
+	}
+
+	// tls_engine selected between Go's TLS and OpenSSL; OpenSSL is now the only
+	// engine. An old config that still sets it keeps working (the value is
+	// ignored), but say so rather than let it look meaningful.
+	if meta.IsDefined("server", "tls_engine") {
+		logger.Warn("server.tls_engine is ignored: TLS is always terminated by OpenSSL")
 	}
 
 	// SEC: Secure by default. If the user omitted tls_verify from the

@@ -4,15 +4,28 @@ package config
 type TransportType string
 
 const (
-	TCP    TransportType = "tcp"
-	TCPMUX TransportType = "tcpmux"
 	WS     TransportType = "ws"
 	WSS    TransportType = "wss"
 	WSMUX  TransportType = "wsmux"
 	WSSMUX TransportType = "wssmux"
-	UDP    TransportType = "udp"
+	DNS    TransportType = "dns"
 	DNSMUX TransportType = "dnsmux"
 )
+
+// IsDNS reports whether t is one of the DNS carrier transports. The carrier is
+// always multiplexed, so "dns" and "dnsmux" run the same code.
+func (t TransportType) IsDNS() bool { return t == DNS || t == DNSMUX }
+
+// IsWebSocket reports whether t is one of the WebSocket transports.
+func (t TransportType) IsWebSocket() bool {
+	return t == WS || t == WSS || t == WSMUX || t == WSSMUX
+}
+
+// IsMux reports whether t multiplexes many flows over a few connections.
+func (t TransportType) IsMux() bool { return t == WSMUX || t == WSSMUX || t.IsDNS() }
+
+// IsTLS reports whether t terminates TLS on the server.
+func (t TransportType) IsTLS() bool { return t == WSS || t == WSSMUX }
 
 // ServerConfig represents the configuration for the server.
 type ServerConfig struct {
@@ -56,7 +69,6 @@ type ServerConfig struct {
 	MuxHalfClose         bool          `toml:"mux_half_close"` // wsmux/wssmux (mux_version >= 2): plain flows carry a request-EOF-then-reply-safe (directional EOF) envelope. STRICT: upgrades from clients that do not offer the halfclose-v1 capability are rejected. Default false. Promotable flows (promote_bytes) keep legacy full-close semantics. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
-	TLSEngine            string        `toml:"tls_engine"`
 	DNSDomain            string        `toml:"dns_domain"`    // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
 	DNSKey               string        `toml:"dns_key"`       // dnsmux: shared secret for the per-query MAC; falls back to token
 	DNSListen            string        `toml:"dns_listen"`    // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)

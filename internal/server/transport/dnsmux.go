@@ -22,7 +22,7 @@ import (
 // DnsMuxConfig configures the dnsmux server: the authoritative end of the DNS
 // carrier. The client dials through recursive resolvers; this side accepts the
 // resulting tunnel conns, opens smux streams on them and forwards local ports,
-// exactly like tcpmux.
+// exactly like wssmux.
 type DnsMuxConfig struct {
 	Domain           string
 	Key              string
@@ -211,7 +211,7 @@ func (s *DnsMuxTransport) pick(skip map[*smux.Session]bool) *smux.Session {
 
 type dnsPortMap struct{ local, remote string }
 
-// expandPorts turns the tcpmux-style "ports" entries ("8080", "8080=host:80",
+// expandPorts turns the "ports" entries ("8080", "8080=host:80",
 // "1000-1010", "ip:8080=remote") into listener/target pairs.
 func expandPorts(ports []string) ([]dnsPortMap, error) {
 	var out []dnsPortMap

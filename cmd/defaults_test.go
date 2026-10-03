@@ -229,8 +229,8 @@ func TestLoadConfigMuxWSFraming(t *testing.T) {
 
 	// Other transports ignore the key: it loads without complaint and only the
 	// wsmux/wssmux wiring reads it.
-	cfg := load(t, "[server]\ntransport = \"tcp\"\nbind_addr = \"0.0.0.0:1\"\nmux_ws_framing = false\n")
-	if cfg.Server.Transport != config.TCP || cfg.Server.MuxWSFraming {
+	cfg := load(t, "[server]\ntransport = \"ws\"\nbind_addr = \"0.0.0.0:1\"\nmux_ws_framing = false\n")
+	if cfg.Server.Transport != config.WS || cfg.Server.MuxWSFraming {
 		t.Fatalf("transport = %q, mux_ws_framing = %v", cfg.Server.Transport, cfg.Server.MuxWSFraming)
 	}
 }
@@ -281,13 +281,13 @@ func TestValidateHalfClose(t *testing.T) {
 		kind    string
 		wantErr string // substring, "" = ok
 	}{
-		{"off is always fine", server(config.TCP, 1, false), "server", ""},
+		{"off is always fine", server(config.WS, 1, false), "server", ""},
 		{"wsmux v2", server(config.WSMUX, 2, true), "server", ""},
 		{"wssmux v2", server(config.WSSMUX, 2, true), "server", ""},
 		{"wsmux v1", server(config.WSMUX, 1, true), "server", "mux_version"},
-		{"tcpmux", server(config.TCPMUX, 2, true), "server", "wsmux/wssmux"},
+		{"dnsmux", server(config.DNSMUX, 2, true), "server", "wsmux/wssmux"},
 		{"plain ws", server(config.WS, 2, true), "server", "wsmux/wssmux"},
-		{"a client config never triggers it", server(config.TCP, 1, true), "client", ""},
+		{"a client config never triggers it", server(config.WS, 1, true), "client", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateHalfClose(tc.cfg, tc.kind)

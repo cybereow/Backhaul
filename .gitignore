@@ -23,6 +23,7 @@ go.work.sum
 
 # toml file
 *.toml
+!examples/*.toml
 
 # Makefile
 MakeFile

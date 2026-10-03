@@ -2,33 +2,27 @@ package network
 
 import (
 	"fmt"
-	"runtime"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
+// ReusePortControl is a net.ListenConfig.Control hook that sets SO_REUSEADDR and
+// SO_REUSEPORT, so a restarted instance can bind an address whose previous
+// listener is still closing.
 func ReusePortControl(network, address string, s syscall.RawConn) error {
 	var controlErr error
-
-	// Set socket options
 	err := s.Control(func(fd uintptr) {
-		// Set SO_REUSEADDR
-		if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
 			controlErr = fmt.Errorf("failed to set SO_REUSEADDR: %v", err)
 			return
 		}
-
-		// Conditionally set SO_REUSEPORT only on Linux
-		if runtime.GOOS == "linux" {
-			if err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, 0xf /* SO_REUSEPORT */, 1); err != nil {
-				controlErr = fmt.Errorf("failed to set SO_REUSEPORT: %v", err)
-				return
-			}
+		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1); err != nil {
+			controlErr = fmt.Errorf("failed to set SO_REUSEPORT: %v", err)
 		}
 	})
-
 	if err != nil {
 		return err
 	}
-
 	return controlErr
 }

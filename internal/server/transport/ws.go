@@ -76,7 +76,6 @@ type WsConfig struct {
 	Mode          config.TransportType // ws or wss
 	Path          string
 	Fallback      string        // decoy backend for non-tunnel requests (host:port), optional
-	TLSEngine     string        // "go" (default) or "openssl" for wss TLS termination
 	MaxConnAge    time.Duration // idle pool connections are replaced at this age (0 = never); see RotationPlan
 }
 
@@ -529,14 +528,10 @@ func (s *WsTransport) tunnelListener() {
 		}()
 	} else {
 		go func() {
-			engine := s.config.TLSEngine
-			if engine == "" {
-				engine = network.TLSEngineGo
-			}
-			s.logger.Infof("wss server starting, listening on %s (tls engine: %s)", addr, engine)
+			s.logger.Infof("wss server starting, listening on %s", addr)
 			s.logger.Info("waiting for wss control channel connection")
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, 0, 0, false)
+			ln, err := network.NewTLSListener(addr, certs, keys, 0, 0, false)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}
@@ -692,7 +687,7 @@ func (s *WsTransport) acceptLocalConn(g *wsGeneration, listener net.Listener, re
 			// discard any non-tcp connection
 			tcpConn, ok := conn.(*net.TCPConn)
 			if !ok {
-				s.logger.Warnf("disarded non-TCP connection from %s", conn.RemoteAddr().String())
+				s.logger.Warnf("discarded non-TCP connection from %s", conn.RemoteAddr().String())
 				conn.Close()
 				continue
 			}

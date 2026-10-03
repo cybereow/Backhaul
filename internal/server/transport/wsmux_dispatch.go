@@ -28,7 +28,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 
 func (s *WsMuxTransport) localListener(g *wsGeneration, localAddr string, remoteAddr string) {
 	// Force the socket buffers on the local ingress port (e.g. 6034), the same
-	// way the tcp/tcpmux transports do. This port carries the user's traffic into
+	// way every transport does. This port carries the user's traffic into
 	// the tunnel; with a plain net.Listen it fell back to the OS default receive
 	// buffer, which caps how fast the server can *read* an upload off a
 	// high-RTT client connection (throughput ~= rcvbuf / RTT) - so upload was
@@ -81,7 +81,7 @@ func (s *WsMuxTransport) acceptLocalConn(g *wsGeneration, listener net.Listener,
 			// discard any non-tcp connection
 			tcpConn, ok := conn.(*net.TCPConn)
 			if !ok {
-				s.logger.Warnf("disarded non-TCP connection from %s", conn.RemoteAddr().String())
+				s.logger.Warnf("discarded non-TCP connection from %s", conn.RemoteAddr().String())
 				conn.Close()
 				continue
 			}

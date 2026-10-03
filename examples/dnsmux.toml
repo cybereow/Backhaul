@@ -1,4 +1,4 @@
-# dnsmux: tunnel over DNS queries through recursive resolvers.
+# dnsmux (alias: dns): tunnel over DNS queries through recursive resolvers.
 #
 # Prerequisites: a domain you control with an NS delegation of the tunnel
 # sub-domain (dns_domain) to the SERVER host, UDP+TCP port 53 reachable there

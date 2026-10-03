@@ -139,7 +139,9 @@ func origin(l net.Listener) {
 				}
 				return
 			}
-			io.CopyN(io.Discard, c, total)
+			if n, err := io.CopyN(io.Discard, c, total); err != nil || n != total {
+				return // truncated: no acknowledgement, so the user side fails the measurement
+			}
 			c.Write([]byte{1})
 		}()
 	}
@@ -198,9 +200,15 @@ func run(pub string, mode byte, total int64) (float64, bool) {
 
 func main() {
 	flag.Parse()
+	if *flows < 1 || *mb < 1 || *chunk0 < 1 {
+		log.Fatal("-flows, -mb and -chunk must be at least 1")
+	}
 	O, P, T, PUB := *base, *base+1, *base+2, *base+3
 	total := int64(*mb) << 20
-	dir, _ := os.MkdirTemp("", "wanbulk")
+	dir, err := os.MkdirTemp("", "wanbulk")
+	if err != nil {
+		log.Fatalf("temporary directory: %v", err)
+	}
 	defer os.RemoveAll(dir)
 	eo, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", O))
 	if err != nil {

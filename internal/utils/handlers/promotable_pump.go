@@ -1060,9 +1060,13 @@ func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
 		case err == nil:
 			return true, false
 		case err == errReplayTimer:
-			if p.growReplay() {
+			switch {
+			case p.replay.ring.free() >= n:
+				// An ACK freed the room just as the timer fired: not a ring that is
+				// too small. The next pass takes the room; no growth.
+			case p.growReplay():
 				growTimer.Reset(replayGrowAfter) // and again, if the bigger ring is full too
-			} else {
+			default:
 				grow = nil // nothing more to get: just wait
 			}
 		case err == errReplayWake:

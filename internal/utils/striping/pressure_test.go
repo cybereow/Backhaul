@@ -45,3 +45,38 @@ func TestStripedBudgetPressureDeliversEverything(t *testing.T) {
 		}
 	}
 }
+
+// With the budget full, the chunk Read is waiting for is let in over it - once.
+// A second copy of it on another leg (the reroute watchdog makes those), and a
+// copy of anything already delivered, are not retained at all.
+func TestAdmitLetsOneCopyOfTheAwaitedChunkOverTheBudget(t *testing.T) {
+	const cost = retainedEntryOverhead + 16
+	c := &Conn{
+		chunkSize: 16,
+		budget:    reassemblyBudget{limit: 5 * cost, used: 5 * cost, peak: 5 * cost},
+		parkAt:    make([]uint64, 3),
+		legWaited: make([]uint32, 3),
+		parkCh:    make(chan struct{}, 1),
+		closed:    make(chan struct{}),
+	}
+	c.nextSeq, c.nextSeqSeen = 7, 7
+
+	if keep, ok := c.admit(0, 7, cost); !keep || !ok {
+		t.Fatalf("the awaited chunk: keep=%v ok=%v, want it admitted", keep, ok)
+	}
+	if keep, ok := c.admit(1, 7, cost); keep || !ok {
+		t.Fatalf("a second copy of the awaited chunk: keep=%v ok=%v, want it discarded", keep, ok)
+	}
+	if keep, ok := c.admit(2, 5, cost); keep || !ok {
+		t.Fatalf("a copy of a delivered chunk: keep=%v ok=%v, want it discarded", keep, ok)
+	}
+	if used, peak := c.budget.used, c.budget.peak; used != 6*cost || peak != 6*cost {
+		t.Fatalf("retained %d (peak %d), want the %d budget plus exactly one chunk", used, peak, 5*cost)
+	}
+
+	// once Read moves on, the next awaited chunk gets the same treatment
+	c.advance()
+	if keep, ok := c.admit(1, 8, cost); !keep || !ok {
+		t.Fatalf("the next awaited chunk: keep=%v ok=%v, want it admitted", keep, ok)
+	}
+}

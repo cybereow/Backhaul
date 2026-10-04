@@ -26,9 +26,21 @@ type TCPDelivery struct {
 }
 
 // tcpInfoFlagsOffset is the byte of struct tcp_info that carries
-// tcpi_delivery_rate_app_limited in its lowest bit. x/sys leaves it (and the
-// window-scale byte before it) as padding after Options, so it is read by offset.
+// tcpi_delivery_rate_app_limited as its first one-bit field. x/sys leaves it
+// (and the window-scale byte before it) as padding after Options, so it is read
+// by offset.
 const tcpInfoFlagsOffset = 7
+
+// appLimitedMask picks that field out of the byte: C puts the first bit-field
+// in the lowest bit on little-endian targets and in the highest on big-endian
+// ones (s390x, ppc64).
+var appLimitedMask = func() uint8 {
+	one := uint16(1)
+	if *(*uint8)(unsafe.Pointer(&one)) == 1 {
+		return 0x01
+	}
+	return 0x80
+}()
 
 // TCPDeliveryInfo reads TCP_INFO from the TCP connection under c. c may be the
 // socket itself or a wrapper that exposes it (a TLS connection of either engine,
@@ -52,7 +64,7 @@ func TCPDeliveryInfo(c net.Conn) (d TCPDelivery, ok bool) {
 			BytesAcked: info.Bytes_acked,
 			Busy:       time.Duration(info.Busy_time) * time.Microsecond,
 			NotSent:    info.Notsent_bytes,
-			AppLimited: flags&1 != 0,
+			AppLimited: flags&appLimitedMask != 0,
 		}
 		ok = true
 	})

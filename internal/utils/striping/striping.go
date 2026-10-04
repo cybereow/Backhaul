@@ -131,10 +131,15 @@ func (b *reassemblyBudget) reserve(n int64) bool {
 		atomic.AddInt64(&b.used, -n)
 		return false
 	}
+	b.notePeak(v)
+	return true
+}
+
+func (b *reassemblyBudget) notePeak(v int64) {
 	for {
 		p := atomic.LoadInt64(&b.peak)
 		if v <= p || atomic.CompareAndSwapInt64(&b.peak, p, v) {
-			return true
+			return
 		}
 	}
 }
@@ -144,7 +149,7 @@ func (b *reassemblyBudget) release(n int64) { atomic.AddInt64(&b.used, -n) }
 // force charges n bytes whatever is retained already. It is for the one chunk
 // that cannot wait: the sequence Read is blocked on, whose arrival is what frees
 // the rest.
-func (b *reassemblyBudget) force(n int64) { atomic.AddInt64(&b.used, n) }
+func (b *reassemblyBudget) force(n int64) { b.notePeak(atomic.AddInt64(&b.used, n)) }
 
 func (b *reassemblyBudget) err(need int64) error {
 	return fmt.Errorf("striping: reassembly budget exceeded (%d bytes retained + %d needed > %d limit): an earlier sequence has not arrived or the reader is too far behind",
@@ -262,6 +267,9 @@ type Conn struct {
 	// nextSeqSeen mirrors nextSeq for the leg readers, which cannot take rmu
 	// (Read holds it while it waits for them). Atomic; see advance.
 	nextSeqSeen uint32
+	// forcedSeq is the sequence last admitted over the budget, plus one (see
+	// admit). Atomic.
+	forcedSeq uint64
 	// parkAt is, for each leg reader waiting for reassembly room (see admit), the
 	// sequence it is holding plus one; zero for a reader that is not waiting.
 	// Atomic. parkCh wakes Read when one starts to wait.
@@ -412,8 +420,21 @@ func (c *Conn) readLeg(i int, leg net.Conn) {
 		// Reserve before retaining: from here until Read consumes or drops the
 		// chunk, its payload counts against the reassembly budget.
 		cost := c.chunkCost(length > 0)
-		if !c.admit(i, seq, cost) {
+		keep, ok := c.admit(i, seq, cost)
+		if !ok {
 			return
+		}
+		if !keep {
+			// A copy of a chunk Read already has: take it off the leg and move on.
+			if _, err := io.CopyN(io.Discard, leg, int64(length)); err != nil {
+				if err == io.EOF {
+					err = io.ErrUnexpectedEOF
+				}
+				c.fail(err)
+				return
+			}
+			atomic.AddInt64(&c.legRead[i], int64(length))
+			continue
 		}
 
 		// Borrow a payload buffer from readPool instead of allocating one per
@@ -466,14 +487,19 @@ const parkPoll = 2 * time.Millisecond
 // leg carrying it is never one holding a later chunk, and the chunk itself is
 // admitted whatever is retained. If every leg is holding a later chunk it can no
 // longer arrive at all, and Read fails the flow (see the parkCh case there).
-// admit returns false if the Conn ended first.
-func (c *Conn) admit(i int, seq uint32, cost int64) bool {
+//
+// Only one copy of the awaited sequence is let in over the budget. The reroute
+// watchdog can put the same sequence on several legs; the others, like a copy of
+// anything already delivered, need no room because Read would only drop them:
+// keep is false for those and the caller discards the payload unretained. ok is
+// false if the Conn ended first.
+func (c *Conn) admit(i int, seq uint32, cost int64) (keep, ok bool) {
 	if c.budget.reserve(cost) {
-		return true
+		return true, true
 	}
 	if cost > c.budget.limit {
 		c.fail(c.budget.err(cost))
-		return false
+		return false, false
 	}
 	atomic.StoreUint32(&c.legWaited[i], 1)
 	atomic.StoreUint64(&c.parkAt[i], uint64(seq)+1)
@@ -485,16 +511,22 @@ func (c *Conn) admit(i int, seq uint32, cost int64) bool {
 	t := time.NewTicker(parkPoll)
 	defer t.Stop()
 	for {
-		if seq <= atomic.LoadUint32(&c.nextSeqSeen) {
+		switch next := atomic.LoadUint32(&c.nextSeqSeen); {
+		case seq < next:
+			return false, true // delivered already
+		case seq == next:
+			if atomic.SwapUint64(&c.forcedSeq, uint64(seq)+1) == uint64(seq)+1 {
+				return false, true // another leg's copy was let in
+			}
 			c.budget.force(cost)
-			return true
+			return true, true
 		}
 		if c.budget.reserve(cost) {
-			return true
+			return true, true
 		}
 		select {
 		case <-c.closed:
-			return false
+			return false, false
 		case <-t.C:
 		}
 	}

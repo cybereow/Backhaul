@@ -420,11 +420,11 @@ func (c *Conn) readLeg(i int, leg net.Conn) {
 		// Reserve before retaining: from here until Read consumes or drops the
 		// chunk, its payload counts against the reassembly budget.
 		cost := c.chunkCost(length > 0)
-		keep, ok := c.admit(i, seq, cost)
+		verdict, ok := c.admit(i, seq, cost)
 		if !ok {
 			return
 		}
-		if !keep {
+		if verdict == admitDrop {
 			// A copy of a chunk Read already has: take it off the leg and move on.
 			if _, err := io.CopyN(io.Discard, leg, int64(length)); err != nil {
 				if err == io.EOF {
@@ -448,7 +448,9 @@ func (c *Conn) readLeg(i int, leg net.Conn) {
 				// Never delivered: recycle immediately so a mid-chunk read error
 				// doesn't drop the buffer out of the pool.
 				c.readPool.Put(bufp)
-				c.budget.release(cost)
+				if verdict == admitKeep {
+					c.budget.release(cost)
+				}
 				// The header promised length bytes, so EOF with none of them
 				// is truncation (ReadFull returns bare io.EOF only then).
 				if err == io.EOF {
@@ -460,6 +462,19 @@ func (c *Conn) readLeg(i int, leg net.Conn) {
 		}
 
 		atomic.AddInt64(&c.legRead[i], int64(length))
+		if verdict == admitAwaited {
+			// The awaited chunk, read while the budget was full. Now that all of
+			// it is here it may claim the one admission over the budget; if a
+			// copy on another leg got there first, or it was delivered in the
+			// meantime, this one is not needed.
+			if !c.claimForced(seq) || seq < atomic.LoadUint32(&c.nextSeqSeen) {
+				if ch.base != nil {
+					c.readPool.Put(ch.base)
+				}
+				continue
+			}
+			c.budget.force(cost)
+		}
 		select {
 		case c.chunkCh <- ch:
 		case <-c.closed:
@@ -489,17 +504,21 @@ const parkPoll = 2 * time.Millisecond
 // longer arrive at all, and Read fails the flow (see the parkCh case there).
 //
 // Only one copy of the awaited sequence is let in over the budget. The reroute
-// watchdog can put the same sequence on several legs; the others, like a copy of
-// anything already delivered, need no room because Read would only drop them:
-// keep is false for those and the caller discards the payload unretained. ok is
-// false if the Conn ended first.
-func (c *Conn) admit(i int, seq uint32, cost int64) (keep, ok bool) {
+// watchdog can put the same sequence on several legs; a copy of one that is
+// already in, like a copy of anything already delivered, needs no room because
+// Read would only drop it (admitDrop: the caller discards the payload
+// unretained). Which copy of the awaited sequence gets in is decided only when a
+// copy has arrived whole (admitAwaited: the caller reads the payload into its
+// own buffer, uncharged, and then claims the admission): a copy that stalls
+// halfway must not shut out a healthy one on another leg. ok is false if the
+// Conn ended first.
+func (c *Conn) admit(i int, seq uint32, cost int64) (verdict admission, ok bool) {
 	if c.budget.reserve(cost) {
-		return true, true
+		return admitKeep, true
 	}
 	if cost > c.budget.limit {
 		c.fail(c.budget.err(cost))
-		return false, false
+		return admitDrop, false
 	}
 	atomic.StoreUint32(&c.legWaited[i], 1)
 	atomic.StoreUint64(&c.parkAt[i], uint64(seq)+1)
@@ -513,28 +532,32 @@ func (c *Conn) admit(i int, seq uint32, cost int64) (keep, ok bool) {
 	for {
 		switch next := atomic.LoadUint32(&c.nextSeqSeen); {
 		case seq < next:
-			return false, true // delivered already
+			return admitDrop, true // delivered already
 		case seq == next:
-			// The view of next may be a moment old: Read can have moved on, and
-			// another reader claimed a later sequence, since it was loaded. So
-			// the claim only ever moves forward, and the sequence is looked at
-			// once more before the charge.
-			if !c.claimForced(seq) || seq < atomic.LoadUint32(&c.nextSeqSeen) {
-				return false, true // another leg's copy was let in, or it is delivered by now
+			if atomic.LoadUint64(&c.forcedSeq) > uint64(seq) {
+				return admitDrop, true // another leg's copy is in
 			}
-			c.budget.force(cost)
-			return true, true
+			return admitAwaited, true
 		}
 		if c.budget.reserve(cost) {
-			return true, true
+			return admitKeep, true
 		}
 		select {
 		case <-c.closed:
-			return false, false
+			return admitDrop, false
 		case <-t.C:
 		}
 	}
 }
+
+// admission is what admit decided about a chunk.
+type admission int
+
+const (
+	admitDrop    admission = iota // not needed: discard the payload
+	admitKeep                     // charged to the budget: read and deliver it
+	admitAwaited                  // the awaited chunk with the budget full: read it, then claimForced
+)
 
 // claimForced claims the one over-budget admission of sequence seq. It fails if
 // that sequence, or a later one, has been claimed already: forcedSeq never moves

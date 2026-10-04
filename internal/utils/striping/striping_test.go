@@ -906,6 +906,34 @@ func TestStripedReassemblyBudget(t *testing.T) {
 		}
 	})
 
+	// The awaited chunk is on two legs (a reroute). The first copy stalls after
+	// its header; the whole copy on the other leg must still get in.
+	t.Run("stalledCopyOfTheAwaitedChunkDoesNotShutOutAHealthyOne", func(t *testing.T) {
+		s, peers := newServer(t, 5*cost)
+		ev := readEvents(s)
+		for seq := uint32(1); seq <= 5; seq++ { // fills the budget behind the gap at 0
+			if _, err := peers[0].Write(stripeFrame(seq, payload)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		half := stripeFrame(0, payload)[:headerSize+chunk/2]
+		go peers[0].Write(half) // header and half the payload, then nothing
+		time.Sleep(100 * time.Millisecond)
+		go peers[1].Write(stripeFrame(0, payload))
+		got := 0
+		for got < 6*chunk {
+			select {
+			case e := <-ev:
+				if e.err != nil {
+					t.Fatalf("read: %v (%d/%d bytes)", e.err, got, 6*chunk)
+				}
+				got += len(e.data)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("only %d/%d bytes: the healthy copy of the awaited chunk was shut out", got, 6*chunk)
+			}
+		}
+	})
+
 	t.Run("everyLegAheadOfTheGapFailsPromptly", func(t *testing.T) {
 		s, peers := newServer(t, 5*cost)
 		ev := readEvents(s)

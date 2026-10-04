@@ -490,7 +490,7 @@ func (p *PumpSwapper) PromoteOpened(ctx context.Context, legs []net.Conn, build 
 		closeAll(legs)
 		return err
 	}
-	return p.finishFrozen(ctx, legs, build, func(ctx context.Context) (uint64, error) {
+	return p.finishFrozen(ctx, PromoteHandshakeTimeout, legs, build, func(ctx context.Context) (uint64, error) {
 		return peer, onLeg(ctx, legs[0], func() error { return utils.WriteCount(legs[0], own) })
 	})
 }
@@ -499,16 +499,21 @@ func (p *PumpSwapper) PromoteOpened(ctx context.Context, legs []net.Conn, build 
 // result). A side that must decide whether to accept a swap uses this to reserve
 // the flow first: once FreezeUp succeeded the flow cannot be refused any more, so
 // a failure from here on aborts it.
+//
+// The peer's count is waited for longer than one PromoteHandshakeTimeout: a peer
+// that opened the legs (PromoteOpened) starts its own freeze only when this
+// side's count reaches it, and that freeze may take the whole timeout before
+// its count is sent back.
 func (p *PumpSwapper) PromoteFrozen(ctx context.Context, own uint64, legs []net.Conn, build func() (net.Conn, error)) error {
-	return p.finishFrozen(ctx, legs, build, func(ctx context.Context) (uint64, error) {
+	return p.finishFrozen(ctx, PromoteHandshakeTimeout+PromoteHandshakeTimeout/2, legs, build, func(ctx context.Context) (uint64, error) {
 		return exchangeCounts(ctx, legs[0], own)
 	})
 }
 
 // finishFrozen completes a swap on a frozen flow: counts settles the two
-// committed counts with the peer and returns the peer's.
-func (p *PumpSwapper) finishFrozen(ctx context.Context, legs []net.Conn, build func() (net.Conn, error), counts func(context.Context) (uint64, error)) error {
-	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+// committed counts with the peer, within wait, and returns the peer's.
+func (p *PumpSwapper) finishFrozen(ctx context.Context, wait time.Duration, legs []net.Conn, build func() (net.Conn, error), counts func(context.Context) (uint64, error)) error {
+	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 
 	peer, err := counts(ctx)

@@ -61,14 +61,24 @@ func TestAdmitLetsOneCopyOfTheAwaitedChunkOverTheBudget(t *testing.T) {
 	}
 	c.nextSeq, c.nextSeqSeen = 7, 7
 
-	if keep, ok := c.admit(0, 7, cost); !keep || !ok {
-		t.Fatalf("the awaited chunk: keep=%v ok=%v, want it admitted", keep, ok)
+	// two legs hold a copy of the awaited chunk: both may read it, one gets in
+	for leg := 0; leg < 2; leg++ {
+		if v, ok := c.admit(leg, 7, cost); v != admitAwaited || !ok {
+			t.Fatalf("a copy of the awaited chunk on leg %d: verdict=%v ok=%v, want it read and then claimed", leg, v, ok)
+		}
 	}
-	if keep, ok := c.admit(1, 7, cost); keep || !ok {
-		t.Fatalf("a second copy of the awaited chunk: keep=%v ok=%v, want it discarded", keep, ok)
+	if !c.claimForced(7) {
+		t.Fatal("the first whole copy of the awaited chunk could not claim the admission")
 	}
-	if keep, ok := c.admit(2, 5, cost); keep || !ok {
-		t.Fatalf("a copy of a delivered chunk: keep=%v ok=%v, want it discarded", keep, ok)
+	c.budget.force(cost)
+	if c.claimForced(7) {
+		t.Fatal("a second copy of the awaited chunk claimed the admission too")
+	}
+	if v, ok := c.admit(1, 7, cost); v != admitDrop || !ok {
+		t.Fatalf("a copy arriving after one is in: verdict=%v ok=%v, want it discarded", v, ok)
+	}
+	if v, ok := c.admit(2, 5, cost); v != admitDrop || !ok {
+		t.Fatalf("a copy of a delivered chunk: verdict=%v ok=%v, want it discarded", v, ok)
 	}
 	if used, peak := c.budget.used, c.budget.peak; used != 6*cost || peak != 6*cost {
 		t.Fatalf("retained %d (peak %d), want the %d budget plus exactly one chunk", used, peak, 5*cost)
@@ -76,8 +86,8 @@ func TestAdmitLetsOneCopyOfTheAwaitedChunkOverTheBudget(t *testing.T) {
 
 	// once Read moves on, the next awaited chunk gets the same treatment
 	c.advance()
-	if keep, ok := c.admit(1, 8, cost); !keep || !ok {
-		t.Fatalf("the next awaited chunk: keep=%v ok=%v, want it admitted", keep, ok)
+	if v, ok := c.admit(1, 8, cost); v != admitAwaited || !ok || !c.claimForced(8) {
+		t.Fatalf("the next awaited chunk: verdict=%v ok=%v, want it read and admitted", v, ok)
 	}
 
 	// A reader that acts on an old view of the awaited sequence cannot take the

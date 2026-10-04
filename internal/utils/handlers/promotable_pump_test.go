@@ -804,6 +804,26 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 		}
 	})
 
+	// The side that sent its count first waits through the peer's freeze: a peer
+	// that opened the legs only starts freezing when that count reaches it.
+	t.Run("frozen-side-waits-through-the-peers-freeze", func(t *testing.T) {
+		old := PromoteHandshakeTimeout
+		PromoteHandshakeTimeout = 300 * time.Millisecond
+		defer func() { PromoteHandshakeTimeout = old }()
+
+		ctx, _ := testCtx(t)
+		a, _ := streamPair(t)
+		s := startSide(t, ctx, a)
+		leg, legPeer := tcpConnPair(t)
+		e := runPromote(s.pump, ctx, []net.Conn{leg}, build)
+		readExact(t, legPeer, 8)           // its count
+		time.Sleep(380 * time.Millisecond) // the peer's freeze took more than one timeout's worth
+		legPeer.Write(make([]byte, 8))
+		if err := waitErr(t, e, "promote"); err != nil {
+			t.Fatalf("the frozen side gave up on a peer that was still freezing: %v", err)
+		}
+	})
+
 	// The side that opened the legs freezes nothing until the peer has answered:
 	// a peer that never gets all its legs costs the flow nothing.
 	t.Run("opener-silent-peer-stays-plain", func(t *testing.T) {

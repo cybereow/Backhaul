@@ -93,9 +93,9 @@ type promoRig struct {
 
 func newPromoRig(t *testing.T, parity int, timeout time.Duration) *promoRig {
 	t.Helper()
-	old := handlers.PromoteHandshakeTimeout
-	handlers.PromoteHandshakeTimeout = timeout
-	t.Cleanup(func() { handlers.PromoteHandshakeTimeout = old })
+	old, oldLegs := handlers.PromoteHandshakeTimeout, handlers.LegAssemblyTimeout
+	handlers.PromoteHandshakeTimeout, handlers.LegAssemblyTimeout = timeout, timeout
+	t.Cleanup(func() { handlers.PromoteHandshakeTimeout, handlers.LegAssemblyTimeout = old, oldLegs })
 
 	h := newLCHarness(t, func(c *WsMuxConfig) {
 		c.StripeFactor = 2

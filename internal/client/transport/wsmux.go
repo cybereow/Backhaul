@@ -297,7 +297,7 @@ func (c *WsMuxTransport) addStripeLeg(stream *smux.Stream, kind byte, promoFlowI
 		}
 		// The timer is bound to this group instance, not just its numeric ID, so
 		// it can never abort a later group that reuses the ID.
-		g.timer = time.AfterFunc(10*time.Second, func() {
+		g.timer = time.AfterFunc(handlers.LegAssemblyTimeout, func() {
 			c.abortStripeGroup(groupID, g)
 		})
 		c.stripeGroups[groupID] = g

@@ -24,6 +24,12 @@ var errTunnelNoAcks = errors.New("promotable pump: replay needs a tunnel that ca
 // only so tests can shorten it; production never changes it.
 var PromoteHandshakeTimeout = 10 * time.Second
 
+// LegAssemblyTimeout is how long the side that accepts the legs of a striped
+// group waits, from the first leg, for the rest before it gives the group up.
+// The opening side counts it into how long a peer may take to answer (see
+// PromoteOpened). A variable only so tests can shorten it.
+var LegAssemblyTimeout = 10 * time.Second
+
 // ErrPromoteUnavailable means the flow can no longer (or not right now) be
 // promoted: a direction already ended, it was aborted, or a freeze is pending.
 var ErrPromoteUnavailable = errors.New("promotable pump: flow cannot be promoted")
@@ -457,11 +463,17 @@ func (p *PumpSwapper) Promote(ctx context.Context, legs []net.Conn, build func()
 // for as long as that takes - or, past the timeout, end it. So this side waits
 // for the peer's count before it freezes anything, the flow still running: if
 // the count does not come, the legs are closed and the flow goes on plain as if
-// nothing had been tried. The wait outlasts the peer's own wait for the legs,
-// so a peer that gives up is seen to (it closes leg 0) rather than timed out on.
+// nothing had been tried.
+//
+// The wait covers everything a live peer may take before its count is here: its
+// wait for the legs (LegAssemblyTimeout), then its own freeze
+// (PromoteHandshakeTimeout), then the way back. Giving up sooner would close the
+// legs under a peer that has just frozen its side, and a peer whose swap fails
+// after its freeze ends the flow. A peer that gives up itself closes leg 0, so
+// it is seen to rather than timed out on.
 func (p *PumpSwapper) PromoteOpened(ctx context.Context, legs []net.Conn, build func() (net.Conn, error)) error {
 	var peer uint64
-	wctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout+PromoteHandshakeTimeout/2)
+	wctx, cancel := context.WithTimeout(ctx, LegAssemblyTimeout+PromoteHandshakeTimeout+PromoteHandshakeTimeout/2)
 	err := onLeg(wctx, legs[0], func() (err error) {
 		peer, err = utils.ReadCount(legs[0])
 		return err

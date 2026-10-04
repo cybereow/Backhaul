@@ -839,6 +839,30 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 		}
 	})
 
+	// A peer may use its whole wait for the legs and then its whole freeze
+	// before its count comes; the opener is still there for it.
+	t.Run("opener-waits-through-the-peers-phases", func(t *testing.T) {
+		oldH, oldL := PromoteHandshakeTimeout, LegAssemblyTimeout
+		PromoteHandshakeTimeout, LegAssemblyTimeout = 300*time.Millisecond, 300*time.Millisecond
+		defer func() { PromoteHandshakeTimeout, LegAssemblyTimeout = oldH, oldL }()
+
+		ctx, _ := testCtx(t)
+		a, _ := streamPair(t)
+		s := startSide(t, ctx, a)
+		leg, legPeer := tcpConnPair(t)
+		newSide, _ := tcpConnPair(t)
+		e := make(chan error, 1)
+		go func() {
+			e <- s.pump.PromoteOpened(ctx, []net.Conn{leg}, func() (net.Conn, error) { return newSide, nil })
+		}()
+		time.Sleep(550 * time.Millisecond) // legs just in time, then a freeze that took nearly all it may
+		legPeer.Write(make([]byte, 8))
+		readExact(t, legPeer, 8)
+		if err := waitErr(t, e, "promote"); err != nil {
+			t.Fatalf("the opener gave up on a peer that was still within its time: %v", err)
+		}
+	})
+
 	t.Run("opener-answers-the-peer", func(t *testing.T) {
 		ctx, _ := testCtx(t)
 		a, b := streamPair(t)

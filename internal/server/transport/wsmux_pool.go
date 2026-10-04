@@ -25,6 +25,15 @@ type pooledSession struct {
 	// not yet returned (see openPlainLegPS). It is guarded by
 	// WsMuxTransport.plainSelectMu, never read or written without it.
 	pendingOpens int
+
+	// Capacity-aware placement (see wsmux_capacity.go). host and conn are fixed
+	// at registration; capLast belongs to capacityLoop alone; slow and capEst are
+	// what it publishes.
+	host    string        // domain the client dialed for this connection (the CDN identity when unknown)
+	conn    net.Conn      // the socket under the session, for TCP_INFO; nil when unknown
+	capLast capSample     // the previous look at the socket
+	capEst  atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
+	slow    atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
 }
 
 // Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;
@@ -57,7 +66,18 @@ const (
 // registerSession adds a pool session to the live registry and returns its
 // wrapper so the caller can start probing it. unregisterSession removes it.
 func (s *WsMuxTransport) registerSession(session *smux.Session, halfClose bool) *pooledSession {
-	ps := &pooledSession{session: session, halfClose: halfClose, cdn: cdnKey(session.RemoteAddr()), born: time.Now(), maxAge: s.config.MaxConnAge}
+	return s.registerCarriedSession(tunnelSession{session: session, halfClose: halfClose})
+}
+
+// registerCarriedSession is registerSession for a session whose socket and
+// dialed domain are known, which is what capacity-aware placement measures and
+// groups by.
+func (s *WsMuxTransport) registerCarriedSession(ts tunnelSession) *pooledSession {
+	session := ts.session
+	ps := &pooledSession{session: session, halfClose: ts.halfClose, cdn: cdnKey(session.RemoteAddr()), born: time.Now(), maxAge: s.config.MaxConnAge, conn: ts.conn, host: ts.host}
+	if ps.host == "" {
+		ps.host = ps.cdn
+	}
 	s.sessionsMu.Lock()
 	s.sessions = append(s.sessions, ps)
 	s.sessionsMu.Unlock()
@@ -142,7 +162,11 @@ func ageFactor(age, maxAge time.Duration) float64 {
 	return 1 + ageWeight*frac
 }
 
+// agedScore applies the two per-session factors to a load x RTT score: the age
+// bias above, and the charge for a connection measured to deliver far less than
+// the best one in the pool (see wsmux_capacity.go).
 func agedScore(base float64, ps *pooledSession) float64 {
+	base *= ps.slowness()
 	if ps.maxAge <= 0 {
 		return base
 	}

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"math"
 	"sort"
 	"sync/atomic"
 	"time"
@@ -202,6 +203,12 @@ func (s *WsMuxTransport) poolSnapshot(v poolViews) map[string]interface{} {
 		Sessions int     `json:"sessions"`
 		Streams  int     `json:"streams"`
 		RTTms    float64 `json:"rtt_ms,omitempty"`
+		// Capacity-aware placement: the domain these connections were dialed
+		// for, the upload they were measured (or assumed, from their domain) to
+		// deliver, and how many times dearer that makes them to place a flow on.
+		Host      string  `json:"host,omitempty"`
+		UpEstMbps float64 `json:"up_est_mbps,omitempty"`
+		Penalty   float64 `json:"penalty,omitempty"`
 	}
 
 	s.sessionsMu.Lock()
@@ -225,6 +232,13 @@ func (s *WsMuxTransport) poolSnapshot(v poolViews) map[string]interface{} {
 		totalStreams += n
 		if rtt := ps.rtt.Load(); rtt > 0 {
 			st.RTTms = float64(rtt) / float64(time.Millisecond)
+		}
+		st.Host = ps.host
+		if e := ps.capEst.Load(); e > 0 {
+			st.UpEstMbps = math.Round(float64(e)*8/1e6*10) / 10
+		}
+		if p := ps.slowness(); p > 1 {
+			st.Penalty = math.Round(p*10) / 10
 		}
 	}
 

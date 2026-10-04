@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -207,6 +208,8 @@ func (g *wsGeneration) join(timeout time.Duration) bool {
 type tunnelSession struct {
 	session   *smux.Session
 	halfClose bool
+	conn      net.Conn // the socket the session runs on, for capacity sampling; may be nil
+	host      string   // domain the client dialed, from the upgrade request
 }
 
 type WsMuxTransport struct {
@@ -891,6 +894,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 				}
 
 				g.start(func() { s.dispatchLoop(g) })
+				g.start(func() { s.capacityLoop(g) })
 
 			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
 				// Track the raw socket before smux wraps it, so a constructor
@@ -926,7 +930,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 				}
 				g.release(netConn)
 				select {
-				case s.tunnelChannel <- tunnelSession{session: session, halfClose: s.config.HalfClose}: // ok
+				case s.tunnelChannel <- tunnelSession{session: session, halfClose: s.config.HalfClose, conn: netConn, host: hostKey(r.Host)}: // ok
 				default:
 					s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
 					// Close the smux session, not just the raw conn: a bare
@@ -1163,7 +1167,7 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 			atomic.AddInt32(&s.sessionCounter, 1)
 			atomic.AddInt32(&s.admittedSessions, 1)
 
-			ps := s.registerSession(session, ts.halfClose)
+			ps := s.registerCarriedSession(ts)
 			// The close watcher settles the session's counter and registry entry
 			// exactly once, however the session ends (peer, rotation, or the
 			// generation closing it). It is a worker of the generation, so Restart

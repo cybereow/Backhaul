@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -800,6 +801,73 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 		s.u.Write(second)
 		if got := readExact(t, b, len(second)); !bytes.Equal(got, second) {
 			t.Fatal("flow did not keep running plain")
+		}
+	})
+
+	// The side that opened the legs freezes nothing until the peer has answered:
+	// a peer that never gets all its legs costs the flow nothing.
+	t.Run("opener-silent-peer-stays-plain", func(t *testing.T) {
+		ctx, _ := testCtx(t)
+		a, b := streamPair(t)
+		s := startSide(t, ctx, a)
+		leg, legPeer := tcpConnPair(t)
+		pctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+		defer cancel()
+		e := make(chan error, 1)
+		go func() { e <- s.pump.PromoteOpened(pctx, []net.Conn{leg}, build) }()
+
+		during := genPayload(300) // the upload is not held while the peer is awaited
+		s.u.Write(during)
+		if got := readExact(t, b, len(during)); !bytes.Equal(got, during) {
+			t.Fatal("upload was held while waiting for the peer")
+		}
+		if err := waitErr(t, e, "promote"); err == nil {
+			t.Fatal("promotion succeeded against a silent peer")
+		}
+		if got, err := readAllDeadline(legPeer); isTimeout(err) || len(got) != 0 {
+			t.Fatalf("leg peer: %d bytes err=%v, want a closed leg and no count", len(got), err)
+		}
+		select {
+		case <-s.pump.DoneWait():
+			t.Fatal("a peer that never answered must leave the flow running")
+		default:
+		}
+		after := genPayload(20)
+		s.u.Write(after)
+		if got := readExact(t, b, len(after)); !bytes.Equal(got, after) {
+			t.Fatal("flow did not keep running plain")
+		}
+	})
+
+	t.Run("opener-answers-the-peer", func(t *testing.T) {
+		ctx, _ := testCtx(t)
+		a, b := streamPair(t)
+		s := startSide(t, ctx, a)
+		leg, legPeer := tcpConnPair(t)
+		newSide, newPeer := tcpConnPair(t)
+		e := make(chan error, 1)
+		go func() {
+			e <- s.pump.PromoteOpened(ctx, []net.Conn{leg}, func() (net.Conn, error) { return newSide, nil })
+		}()
+
+		before := genPayload(400)
+		s.u.Write(before)
+		if got := readExact(t, b, len(before)); !bytes.Equal(got, before) {
+			t.Fatal("upload was held while waiting for the peer")
+		}
+		expectNoData(t, legPeer, "the opener's count before the peer's")
+
+		legPeer.Write(make([]byte, 8)) // the peer has its legs: it sent nothing on the old tunnel
+		if got := binary.BigEndian.Uint64(readExact(t, legPeer, 8)); got != uint64(len(before)) {
+			t.Fatalf("opener's count = %d, want the %d bytes it sent on the old tunnel", got, len(before))
+		}
+		if err := waitErr(t, e, "promote"); err != nil {
+			t.Fatalf("promotion failed: %v", err)
+		}
+		after := genPayload(50)
+		s.u.Write(after)
+		if got := readExact(t, newPeer, len(after)); !bytes.Equal(got, after) {
+			t.Fatal("upload did not move to the new tunnel")
 		}
 	})
 }

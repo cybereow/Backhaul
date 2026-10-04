@@ -278,6 +278,11 @@ func (c *WsMuxTransport) addStripeLeg(stream *smux.Stream, kind byte, promoFlowI
 		stream.Close()
 		return nil, false
 	}
+	if parity == 0 {
+		// Reading the header opened this leg's full window; close it down again
+		// before the server fills it while the other legs are still on their way.
+		striping.HoldLeg(stream)
+	}
 
 	c.stripeGroupsMu.Lock()
 	g, ok := c.stripeGroups[groupID]

@@ -741,10 +741,11 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 		conns[i] = st
 	}
 
-	// Freeze, exchange the byte counts on raw leg 0 (no striped reader exists
-	// yet), then build the wrapper and install it. A failure before the freeze
-	// leaves the flow plain; a later one aborts it (see PumpSwapper.Promote).
-	err = swapper.Promote(ctx, conns, func() (net.Conn, error) {
+	// Wait for the client's byte count on raw leg 0 (it sends it once it has
+	// every leg), then freeze, answer with ours, build the wrapper and install
+	// it. A failure before the freeze leaves the flow plain; a later one aborts
+	// it (see PumpSwapper.PromoteOpened).
+	err = swapper.PromoteOpened(ctx, conns, func() (net.Conn, error) {
 		if s.config.StripeParity > 0 {
 			return striping.NewFEC(conns, striping.DefaultChunkSize, s.config.StripeFactor, s.config.StripeParity)
 		}

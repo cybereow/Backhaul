@@ -451,15 +451,55 @@ func (p *PumpSwapper) Promote(ctx context.Context, legs []net.Conn, build func()
 	return p.PromoteFrozen(ctx, own, legs, build)
 }
 
+// PromoteOpened is Promote for the side that opened the legs. The other side
+// answers on leg 0 only once every leg has reached it, and a leg that is slow to
+// get there (its tunnel connection is stalling) would hold a flow frozen first
+// for as long as that takes - or, past the timeout, end it. So this side waits
+// for the peer's count before it freezes anything, the flow still running: if
+// the count does not come, the legs are closed and the flow goes on plain as if
+// nothing had been tried. The wait outlasts the peer's own wait for the legs,
+// so a peer that gives up is seen to (it closes leg 0) rather than timed out on.
+func (p *PumpSwapper) PromoteOpened(ctx context.Context, legs []net.Conn, build func() (net.Conn, error)) error {
+	var peer uint64
+	wctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout+PromoteHandshakeTimeout/2)
+	err := onLeg(wctx, legs[0], func() (err error) {
+		peer, err = utils.ReadCount(legs[0])
+		return err
+	})
+	cancel()
+	if err != nil {
+		closeAll(legs)
+		return err
+	}
+	fctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	own, err := p.FreezeUp(fctx)
+	cancel()
+	if err != nil {
+		closeAll(legs)
+		return err
+	}
+	return p.finishFrozen(ctx, legs, build, func(ctx context.Context) (uint64, error) {
+		return peer, onLeg(ctx, legs[0], func() error { return utils.WriteCount(legs[0], own) })
+	})
+}
+
 // PromoteFrozen finishes a swap whose upload FreezeUp already stopped (own is its
 // result). A side that must decide whether to accept a swap uses this to reserve
 // the flow first: once FreezeUp succeeded the flow cannot be refused any more, so
 // a failure from here on aborts it.
 func (p *PumpSwapper) PromoteFrozen(ctx context.Context, own uint64, legs []net.Conn, build func() (net.Conn, error)) error {
+	return p.finishFrozen(ctx, legs, build, func(ctx context.Context) (uint64, error) {
+		return exchangeCounts(ctx, legs[0], own)
+	})
+}
+
+// finishFrozen completes a swap on a frozen flow: counts settles the two
+// committed counts with the peer and returns the peer's.
+func (p *PumpSwapper) finishFrozen(ctx context.Context, legs []net.Conn, build func() (net.Conn, error), counts func(context.Context) (uint64, error)) error {
 	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
 	defer cancel()
 
-	peer, err := exchangeCounts(ctx, legs[0], own)
+	peer, err := counts(ctx)
 	if err == nil {
 		var striped net.Conn
 		if striped, err = build(); err == nil {
@@ -490,25 +530,36 @@ func closeAll(conns []net.Conn) {
 // exchangeCounts swaps the two 8-byte committed counts on a raw leg, under a
 // deadline derived from ctx that is cleared before the leg carries data.
 func exchangeCounts(ctx context.Context, leg net.Conn, own uint64) (uint64, error) {
+	var peer uint64
+	err := onLeg(ctx, leg, func() (err error) {
+		if err = utils.WriteCount(leg, own); err == nil {
+			peer, err = utils.ReadCount(leg)
+		}
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return peer, nil
+}
+
+// onLeg runs one step of the handshake on a raw leg, bounded by ctx's deadline
+// and cancellation. The leg's deadline is cleared again if the step succeeded.
+func onLeg(ctx context.Context, leg net.Conn, step func() error) error {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = leg.SetDeadline(dl)
 	}
 	stop := context.AfterFunc(ctx, func() { _ = leg.SetDeadline(time.Unix(1, 0)) })
-
-	var peer uint64
-	err := utils.WriteCount(leg, own)
-	if err == nil {
-		peer, err = utils.ReadCount(leg)
-	}
+	err := step()
 	stop()
 	if err == nil {
 		err = ctx.Err()
 	}
 	if err != nil {
-		return 0, err
+		return err
 	}
 	_ = leg.SetDeadline(time.Time{})
-	return peer, nil
+	return nil
 }
 
 // writeFull writes all of b, returning how many bytes were accepted.

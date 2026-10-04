@@ -201,8 +201,9 @@ func TestWSMuxPromotionHandshake(t *testing.T) {
 	for _, parity := range []int{0, 1} {
 		parity := parity
 		t.Run(fmt.Sprintf("parity=%d", parity), func(t *testing.T) {
-			// The server writes its committed old-tunnel count first; the count
-			// must be exactly the bytes the scripted client read on the plain stream.
+			// The server answers the client's count with its own committed
+			// old-tunnel count, which must be exactly the bytes the scripted client
+			// read on the plain stream.
 			readOwn := func(t *testing.T, legs []promoLeg, want int) {
 				t.Helper()
 				_ = legs[0].st.SetReadDeadline(time.Now().Add(promoWait))
@@ -213,39 +214,55 @@ func TestWSMuxPromotionHandshake(t *testing.T) {
 				_ = legs[0].st.SetReadDeadline(time.Time{})
 			}
 
-			t.Run("stalled count peer", func(t *testing.T) {
+			// The flow is still running plain, both ways.
+			stillPlain := func(t *testing.T, user net.Conn, flow promoFlow) {
+				t.Helper()
+				more := promoPayload(20000, 5)
+				if _, err := user.Write(more); err != nil {
+					t.Fatal(err)
+				}
+				_ = flow.st.SetReadDeadline(time.Now().Add(promoWait))
+				got := make([]byte, len(more))
+				if _, err := io.ReadFull(flow.st, got); err != nil || !bytes.Equal(got, more) {
+					t.Fatalf("plain upload after a failed attempt: %v", err)
+				}
+				if _, err := flow.st.Write([]byte("still alive")); err != nil {
+					t.Fatalf("download direction: %v", err)
+				}
+				buf := make([]byte, len("still alive"))
+				if _, err := io.ReadFull(user, buf); err != nil || string(buf) != "still alive" {
+					t.Fatalf("user did not receive the plain download: %q %v", buf, err)
+				}
+			}
+
+			t.Run("silent peer leaves the flow plain", func(t *testing.T) {
 				r := newPromoRig(t, parity, 400*time.Millisecond)
-				user, flow, legs, sent := r.start(t)
-				readOwn(t, legs, len(sent))
-				// The peer never answers: the handshake gives up, the post-freeze
-				// failure aborts the flow and closes every resource.
-				expectClosed(t, "user connection", user)
-				expectClosed(t, "plain stream", flow.st)
+				user, flow, legs, _ := r.start(t)
+				// The peer never answers (a leg never reached it): the server gives
+				// up having frozen nothing, and closes the legs.
 				for i, l := range legs {
 					expectClosed(t, fmt.Sprintf("leg %d", i), l.st)
 				}
-				r.waitFlowsGone(t)
+				stillPlain(t, user, flow)
 			})
 
-			t.Run("leg closed before the count exchange", func(t *testing.T) {
+			t.Run("legs closed before the count exchange leave the flow plain", func(t *testing.T) {
 				r := newPromoRig(t, parity, promoWait)
 				user, flow, legs, _ := r.start(t)
 				for _, l := range legs {
 					l.st.Close()
 				}
-				expectClosed(t, "user connection", user)
-				expectClosed(t, "plain stream", flow.st)
-				r.waitFlowsGone(t)
+				stillPlain(t, user, flow)
 			})
 
 			t.Run("installed then legs closed", func(t *testing.T) {
 				r := newPromoRig(t, parity, promoWait)
 				user, flow, legs, sent := r.start(t)
-				readOwn(t, legs, len(sent))
 				// Our own committed old count: nothing was ever sent downstream.
 				if err := utils.WriteCount(legs[0].st, 0); err != nil {
 					t.Fatal(err)
 				}
+				readOwn(t, legs, len(sent))
 				// Only now build the striped wrapper on the scripted side (one
 				// reader per leg), and prove the server switched over: the
 				// upload now arrives on the group and not on the plain stream.
@@ -285,8 +302,7 @@ func TestWSMuxPromotionHandshake(t *testing.T) {
 				// The 10 second bound is not what ends this one: cancelling the
 				// generation does, and Restart waits for the worker.
 				r := newPromoRig(t, parity, 10*time.Second)
-				user, _, legs, sent := r.start(t)
-				readOwn(t, legs, len(sent))
+				user, _, _, _ := r.start(t)
 				done := make(chan struct{})
 				go func() { r.h.s.Restart(); close(done) }()
 				lcWaitClosed(t, "Restart to return with a promotion stalled", done)

@@ -65,59 +65,31 @@ const headerSize = 8 // 4 bytes sequence number + 4 bytes payload length
 // occasionally slip through as a short read).
 const endMarkerLen = 0xFFFFFFFF
 
-// Adaptive scheduling tunables. In-order reassembly makes a striped flow only
-// as fast as its slowest leg can deliver the sequence number the reader is
-// waiting on: a single throttled CDN leg (a common asymmetry on the egress
-// direction) drags the whole flow down to its rate even though the other legs
-// are idle. These make the striper route around such a leg the way plain
-// per-connection load-balancing naturally does.
+// Reroute tunables. A leg that stops moving altogether must not strand the
+// chunk it is holding: the reader would wait on that sequence number until the
+// flow times out.
 const (
-	// legEWMAAlpha weights the newest per-write throughput sample into each
-	// leg's running estimate. High enough to react to a leg that suddenly
-	// throttles within a few chunks, low enough not to flap on one slow write.
-	legEWMAAlpha = 0.3
-	// quarantineFraction is the share of the fastest leg's throughput below
-	// which a leg is quarantined - it stops being handed new sequential chunks
-	// so it can't become a head-of-line stall point. A leg carrying a quarter of
-	// the best leg's rate hurts more (as a reorder-buffer gate) than it helps.
-	quarantineFraction = 0.25
-	// quarantineProbeEvery is how often a quarantined leg is allowed to take one
-	// chunk again, so a leg whose throttling lifted can re-measure and rejoin.
-	quarantineProbeEvery = 500 * time.Millisecond
 	// resendTimeout is how long a chunk may sit in flight on one leg before the
-	// same sequence number is re-sent on a healthy leg (the receiver dedups by
-	// seq). Only trips for a near-stalled leg - a merely slow leg moves a chunk
-	// in microseconds - so reroute costs a little duplicate bandwidth only when a
-	// leg has actually frozen, not on every slow write.
+	// same sequence number is re-sent on another leg (the receiver dedups by
+	// seq). It trips for a leg that has stalled, or one whose receiver is making
+	// it wait for the others; either way the copy costs one chunk.
 	resendTimeout = 1500 * time.Millisecond
 	// healthTick is how often the reroute watchdog scans for stuck chunks.
 	healthTick = 200 * time.Millisecond
 )
 
-// legSched is the per-leg scheduling state the adaptive write path keeps, all
-// guarded by Conn.schedMu. rate is the EWMA throughput estimate. A leg is held
-// out of new sequential work for either of two independent reasons, tracked
-// separately so one can't mask the other:
+// legSched tracks the chunk a leg is currently writing, so the watchdog can
+// re-send it elsewhere if the leg stalls. Guarded by Conn.schedMu.
 //
-//   - slowQuar: a *rate* decision - the leg is persistently slower than its
-//     peers AND the write queue is genuinely backlogged (a bulk transfer). This
-//     is the throughput-aggregation path; it is deliberately never engaged for a
-//     low-rate, bursty flow (a game, an SSH session), whose per-write rate
-//     samples are noise and whose queue is near-empty, so such a flow behaves
-//     exactly like the plain work-stealing striper and can't be reordered into a
-//     reassembly stall.
-//   - frozen: a *liveness* decision - scanStuck saw this leg stuck on one chunk
-//     past resendTimeout, so its sequence number was rerouted onto a healthy leg
-//     and no new work goes here until it proves alive again (a successful write
-//     clears it, see recordRate). This one always applies, bulk or interactive,
-//     because a frozen leg is a real problem for any flow.
-//
-// The in* fields track the chunk currently being written so the watchdog can
-// re-send it elsewhere if the leg freezes.
+// There is deliberately no ranking of legs here. Each worker takes the next
+// chunk when its leg's transport accepts one, so a leg carries what it can
+// deliver, and how far a leg may run behind the others is bounded by the
+// receiving side (see window.go). An earlier version also kept slow legs out of
+// the sequential path by timing each Write; but a Write into a transport window
+// returns at once until the window is full and then blocks, whatever the path
+// carries, so those timings ranked equal legs apart at random and left all but
+// one of them idle.
 type legSched struct {
-	rate     float64
-	slowQuar bool
-	frozen   bool
 	inSeq    uint32
 	inData   []byte
 	inFly    bool
@@ -127,10 +99,10 @@ type legSched struct {
 
 // reassemblyBudgetBytes is the per-connection ceiling on memory retained for
 // reassembly: raw/decoded payload waiting in the reorder buffer, payload held in
-// the hand-off channel, and (FEC) incomplete shards. Exceeding it closes the flow
-// with a descriptive error instead of growing without bound or blocking every
-// leg (which could keep the one missing sequence from ever arriving). With the
-// 16KiB DefaultChunkSize even a 256-shard FEC row (4MiB) fits.
+// the hand-off channel, and (FEC) incomplete shards. A striped leg that would
+// exceed it waits (see Conn.admit); an FEC flow that exceeds it is closed with a
+// descriptive error. With the 16KiB DefaultChunkSize even a 256-shard FEC row
+// (4MiB) fits.
 // ponytail: fixed initial ceiling; make it configurable if real traffic needs a
 // deeper reorder window.
 const reassemblyBudgetBytes = 32 << 20
@@ -168,6 +140,11 @@ func (b *reassemblyBudget) reserve(n int64) bool {
 }
 
 func (b *reassemblyBudget) release(n int64) { atomic.AddInt64(&b.used, -n) }
+
+// force charges n bytes whatever is retained already. It is for the one chunk
+// that cannot wait: the sequence Read is blocked on, whose arrival is what frees
+// the rest.
+func (b *reassemblyBudget) force(n int64) { atomic.AddInt64(&b.used, n) }
 
 func (b *reassemblyBudget) err(need int64) error {
 	return fmt.Errorf("striping: reassembly budget exceeded (%d bytes retained + %d needed > %d limit): an earlier sequence has not arrived or the reader is too far behind",
@@ -257,12 +234,12 @@ type Conn struct {
 	wmu        sync.Mutex // guards writeSeq only; queueing itself is lock-free via the channel
 	writeSeq   uint32
 	writeQueue chan writeJob
-	// resendQueue is a priority reroute path: chunks a frozen leg is stuck on
-	// are re-queued here (by the watchdog) and picked up by a healthy leg ahead
+	// resendQueue is a priority reroute path: chunks a stalled leg is stuck on
+	// are re-queued here (by the watchdog) and picked up by another leg ahead
 	// of new work, so a stalled sequence number reaches the reader without
-	// waiting out the frozen leg.
+	// waiting out the stuck leg.
 	resendQueue chan writeJob
-	// schedMu guards sched, the per-leg adaptive scheduling state.
+	// schedMu guards sched, the chunk each leg has in flight.
 	schedMu sync.Mutex
 	sched   []legSched
 	// chunkPool recycles chunkSize payload buffers across the write path so a
@@ -282,8 +259,19 @@ type Conn struct {
 	// the other side's Write needs to even start sending it.
 	rmu     sync.Mutex
 	nextSeq uint32
-	pending map[uint32]chunk
-	readBuf []byte
+	// nextSeqSeen mirrors nextSeq for the leg readers, which cannot take rmu
+	// (Read holds it while it waits for them). Atomic; see advance.
+	nextSeqSeen uint32
+	// parkAt is, for each leg reader waiting for reassembly room (see admit), the
+	// sequence it is holding plus one; zero for a reader that is not waiting.
+	// Atomic. parkCh wakes Read when one starts to wait.
+	parkAt []uint64
+	// legWaited is set for a leg whose reader had to wait for room since
+	// windowLoop last looked. Atomic.
+	legWaited []uint32
+	parkCh    chan struct{}
+	pending   map[uint32]chunk
+	readBuf   []byte
 	// readBufBase is the pooled backing buffer for readBuf. It's returned to
 	// readPool once readBuf drains to empty, so the next inbound chunk can reuse
 	// it. Guarded by rmu, like the rest of the reassembly state.
@@ -291,6 +279,9 @@ type Conn struct {
 	readCost    int64 // budget charge of the chunk behind readBuf
 	// budget bounds everything retained for reassembly (see reassemblyBudgetBytes).
 	budget reassemblyBudget
+	// legRead counts the payload bytes each leg delivered since windowLoop last
+	// looked. Atomic.
+	legRead []int64
 	// gap is the absolute deadline state of the gap Read is waiting on.
 	gap gapState
 	// readTimer is the reusable gap timer for Read's blocking loop, created
@@ -358,7 +349,11 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		legsDone:    make(chan struct{}),
 		totalKnown:  make(chan struct{}),
 		closed:      make(chan struct{}),
+		parkAt:      make([]uint64, len(legs)),
+		legWaited:   make([]uint32, len(legs)),
+		parkCh:      make(chan struct{}, 1),
 		sched:       make([]legSched, len(legs)),
+		legRead:     make([]int64, len(legs)),
 	}
 	c.chunkCh = make(chan chunk, c.budget.depth(len(legs)*8, c.chunkCost(true)))
 	c.chunkPool.New = func() any {
@@ -371,14 +366,16 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 	}
 	for i, leg := range legs {
 		c.writersWG.Add(1)
-		go c.readLeg(leg)
+		go c.readLeg(i, leg)
 		go c.writeLeg(i, leg)
 	}
 	go c.rerouteWatchdog()
+	go c.windowLoop()
 	return c
 }
 
-func (c *Conn) readLeg(leg net.Conn) {
+func (c *Conn) readLeg(i int, leg net.Conn) {
+	HoldLeg(leg)
 	header := make([]byte, headerSize)
 	for {
 		if _, err := io.ReadFull(leg, header); err != nil {
@@ -413,12 +410,9 @@ func (c *Conn) readLeg(leg net.Conn) {
 		}
 
 		// Reserve before retaining: from here until Read consumes or drops the
-		// chunk, its payload counts against the reassembly budget. Failing loudly
-		// beats blocking - a parked leg could be the one carrying the missing
-		// sequence.
+		// chunk, its payload counts against the reassembly budget.
 		cost := c.chunkCost(length > 0)
-		if !c.budget.reserve(cost) {
-			c.fail(c.budget.err(cost))
+		if !c.admit(i, seq, cost) {
 			return
 		}
 
@@ -444,6 +438,7 @@ func (c *Conn) readLeg(leg net.Conn) {
 			}
 		}
 
+		atomic.AddInt64(&c.legRead[i], int64(length))
 		select {
 		case c.chunkCh <- ch:
 		case <-c.closed:
@@ -453,6 +448,74 @@ func (c *Conn) readLeg(leg net.Conn) {
 			return
 		}
 	}
+}
+
+// parkPoll is how often a parked leg reader looks for reassembly room again.
+// ponytail: a poll, at most this much added latency per pause; wake parked
+// readers from release() if it ever shows up in a profile.
+const parkPoll = 2 * time.Millisecond
+
+// admit charges the reassembly budget for chunk seq, which leg i is about to
+// read. When the budget is full the leg waits here, its payload still in the
+// transport, so its sender is held back by the transport's own flow control:
+// the legs that ran ahead pause until the one carrying the sequence Read is
+// waiting for catches up, instead of the flow dying of a leg that fell behind
+// for a moment.
+//
+// Waiting cannot keep that sequence out. A leg sends its chunks in order, so the
+// leg carrying it is never one holding a later chunk, and the chunk itself is
+// admitted whatever is retained. If every leg is holding a later chunk it can no
+// longer arrive at all, and Read fails the flow (see the parkCh case there).
+// admit returns false if the Conn ended first.
+func (c *Conn) admit(i int, seq uint32, cost int64) bool {
+	if c.budget.reserve(cost) {
+		return true
+	}
+	if cost > c.budget.limit {
+		c.fail(c.budget.err(cost))
+		return false
+	}
+	atomic.StoreUint32(&c.legWaited[i], 1)
+	atomic.StoreUint64(&c.parkAt[i], uint64(seq)+1)
+	defer atomic.StoreUint64(&c.parkAt[i], 0)
+	select {
+	case c.parkCh <- struct{}{}:
+	default:
+	}
+	t := time.NewTicker(parkPoll)
+	defer t.Stop()
+	for {
+		if seq <= atomic.LoadUint32(&c.nextSeqSeen) {
+			c.budget.force(cost)
+			return true
+		}
+		if c.budget.reserve(cost) {
+			return true
+		}
+		select {
+		case <-c.closed:
+			return false
+		case <-t.C:
+		}
+	}
+}
+
+// allParkedPast reports whether every leg still delivering is waiting for room
+// with a chunk later than next. Caller holds rmu.
+func (c *Conn) allParkedPast(next uint32) bool {
+	n := int32(0)
+	for i := range c.parkAt {
+		if at := atomic.LoadUint64(&c.parkAt[i]); at > uint64(next)+1 {
+			n++
+		}
+	}
+	return n > 0 && n >= atomic.LoadInt32(&c.legsActive)
+}
+
+// advance moves Read on to the next sequence. Caller holds rmu.
+func (c *Conn) advance() {
+	c.nextSeq++
+	atomic.StoreUint32(&c.nextSeqSeen, c.nextSeq)
 }
 
 // setTotal records the announced total chunk count and wakes any blocked Read
@@ -514,37 +577,6 @@ func (c *Conn) writeLeg(i int, leg net.Conn) {
 	// transport sees one frame per chunk instead of two.
 	frame := make([]byte, headerSize+c.chunkSize)
 	for {
-		if c.quarantined(i) {
-			// A quarantined leg stays out of the *sequential* path so it can't
-			// gate the reorder buffer - but it still services the reroute queue.
-			// A reroute is a stalled sequence number that needs any live carrier
-			// now; when the leg holding the original is frozen, a quarantined but
-			// alive leg is exactly the leg that must move it (otherwise, in a
-			// two-leg flow where the fast leg froze, the reroute would have no
-			// worker at all). It also honours a graceful close and periodically
-			// takes one normal chunk to re-measure so a recovered leg can rejoin.
-			select {
-			case <-c.flush:
-				c.flushRemaining(i, leg, frame)
-				return
-			case <-c.closed:
-				return
-			case job := <-c.resendQueue:
-				if !c.writeChunkTracked(i, leg, frame, job) {
-					return
-				}
-			case <-time.After(quarantineProbeEvery):
-				select {
-				case job := <-c.writeQueue:
-					if !c.writeChunkTracked(i, leg, frame, job) {
-						return
-					}
-				default:
-				}
-			}
-			continue
-		}
-
 		// Reroute work first (a stalled sequence a healthy leg must carry now),
 		// then, preferring to drain a queued chunk before considering exit -
 		// which is what keeps a graceful Close lossless even when a teardown
@@ -606,31 +638,17 @@ func (c *Conn) flushRemaining(i int, leg net.Conn, frame []byte) {
 }
 
 // writeChunkTracked sends one chunk on leg i, recording it as in-flight (so the
-// watchdog can reroute it if the leg freezes), timing it to keep the leg's
-// throughput estimate fresh, and returning the borrowed pool buffer. It returns
-// false (after failing the whole Conn) if the leg errors.
+// watchdog can reroute it if the leg stalls) and returning the borrowed pool
+// buffer. It returns false (after failing the whole Conn) if the leg errors.
 func (c *Conn) writeChunkTracked(i int, leg net.Conn, frame []byte, job writeJob) bool {
 	c.beginWrite(i, job)
-	start := time.Now()
 	ok := c.writeChunk(leg, frame, job)
-	elapsed := time.Since(start)
 	c.endWrite(i)
 	// A resend job carries a fresh copy (buf == nil), not a pooled buffer.
 	if job.buf != nil {
 		c.chunkPool.Put(job.buf)
 	}
-	if ok {
-		c.recordRate(i, len(job.data), elapsed)
-	}
 	return ok
-}
-
-// quarantined reports whether leg i is currently held out of the sequential
-// write path, for either reason (rate-slow while backlogged, or frozen).
-func (c *Conn) quarantined(i int) bool {
-	c.schedMu.Lock()
-	defer c.schedMu.Unlock()
-	return c.sched[i].slowQuar || c.sched[i].frozen
 }
 
 // beginWrite records leg i's chunk as in-flight, so the watchdog can reroute its
@@ -656,107 +674,9 @@ func (c *Conn) endWrite(i int) {
 	c.schedMu.Unlock()
 }
 
-// recordRate folds one write's throughput into leg i's EWMA estimate and
-// re-evaluates which legs are quarantined. A completed write is also proof the
-// leg is alive, so it clears any frozen mark scanStuck had set: this is the
-// liveness-based recovery path, independent of the rate estimate, so a leg that
-// froze and then came back rejoins even for a low-rate flow that never triggers
-// the rate path at all.
-func (c *Conn) recordRate(i, n int, elapsed time.Duration) {
-	if elapsed <= 0 {
-		elapsed = time.Microsecond
-	}
-	inst := float64(n) / elapsed.Seconds()
-	c.schedMu.Lock()
-	s := &c.sched[i]
-	s.frozen = false // a successful write means this leg is not frozen
-	if s.rate == 0 {
-		s.rate = inst
-	} else {
-		s.rate = legEWMAAlpha*inst + (1-legEWMAAlpha)*s.rate
-	}
-	c.reevaluateLocked()
-	c.schedMu.Unlock()
-}
-
-// reevaluateLocked manages the *rate* quarantine (slowQuar) only; the frozen
-// mark is owned by scanStuck/recordRate. It engages at all only when the write
-// queue is genuinely backlogged - i.e. Write is outpacing the legs, the signature
-// of a bulk transfer where routing a slow leg out of the sequential path actually
-// raises aggregate throughput. A low-rate, bursty flow (a game, an SSH session)
-// keeps the queue near-empty and its per-write rate samples are meaningless, so
-// it must never be reordered by this path: when the queue is not backlogged every
-// slowQuar mark is cleared and the flow runs as plain work-stealing. Caller holds
-// schedMu.
-func (c *Conn) reevaluateLocked() {
-	// Not backlogged: this is not a bulk transfer (or the burst already
-	// drained). Drop all rate quarantines and leave the flow work-stealing.
-	if len(c.writeQueue) < cap(c.writeQueue)/2 {
-		for i := range c.sched {
-			c.sched[i].slowQuar = false
-		}
-		c.ensureActiveLocked()
-		return
-	}
-
-	best := 0.0
-	for i := range c.sched {
-		if c.sched[i].rate > best {
-			best = c.sched[i].rate
-		}
-	}
-	if best <= 0 {
-		return
-	}
-	threshold := quarantineFraction * best
-	for i := range c.sched {
-		r := c.sched[i].rate
-		c.sched[i].slowQuar = r > 0 && r < threshold
-	}
-	c.ensureActiveLocked()
-}
-
-// ensureActiveLocked guarantees at least one leg stays out of quarantine, so a
-// transient where every leg looks slow can never leave the flow with no writer.
-// It prefers to reactivate a leg that is NOT currently mid-write: a leg frozen
-// in flight (the one scanStuck just quarantined) can't take new work until its
-// stuck write returns, so reactivating it would leave the flow with a nominally-
-// active but blocked writer while everything else stays quarantined. Only if
-// every leg is in flight does it fall back to the highest-rate one. Caller holds
-// schedMu.
-func (c *Conn) ensureActiveLocked() {
-	for i := range c.sched {
-		if !c.sched[i].slowQuar && !c.sched[i].frozen {
-			return // at least one active leg already
-		}
-	}
-	best := -1
-	for i := range c.sched {
-		if c.sched[i].inFly {
-			continue // frozen mid-write; can't service work now
-		}
-		if best < 0 || c.sched[i].rate > c.sched[best].rate {
-			best = i
-		}
-	}
-	if best < 0 {
-		// Every leg is in flight; pick the highest-rate one anyway so the
-		// invariant (at least one non-quarantined leg) still holds.
-		for i := range c.sched {
-			if best < 0 || c.sched[i].rate > c.sched[best].rate {
-				best = i
-			}
-		}
-	}
-	if best >= 0 {
-		c.sched[best].slowQuar = false
-		c.sched[best].frozen = false
-	}
-}
-
-// rerouteWatchdog periodically re-sends a chunk that a leg has frozen on: its
-// sequence number is copied onto the priority resend queue for a healthy leg to
-// carry, so the reader isn't stalled waiting out the frozen leg. It stops on a
+// rerouteWatchdog periodically re-sends a chunk that a leg has stalled on: its
+// sequence number is copied onto the priority resend queue for another leg to
+// carry, so the reader isn't stalled waiting out the stuck one. It stops on a
 // graceful close (originals are flushed anyway) or teardown.
 func (c *Conn) rerouteWatchdog() {
 	t := time.NewTicker(healthTick)
@@ -774,8 +694,7 @@ func (c *Conn) rerouteWatchdog() {
 }
 
 // scanStuck finds chunks in flight longer than resendTimeout and re-queues their
-// sequence numbers (with a fresh copy of the payload) for a healthy leg. The leg
-// they were stuck on is quarantined so it takes no new sequential work. The
+// sequence numbers (with a fresh copy of the payload) for another leg. The
 // receiver dedups by sequence number, so a re-send that races the original is
 // harmless.
 func (c *Conn) scanStuck() {
@@ -789,18 +708,16 @@ func (c *Conn) scanStuck() {
 			copy(data, s.inData)
 			resends = append(resends, writeJob{seq: s.inSeq, data: data})
 			s.inResent = true
-			s.frozen = true // clearly frozen; keep new work off it until it writes again
 		}
 	}
-	c.ensureActiveLocked()
 	c.schedMu.Unlock()
 
 	for _, job := range resends {
-		// Non-lossy: the leg this chunk was stuck on is frozen, so the original
+		// Non-lossy: the leg this chunk is stuck on has stalled, so the original
 		// write may never deliver - dropping the reroute would leave the reader
 		// stalled on this sequence number until stallTimeout tears the whole flow
 		// down (which is exactly the mid-session disconnect this path exists to
-		// prevent). Block until a healthy leg can take it; only a teardown
+		// prevent). Block until another leg can take it; only a teardown
 		// (c.closed) lets us give up, and by then the flow is already ending.
 		select {
 		case c.resendQueue <- job:
@@ -939,7 +856,7 @@ func (c *Conn) stash(ch chunk) {
 	}
 	if ch.seq == c.nextSeq {
 		c.setReadBuf(ch)
-		c.nextSeq++
+		c.advance()
 	} else if _, dup := c.pending[ch.seq]; dup {
 		c.recycle(ch)
 	} else {
@@ -1083,7 +1000,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			if ch, ok := c.pending[c.nextSeq]; ok {
 				delete(c.pending, c.nextSeq)
 				c.setReadBuf(ch)
-				c.nextSeq++
+				c.advance()
 			} else {
 				return 0, err
 			}
@@ -1102,7 +1019,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		if ch, ok := c.pending[c.nextSeq]; ok {
 			delete(c.pending, c.nextSeq)
 			c.setReadBuf(ch)
-			c.nextSeq++
+			c.advance()
 			continue
 		}
 
@@ -1185,6 +1102,21 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 						return 0, net.ErrClosed
 					}
 				}
+			}
+
+		case <-c.parkCh:
+			// A leg is waiting for room. If they all are, each holds a chunk
+			// later than the one awaited, and a leg sends in order: it can no
+			// longer arrive, and nothing would ever make room.
+			c.drainAvailable()
+			if _, ok := c.pending[c.nextSeq]; ok {
+				continue
+			}
+			if c.allParkedPast(c.nextSeq) {
+				err := c.budget.err(c.chunkCost(true))
+				c.setPermErr(err)
+				c.teardown()
+				return 0, err
 			}
 
 		case <-timerC:

@@ -66,6 +66,10 @@ type Stream struct {
 	peerConsumed uint32        // num of bytes the peer has consumed
 	peerWindow   uint32        // peer window, initialized to 256KB, updated by peer
 	chUpdate     chan struct{} // notify of remote data consuming and window update
+
+	// rcvWindow, when not zero, is this stream's receive window in place of the
+	// session's MaxStreamBuffer (see SetReceiveWindow). Atomic.
+	rcvWindow uint32
 }
 
 // newStream initiates a Stream struct
@@ -182,7 +186,7 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 	s.incr += uint32(n)
 
 	// for initial reading, send window update
-	if s.incr >= uint32(s.sess.config.MaxStreamBuffer/windowUpdateDivisor) || s.numRead == uint32(n) {
+	if s.incr >= s.receiveWindow()/windowUpdateDivisor || s.numRead == uint32(n) {
 		notifyConsumed = s.numRead
 		s.incr = 0 // reset couting for next window update
 	}
@@ -259,7 +263,7 @@ func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
 		}
 		s.numRead += uint32(len(buf))
 		s.incr += uint32(len(buf))
-		if s.incr >= uint32(s.sess.config.MaxStreamBuffer/windowUpdateDivisor) || s.numRead == uint32(len(buf)) {
+		if s.incr >= s.receiveWindow()/windowUpdateDivisor || s.numRead == uint32(len(buf)) {
 			notifyConsumed = s.numRead
 			s.incr = 0
 		}
@@ -288,6 +292,37 @@ func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
 	}
 }
 
+// receiveWindow is how many unconsumed bytes the peer may have outstanding on
+// this stream.
+func (s *Stream) receiveWindow() uint32 {
+	if w := atomic.LoadUint32(&s.rcvWindow); w != 0 {
+		return w
+	}
+	return uint32(s.sess.config.MaxStreamBuffer)
+}
+
+// SetReceiveWindow changes how many unconsumed bytes the peer may have
+// outstanding on this stream, between 1 and the session's MaxStreamBuffer, and
+// tells the peer at once. The session default is a memory bound; a stream whose
+// reader wants to hold the sender closer than that (a striped leg: what one leg
+// has outstanding is how far it can run behind the others) sets less. A peer
+// that already has more outstanding than a reduced window simply sends nothing
+// until enough of it was consumed. Protocol version 2 only; a no-op before that.
+func (s *Stream) SetReceiveWindow(n int) error {
+	if s.sess.config.Version != 2 {
+		return nil
+	}
+	n = max(1, min(n, s.sess.config.MaxStreamBuffer))
+	if atomic.SwapUint32(&s.rcvWindow, uint32(n)) == uint32(n) {
+		return nil
+	}
+	s.bufferLock.Lock()
+	consumed := s.numRead
+	s.incr = 0
+	s.bufferLock.Unlock()
+	return s.sendWindowUpdate(consumed)
+}
+
 func (s *Stream) sendWindowUpdate(consumed uint32) error {
 	var timer *time.Timer
 	var deadline <-chan time.Time
@@ -300,7 +335,7 @@ func (s *Stream) sendWindowUpdate(consumed uint32) error {
 	frame := newFrame(byte(s.sess.config.Version), cmdUPD, s.id)
 	var hdr updHeader
 	binary.LittleEndian.PutUint32(hdr[:], consumed)
-	binary.LittleEndian.PutUint32(hdr[4:], uint32(s.sess.config.MaxStreamBuffer))
+	binary.LittleEndian.PutUint32(hdr[4:], s.receiveWindow())
 	frame.data = hdr[:]
 	_, err := s.sess.writeFrameInternal(frame, deadline, CLSCTRL)
 	return err

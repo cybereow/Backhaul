@@ -6,7 +6,6 @@ import (
 	"io"
 	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1235,17 +1234,12 @@ func (c *WsMuxTransport) localDialer(stream net.Conn, remoteAddr string) {
 		return
 	}
 
-	var sendBuf, recvBuf int
-
-	if strings.Contains(resolvedAddr, "127.0.0.1") {
-		// Use 32 KB for localhost
-		sendBuf = 32 * 1024
-		recvBuf = 32 * 1024
-	} else {
-		// Use your custom buffer sizes
-		sendBuf = 0
-		recvBuf = 0
-	}
+	// The socket to the local destination is left to kernel autotuning. It used
+	// to be pinned at 32 KiB, which Linux doubles to 64 KiB: a tunnel frame larger
+	// than that (mux_framesize up to 65535) then goes out one segment at a time,
+	// each waiting for the destination's delayed ACK - an upload ceiling of a few
+	// MB/s per flow whatever the tunnel can carry.
+	const sendBuf, recvBuf = 0, 0
 
 	localConnection, err := network.TcpDialer(ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
 	if err != nil {
@@ -1385,13 +1379,7 @@ func (c *WsMuxTransport) localDialerPlain(stream *smux.Stream, flowID uint64, re
 		return
 	}
 
-	var sendBuf, recvBuf int
-	if strings.Contains(resolvedAddr, "127.0.0.1") {
-		sendBuf, recvBuf = 32*1024, 32*1024 // localhost
-	} else if c.config.AggressivePool {
-		sendBuf = 32 * 1024
-		recvBuf = 32 * 1024
-	}
+	const sendBuf, recvBuf = 0, 0 // kernel autotuning: see localDialer
 
 	localConnection, err := network.TcpDialer(ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
 	if err != nil {
@@ -1429,13 +1417,7 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 		return
 	}
 
-	var sendBuf, recvBuf int
-	if strings.Contains(resolvedAddr, "127.0.0.1") {
-		sendBuf, recvBuf = 32*1024, 32*1024 // localhost
-	} else if c.config.AggressivePool {
-		sendBuf = 32 * 1024
-		recvBuf = 32 * 1024
-	}
+	const sendBuf, recvBuf = 0, 0 // kernel autotuning: see localDialer
 
 	if replay {
 		// Known but not running yet: a resume attach that arrives while the target

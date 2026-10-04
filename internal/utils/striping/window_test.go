@@ -22,6 +22,8 @@ func TestLegWindow(t *testing.T) {
 		{"one of six equal legs", 8 * MB, 17 * MB, 85 * MB, 3.2 * MB},
 		{"alone", 16 * MB, 3 * MB, 0, 16 * MB},
 		{"after a pause", 1 * MB, 6, 100, 0.96 * MB},
+		{"nothing delivered yet", 256 << 10, 0, 0, 256 << 10},
+		{"quiet for long", 3 * MB, 0, 0, 3 * MB},
 		{"grows by doubling", 256 << 10, 50 * MB, 50 * MB, 512 << 10},
 		{"idle next to a busy one", 4 * MB, 0, 100 * MB, floor},
 		{"never below the floor", floor, 0.1 * MB, 100 * MB, floor},

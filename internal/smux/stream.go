@@ -67,6 +67,8 @@ type Stream struct {
 	peerWindow   uint32        // peer window, initialized to 256KB, updated by peer
 	chUpdate     chan struct{} // notify of remote data consuming and window update
 
+	updLock sync.Mutex // orders window updates, see sendWindowUpdate
+
 	// rcvWindow, when not zero, is this stream's receive window in place of the
 	// session's MaxStreamBuffer (see SetReceiveWindow). Atomic.
 	rcvWindow uint32
@@ -197,7 +199,7 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 
 		// send window update if necessary
 		if notifyConsumed > 0 {
-			err := s.sendWindowUpdate(notifyConsumed)
+			err := s.sendWindowUpdate()
 			return n, err
 		} else {
 			return n, nil
@@ -282,7 +284,7 @@ func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
 			}
 
 			if notifyConsumed > 0 {
-				if err := s.sendWindowUpdate(notifyConsumed); err != nil {
+				if err := s.sendWindowUpdate(); err != nil {
 					return n, err
 				}
 			}
@@ -317,13 +319,24 @@ func (s *Stream) SetReceiveWindow(n int) error {
 		return nil
 	}
 	s.bufferLock.Lock()
-	consumed := s.numRead
 	s.incr = 0
 	s.bufferLock.Unlock()
-	return s.sendWindowUpdate(consumed)
+	return s.sendWindowUpdate()
 }
 
-func (s *Stream) sendWindowUpdate(consumed uint32) error {
+// sendWindowUpdate tells the peer how much has been read and what the window
+// is. The count is absolute and the peer takes whatever arrives last, so the
+// count is read and the frame written under updLock: an update from the reader
+// and one from SetReceiveWindow can then never reach the peer in the wrong
+// order and take its view of what was consumed backward - which, with a small
+// window, would leave it waiting for room that is already there.
+func (s *Stream) sendWindowUpdate() error {
+	s.updLock.Lock()
+	defer s.updLock.Unlock()
+	s.bufferLock.Lock()
+	consumed := s.numRead
+	s.bufferLock.Unlock()
+
 	var timer *time.Timer
 	var deadline <-chan time.Time
 	if d, ok := s.readDeadline.Load().(time.Time); ok && !d.IsZero() {

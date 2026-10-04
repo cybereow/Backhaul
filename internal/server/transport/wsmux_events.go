@@ -79,6 +79,14 @@ func (s *WsMuxTransport) snapshotEvents() []transportEvent {
 //	replacement_waiting        *bool   the rotation decision gate is held: one aging
 //	                                   session is waiting for its replacement;
 //	                                   omitted when the generation is untracked.
+//	hosts                      []      capacity-aware placement, per domain the
+//	                                   client dialed (what it is measured and charged
+//	                                   by; several may share a remote IP): its
+//	                                   registered sessions, the upload one of them
+//	                                   was seen to deliver (up_est_mbps, omitted when
+//	                                   unknown) and how many times dearer that makes
+//	                                   them to place a flow on (penalty, omitted
+//	                                   when not charged).
 //
 // Not reported because no delivered state carries it: a generation ID (a
 // wsGeneration has none and one is not invented here), the number of rotations
@@ -97,6 +105,15 @@ type poolDiagnostics struct {
 	SetupsSaturated       bool   `json:"setups_saturated"`
 	PendingOpens          int    `json:"pending_opens"`
 	ReplacementWaiting    *bool  `json:"replacement_waiting,omitempty"`
+
+	Hosts []*poolHostStat `json:"hosts,omitempty"`
+}
+
+type poolHostStat struct {
+	Host      string  `json:"host"`
+	Sessions  int     `json:"sessions"`
+	UpEstMbps float64 `json:"up_est_mbps,omitempty"`
+	Penalty   float64 `json:"penalty,omitempty"`
 }
 
 // poolViews are the generation-scoped fields a snapshot reads. Restart republishes
@@ -148,10 +165,26 @@ func (s *WsMuxTransport) poolDiagnostics(v poolViews) poolDiagnostics {
 	s.sessionsMu.Unlock()
 
 	isRegistered := make(map[*smux.Session]struct{}, len(registered))
+	byHost := map[string]*poolHostStat{}
 	for _, ps := range registered {
 		isRegistered[ps.session] = struct{}{}
 		if ps.session != nil && !ps.session.IsClosed() {
 			d.SessionsEligible++
+		}
+		// A domain's sessions share its estimate and charge; one that joined
+		// since the last sample has neither yet, hence the max.
+		hs, ok := byHost[ps.host]
+		if !ok {
+			hs = &poolHostStat{Host: ps.host}
+			byHost[ps.host] = hs
+			d.Hosts = append(d.Hosts, hs)
+		}
+		hs.Sessions++
+		if e := ps.capEst.Load(); e > 0 {
+			hs.UpEstMbps = math.Max(hs.UpEstMbps, math.Round(float64(e)*8/1e6*10)/10)
+		}
+		if p := ps.slowness(); p > 1 {
+			hs.Penalty = math.Max(hs.Penalty, math.Round(p*10)/10)
 		}
 	}
 
@@ -203,12 +236,6 @@ func (s *WsMuxTransport) poolSnapshot(v poolViews) map[string]interface{} {
 		Sessions int     `json:"sessions"`
 		Streams  int     `json:"streams"`
 		RTTms    float64 `json:"rtt_ms,omitempty"`
-		// Capacity-aware placement: the domain these connections were dialed
-		// for, the upload they were measured (or assumed, from their domain) to
-		// deliver, and how many times dearer that makes them to place a flow on.
-		Host      string  `json:"host,omitempty"`
-		UpEstMbps float64 `json:"up_est_mbps,omitempty"`
-		Penalty   float64 `json:"penalty,omitempty"`
 	}
 
 	s.sessionsMu.Lock()
@@ -233,13 +260,7 @@ func (s *WsMuxTransport) poolSnapshot(v poolViews) map[string]interface{} {
 		if rtt := ps.rtt.Load(); rtt > 0 {
 			st.RTTms = float64(rtt) / float64(time.Millisecond)
 		}
-		st.Host = ps.host
-		if e := ps.capEst.Load(); e > 0 {
-			st.UpEstMbps = math.Round(float64(e)*8/1e6*10) / 10
-		}
-		if p := ps.slowness(); p > 1 {
-			st.Penalty = math.Round(p*10) / 10
-		}
+
 	}
 
 	// Sort CDNs by stream count, busiest first, so concentration is obvious.

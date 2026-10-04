@@ -25,9 +25,9 @@ import (
 // so the slow leg of a fast flow is held to a fraction of a second and still
 // carries what it can, and equal legs keep large windows. Rates are what each
 // leg was seen to deliver here; they fade together when the flow goes quiet, so
-// a pause leaves the windows as they were. A window at most doubles per tick,
-// starting small: a leg has to show what it delivers before it is trusted with
-// more.
+// a pause leaves the windows as they were, as does a direction that has carried
+// nothing yet. A window at most doubles per tick, starting small: a leg has to
+// show what it delivers before it is trusted with more.
 //
 // This keeps the legs together in the steady state. It cannot see a change
 // coming - a leg that stalls, a flow that starts - so the budget itself is
@@ -55,6 +55,9 @@ type receiveWindowSetter interface{ SetReceiveWindow(int) error }
 // legWindow is the window for a leg delivering own bytes/s next to legs that
 // together deliver others, given its current window cur.
 func legWindow(cur, own, others, target, floor float64) float64 {
+	if own <= 0 && others <= 0 {
+		return cur // nothing has been delivered: nothing is known, nothing changes
+	}
 	w := target // nothing else is delivering: nothing to run behind
 	if others > 0 {
 		w = min(target, own*target/others)

@@ -79,4 +79,16 @@ func TestAdmitLetsOneCopyOfTheAwaitedChunkOverTheBudget(t *testing.T) {
 	if keep, ok := c.admit(1, 8, cost); !keep || !ok {
 		t.Fatalf("the next awaited chunk: keep=%v ok=%v, want it admitted", keep, ok)
 	}
+
+	// A reader that acts on an old view of the awaited sequence cannot take the
+	// claim back: a late claim for 7 fails, and 8 stays claimed.
+	if c.claimForced(7) {
+		t.Fatal("a claim for a sequence behind the last one admitted succeeded")
+	}
+	if c.claimForced(8) {
+		t.Fatal("the awaited sequence could be claimed twice after a stale claim")
+	}
+	if !c.claimForced(9) {
+		t.Fatal("the following sequence could not be claimed")
+	}
 }

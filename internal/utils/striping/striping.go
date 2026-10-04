@@ -515,8 +515,12 @@ func (c *Conn) admit(i int, seq uint32, cost int64) (keep, ok bool) {
 		case seq < next:
 			return false, true // delivered already
 		case seq == next:
-			if atomic.SwapUint64(&c.forcedSeq, uint64(seq)+1) == uint64(seq)+1 {
-				return false, true // another leg's copy was let in
+			// The view of next may be a moment old: Read can have moved on, and
+			// another reader claimed a later sequence, since it was loaded. So
+			// the claim only ever moves forward, and the sequence is looked at
+			// once more before the charge.
+			if !c.claimForced(seq) || seq < atomic.LoadUint32(&c.nextSeqSeen) {
+				return false, true // another leg's copy was let in, or it is delivered by now
 			}
 			c.budget.force(cost)
 			return true, true
@@ -528,6 +532,22 @@ func (c *Conn) admit(i int, seq uint32, cost int64) (keep, ok bool) {
 		case <-c.closed:
 			return false, false
 		case <-t.C:
+		}
+	}
+}
+
+// claimForced claims the one over-budget admission of sequence seq. It fails if
+// that sequence, or a later one, has been claimed already: forcedSeq never moves
+// backward, so a reader acting on a stale view cannot reopen a claim.
+func (c *Conn) claimForced(seq uint32) bool {
+	want := uint64(seq) + 1
+	for {
+		have := atomic.LoadUint64(&c.forcedSeq)
+		if have >= want {
+			return false
+		}
+		if atomic.CompareAndSwapUint64(&c.forcedSeq, have, want) {
+			return true
 		}
 	}
 }

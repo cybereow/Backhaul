@@ -1108,11 +1108,19 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			// A leg is waiting for room. If they all are, each holds a chunk
 			// later than the one awaited, and a leg sends in order: it can no
 			// longer arrive, and nothing would ever make room.
+			//
+			// The legs are looked at first and the queue after. A leg hands over
+			// a chunk before it reads, and waits on, the next one; so whatever a
+			// leg seen waiting has delivered is in the queue by now - including
+			// the awaited chunk, if it was the last thing that leg did before it
+			// stopped. Looked at the other way round, that chunk could arrive
+			// between the two looks and a flow with nothing missing be failed.
+			stuck := c.allParkedPast(c.nextSeq)
 			c.drainAvailable()
 			if _, ok := c.pending[c.nextSeq]; ok {
 				continue
 			}
-			if c.allParkedPast(c.nextSeq) {
+			if stuck {
 				err := c.budget.err(c.chunkCost(true))
 				c.setPermErr(err)
 				c.teardown()

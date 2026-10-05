@@ -931,15 +931,33 @@ func (c *WsMuxTransport) tunnelDialer() {
 	// still handshaking. It is handed off to poolConnections once established.
 	atomic.AddInt32(&c.pendingDials, 1)
 
-	ep := c.nextEndpoint()
-	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
-
-	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify, c.dialOptions()...)
+	// One pool connection was asked for, not one attempt on whichever entry point
+	// is next in turn. With several of them a failure moves on to the next, once
+	// round, instead of retrying the one that just failed: an entry point that is
+	// down (a CDN answering 502) would otherwise swallow every dial that falls to
+	// it - and when that dial is the replacement a rotation on the server is
+	// waiting for, the server only asks again half a minute later, with every
+	// other rotation queued behind it.
+	attempts, retries := len(c.endpoints), 1
+	if attempts <= 1 {
+		attempts, retries = 1, 3
+	}
+	var tunnelWSConn *network.WebSocketConn
+	var err error
+	for try := 0; try < attempts; try++ {
+		ep := c.nextEndpoint()
+		c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
+		tunnelWSConn, err = network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, retries, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify, c.dialOptions()...)
+		if err == nil {
+			break
+		}
+		c.logger.Errorf("tunnel server dialer: %v (endpoint %s)", err, ep.addr)
+		if ctx.Err() != nil {
+			break
+		}
+	}
 	if err != nil {
 		atomic.AddInt32(&c.pendingDials, -1)
-		c.logger.Errorf("tunnel server dialer: %v (endpoint %s)", err, ep.addr)
-
 		return
 	}
 

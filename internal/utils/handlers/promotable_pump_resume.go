@@ -82,9 +82,13 @@ func (p *PumpSwapper) Suspend() bool {
 	close(p.suspendCh)
 	p.checkParkedLocked() // a direction that already ended has nothing to park
 
-	// Wake whatever the pumps are blocked in: the app read, a wait for ring room
-	// (the tunnel read and write fail on their own once the tunnel is dropped).
+	// Wake whatever the pumps are blocked in: the app read, a wait for ring room,
+	// and a write the app is not taking - an app that has stopped reading (a
+	// paused download) would otherwise keep the download pump from parking, and
+	// the flow from resuming, for as long as it does. The tunnel read and write
+	// fail on their own once the tunnel is dropped.
 	_ = p.app.SetReadDeadline(time.Unix(1, 0))
+	_ = p.app.SetWriteDeadline(time.Unix(1, 0))
 	select {
 	case p.freezeWake <- struct{}{}:
 	default:
@@ -203,6 +207,7 @@ func (p *PumpSwapper) parkUp() (dst net.Conn, ok bool) {
 // tunnel to read from.
 func (p *PumpSwapper) parkDl() (src net.Conn, ok bool) {
 	p.mu.Lock()
+	_ = p.app.SetWriteDeadline(time.Time{}) // the suspension's wakeup has done its job
 	p.dlParked = true
 	p.checkParkedLocked()
 	rc := p.resumeCh

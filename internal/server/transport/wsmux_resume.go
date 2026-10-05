@@ -451,8 +451,8 @@ const migrateParallel = 8
 // It returns when all of them have been moved or given up on; ctx bounds it.
 func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session) {
 	flows := s.flowsOn(old)
-	if failed := s.moveFlowsOff(ctx, old, flows, migrateAttempts, "retiring session"); failed > 0 {
-		s.recordEvent("flows_not_moved", fmt.Sprintf("%d of %d flow(s) could not be moved off a retiring session; they stay on it until it drains or is cut", failed, len(flows)))
+	if failed, why := s.moveFlowsOff(ctx, old, flows, migrateAttempts, "retiring session"); failed > 0 {
+		s.recordEvent("flows_not_moved", fmt.Sprintf("%d of %d flow(s) could not be moved off a retiring session; they stay on it until it drains or is cut (%v)", failed, len(flows), why))
 	}
 }
 
@@ -480,12 +480,19 @@ func (s *WsMuxTransport) regroupFlowsOn(ctx context.Context, dead *smux.Session)
 
 // moveFlowsOff moves flows off the session old, a few at a time, trying again the
 // ones that could not be started: attempts times each, or until ctx ends when
-// attempts is 0. It returns how many it had to leave.
-func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, flows []*resumableFlow, attempts int, what string) int {
+// attempts is 0. It returns how many it had to leave, and why the last of them.
+//
+// A flow that keeps replay state is not left: when it cannot be moved the
+// orderly way - which needs both ends to stop at a write boundary, and an end
+// whose reader has stopped reading (a paused download) never gets to one - it is
+// taken off the session the way a cut would take it, suspended here and resumed
+// on another by driveResume, replaying what was in flight.
+func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, flows []*resumableFlow, attempts int, what string) (int, error) {
 	if len(flows) == 0 {
-		return 0
+		return 0, nil
 	}
-	var moved, failed, finished int
+	var moved, failed, finished, resumed int
+	var why error
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, migrateParallel)
@@ -497,6 +504,7 @@ func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, fl
 		if ctx.Err() != nil {
 			mu.Lock()
 			failed++
+			why = ctx.Err()
 			mu.Unlock()
 			continue
 		}
@@ -508,7 +516,7 @@ func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, fl
 			for attempt := 1; ; attempt++ {
 				// A flow that is suspended or being swapped right now is not ours to
 				// move; it may be by the next look.
-				if err = handlers.ErrPromoteUnavailable; f.sw.Swappable() || !f.on(old) {
+				if err = f.sw.Unswappable(); f.sw.Swappable() || !f.on(old) {
 					err = s.migrateFlow(ctx, f, old)
 				}
 				if err == nil || attempt == attempts {
@@ -533,14 +541,20 @@ func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, fl
 					return
 				default:
 				}
-				failed++
 				s.logger.Debugf("%s: moving flow %d off it: %v", what, f.id, err)
+				// With nowhere to resume it, it is better off where it is.
+				if !errors.Is(err, errNoOtherSession) && !f.isStriped() && f.session() == old && f.sw.Suspend() {
+					resumed++
+					return
+				}
+				failed++
+				why = err
 				return
 			}
 			moved++
 		}(f)
 	}
 	wg.Wait()
-	s.logger.Debugf("%s: %d flow(s) moved, %d finished meanwhile, %d left on it", what, moved, finished, failed)
-	return failed
+	s.logger.Debugf("%s: %d flow(s) moved, %d resumed elsewhere, %d finished meanwhile, %d left on it", what, moved, resumed, finished, failed)
+	return failed, why
 }

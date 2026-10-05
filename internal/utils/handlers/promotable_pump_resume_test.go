@@ -433,3 +433,29 @@ func TestResumeReplaysProxyHeader(t *testing.T) {
 		t.Fatal("the header or the payload after the resume differs")
 	}
 }
+
+// An app that has stopped reading (a paused download) keeps the download pump in
+// a write to it. A cut then must not wait for the app: the flow is suspended and
+// resumed with that write interrupted, and when the app reads again it gets
+// every byte, once and in order.
+func TestResumeWhileTheAppIsNotReading(t *testing.T) {
+	ctx, _ := testCtx(t)
+	rt, a0, b0 := newRawTunnel(t)
+	A, B := newResumableEnd(t, ctx, a0), newResumableEnd(t, ctx, b0)
+
+	msg := genPayload(8 << 20)
+	go A.user.Write(msg) // far more than B's app, which reads nothing, will take
+	for i := 0; i < 2; i++ {
+		time.Sleep(300 * time.Millisecond) // B's pump is stuck writing to its app by now
+		rt.cut()
+		if rt = resumeBoth(t, ctx, A.pump, B.pump); rt == nil {
+			t.Fatal("the flow could not be suspended")
+		}
+	}
+	if !bytes.Equal(readExact(t, B.user, len(msg)), msg) {
+		t.Fatal("the download differs after resuming under a blocked app")
+	}
+	if B.pump.Resumes() != 2 {
+		t.Fatalf("resumes: %d, want 2", B.pump.Resumes())
+	}
+}

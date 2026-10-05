@@ -362,6 +362,19 @@ func (p *PumpSwapper) Swappable() bool {
 	return !p.aborted && !p.suspended && !p.freezeReq && !(p.upEnded && p.dlEnded)
 }
 
+// unswappableLocked is the error for a swap that cannot be started, saying why.
+func (p *PumpSwapper) unswappableLocked() error {
+	return fmt.Errorf("%w (aborted=%v suspended=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.suspended, p.upEnded && p.dlEnded, p.freezeReq)
+}
+
+// Unswappable is the error a swap started right now would be refused with (see
+// Swappable), for a caller that reports why it left a flow where it was.
+func (p *PumpSwapper) Unswappable() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.unswappableLocked()
+}
+
 // FreezeUp stops the upload direction at a write boundary and returns the final
 // number of bytes committed to the current tunnel (counted from the start of the
 // flow). It blocks until the upload pump has completed any in-flight write,
@@ -371,7 +384,7 @@ func (p *PumpSwapper) Swappable() bool {
 func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	p.mu.Lock()
 	if p.aborted || p.suspended || p.freezeReq || (p.upEnded && p.dlEnded) {
-		err := fmt.Errorf("%w (aborted=%v suspended=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.suspended, p.upEnded && p.dlEnded, p.freezeReq)
+		err := p.unswappableLocked()
 		p.mu.Unlock()
 		return 0, err
 	}
@@ -902,6 +915,20 @@ dl:
 					usage.AddOrUpdatePort(remotePort, uint64(n))
 				}
 				if werr != nil {
+					// A suspension interrupts a write the app is not taking (see
+					// Suspend). What the app did take is counted, and the peer
+					// replays from that count: the rest of buf is simply dropped.
+					p.mu.Lock()
+					suspended := p.suspended
+					p.mu.Unlock()
+					if suspended && isTimeout(werr) {
+						nsrc, ok := p.parkDl()
+						if !ok {
+							return
+						}
+						src = nsrc
+						continue dl
+					}
 					p.Abort()
 					return
 				}

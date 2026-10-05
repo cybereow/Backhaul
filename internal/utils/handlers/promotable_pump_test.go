@@ -700,18 +700,43 @@ func TestPromotablePumpBothPhaseOrders(t *testing.T) {
 	})
 }
 
-// The handshake is bounded and classified: before the freeze ack a failure
-// leaves the flow plain (and closes the new legs); after it the flow is aborted
-// (and the legs closed). Nothing waits forever on a silent peer.
+// The handshake is bounded and classified. A failure before the two counts are
+// settled calls the swap off: the new legs are closed and the flow carries on
+// where it is, whether or not this side had frozen (the peer cannot have
+// switched without both counts). After that a failure aborts the flow. Nothing
+// waits forever on a silent peer.
 func TestPromotablePumpPromoteHandshake(t *testing.T) {
 	build := func() (net.Conn, error) {
 		m, _ := tcpConnPair(t)
 		return m, nil
 	}
+	// carriesOn: the flow runs on its old tunnel b as before, in both directions,
+	// and can be swapped again.
+	carriesOn := func(t *testing.T, s *side, b net.Conn, what string) {
+		t.Helper()
+		select {
+		case <-s.pump.DoneWait():
+			t.Fatalf("%s ended the flow", what)
+		default:
+		}
+		up := genPayload(700)
+		s.u.Write(up)
+		if got := readExact(t, b, len(up)); !bytes.Equal(got, up) {
+			t.Fatalf("%s: the upload did not carry on", what)
+		}
+		dn := genPayload(300)
+		b.Write(dn)
+		if got := readExact(t, s.u, len(dn)); !bytes.Equal(got, dn) {
+			t.Fatalf("%s: the download did not carry on", what)
+		}
+		if !s.pump.Swappable() || s.app.aborted.Load() {
+			t.Fatalf("%s left the flow unable to swap again (aborted=%v)", what, s.app.aborted.Load())
+		}
+	}
 
 	t.Run("stalled-count-peer", func(t *testing.T) {
 		ctx, _ := testCtx(t)
-		a, _ := streamPair(t)
+		a, b := streamPair(t)
 		s := startSide(t, ctx, a)
 		leg, legPeer := tcpConnPair(t)
 		pctx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
@@ -719,19 +744,16 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 		if err := waitErr(t, runPromote(s.pump, pctx, []net.Conn{leg}, build), "promote"); err == nil {
 			t.Fatal("promotion succeeded against a silent peer")
 		}
-		waitDone(t, s.pump, "post-freeze failure must abort the flow")
 		// The leg was closed: after our 8-byte count the peer reads to the end.
 		if got, err := readAllDeadline(legPeer); isTimeout(err) || len(got) != 8 {
 			t.Fatalf("leg peer: %d bytes err=%v, want the count then a closed leg", len(got), err)
 		}
-		if !s.app.aborted.Load() {
-			t.Fatal("abort was not marked")
-		}
+		carriesOn(t, s, b, "a peer that never sent its count")
 	})
 
 	t.Run("peer-closes-during-exchange", func(t *testing.T) {
 		ctx, _ := testCtx(t)
-		a, _ := streamPair(t)
+		a, b := streamPair(t)
 		s := startSide(t, ctx, a)
 		leg, legPeer := tcpConnPair(t)
 		e := runPromote(s.pump, ctx, []net.Conn{leg}, build)
@@ -740,7 +762,9 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 		if err := waitErr(t, e, "promote"); err == nil {
 			t.Fatal("promotion succeeded although the peer closed")
 		}
-		waitDone(t, s.pump, "closure during the exchange")
+		// This is the peer that opened the legs giving the swap up after this
+		// side froze: the flow must not pay for it.
+		carriesOn(t, s, b, "a peer that closed the legs instead of answering")
 	})
 
 	t.Run("build-failure-aborts", func(t *testing.T) {
@@ -760,7 +784,7 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 
 	t.Run("cancel-during-exchange", func(t *testing.T) {
 		ctx, _ := testCtx(t)
-		a, _ := streamPair(t)
+		a, b := streamPair(t)
 		s := startSide(t, ctx, a)
 		leg, legPeer := tcpConnPair(t)
 		pctx, cancel := context.WithCancel(ctx)
@@ -770,7 +794,7 @@ func TestPromotablePumpPromoteHandshake(t *testing.T) {
 		if err := waitErr(t, e, "promote"); err == nil {
 			t.Fatal("promotion succeeded after cancellation")
 		}
-		waitDone(t, s.pump, "cancelled exchange")
+		carriesOn(t, s, b, "a cancelled exchange")
 	})
 
 	t.Run("pre-freeze-failure-stays-plain", func(t *testing.T) {

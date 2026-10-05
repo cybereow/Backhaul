@@ -578,16 +578,35 @@ func (c *Conn) claimForced(seq uint32) bool {
 	}
 }
 
-// allParkedPast reports whether every leg still delivering is waiting for room
-// with a chunk later than next. Caller holds rmu.
-func (c *Conn) allParkedPast(next uint32) bool {
+// parkedPast returns what each leg is waiting on (its parkAt) if every leg still
+// delivering is waiting for room with a chunk later than next, nil otherwise.
+// Caller holds rmu.
+func (c *Conn) parkedPast(next uint32) []uint64 {
+	at := make([]uint64, len(c.parkAt))
 	n := int32(0)
 	for i := range c.parkAt {
-		if at := atomic.LoadUint64(&c.parkAt[i]); at > uint64(next)+1 {
+		if at[i] = atomic.LoadUint64(&c.parkAt[i]); at[i] > uint64(next)+1 {
 			n++
 		}
 	}
-	return n > 0 && n >= atomic.LoadInt32(&c.legsActive)
+	if n == 0 || n < atomic.LoadInt32(&c.legsActive) {
+		return nil
+	}
+	return at
+}
+
+// sameParked reports whether two parkedPast snapshots show every leg waiting on
+// the same chunk: none of them has moved in between.
+func sameParked(a, b []uint64) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // advance moves Read on to the next sequence. Caller holds rmu.
@@ -1200,12 +1219,18 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			// the awaited chunk, if it was the last thing that leg did before it
 			// stopped. Looked at the other way round, that chunk could arrive
 			// between the two looks and a flow with nothing missing be failed.
-			stuck := c.allParkedPast(c.nextSeq)
+			//
+			// And the legs are looked at again after the queue: one that found
+			// room meanwhile (a Read just before this one released some) is
+			// reading on, and what it reads next may be a re-sent copy of the
+			// awaited chunk. Only legs that all sit on the same chunks as before
+			// are stuck; a leg that has moved will wake this Read again.
+			was := c.parkedPast(c.nextSeq)
 			c.drainAvailable()
 			if _, ok := c.pending[c.nextSeq]; ok {
 				continue
 			}
-			if stuck {
+			if sameParked(was, c.parkedPast(c.nextSeq)) {
 				err := c.budget.err(c.chunkCost(true))
 				c.setPermErr(err)
 				c.teardown()

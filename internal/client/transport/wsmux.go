@@ -1544,7 +1544,9 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 	_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
 	if err := utils.WriteAttachVerdict(stream, true, 0); err != nil {
 		stream.Close()
-		swapper.Abort() // frozen and no way to thaw: the peer never saw an accept
+		if !swapper.Thaw() { // the peer never saw an accept: nothing has moved
+			swapper.Abort()
+		}
 		return
 	}
 	_ = stream.SetWriteDeadline(time.Time{})

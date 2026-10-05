@@ -125,6 +125,7 @@ type PumpSwapper struct {
 
 	upAck     chan struct{} // closed when the upload pump acks the freeze
 	installCh chan struct{} // closed by Install
+	thawCh    chan struct{} // closed by Thaw; replaced each time
 	abortCh   chan struct{} // closed by Abort
 }
 
@@ -271,6 +272,7 @@ func NewPromotablePump(
 		done:       make(chan struct{}),
 		upAck:      make(chan struct{}),
 		installCh:  make(chan struct{}),
+		thawCh:     make(chan struct{}),
 		abortCh:    make(chan struct{}),
 		suspendCh:  make(chan struct{}),
 		resumeCh:   make(chan struct{}),
@@ -428,6 +430,27 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	return 0, cause
 }
 
+// Thaw calls off a swap after FreezeUp and before Install: the upload carries on
+// on the tunnel the flow is on, as if it had never been stopped. It reports
+// whether it did; false means there was nothing to call off (not frozen, already
+// installed, suspended or aborted). Only safe while the peer cannot have
+// switched: before this side's count reached it, or before its own arrived here.
+func (p *PumpSwapper) Thaw() bool {
+	p.mu.Lock()
+	if p.aborted || p.suspended || !p.frozen || p.installed {
+		p.mu.Unlock()
+		return false
+	}
+	p.freezeReq, p.frozen = false, false
+	called := p.thawCh
+	p.thawCh = make(chan struct{})
+	p.upAck = make(chan struct{})
+	p.installCh = make(chan struct{})
+	p.mu.Unlock()
+	close(called)
+	return true
+}
+
 // Install hands over the new tunnel after a successful freeze. dlLimit is the
 // peer's committed byte count, from the start of the flow: exactly that many
 // bytes in total are delivered before the download switches. An error means the
@@ -567,15 +590,31 @@ func (p *PumpSwapper) finishFrozen(ctx context.Context, wait time.Duration, legs
 	defer cancel()
 
 	peer, err := counts(ctx)
-	if err == nil {
-		var striped net.Conn
-		if striped, err = build(); err == nil {
-			if err = p.Install(striped, peer); err != nil {
-				if aw, ok := striped.(interface{ AbortWrite() }); ok {
-					aw.AbortWrite()
-				}
-				striped.Close()
+	if err != nil {
+		// The counts were not settled, so neither end has been told to switch:
+		// nothing has moved, and the flow carries on where it is instead of
+		// ending. This is what lets the side that opened the legs give a swap up
+		// after its peer has frozen (its own freeze failed, or the peer's count
+		// came too late): it closes the legs, and the frozen peer ends up here.
+		// Should the peer have got this side's count after all and gone ahead,
+		// it finds the legs closed and ends the flow on the old tunnel, where
+		// this side sees it.
+		closeAll(legs)
+		if p.Thaw() {
+			return err
+		}
+		if !p.Suspend() {
+			p.Abort()
+		}
+		return err
+	}
+	var striped net.Conn
+	if striped, err = build(); err == nil {
+		if err = p.Install(striped, peer); err != nil {
+			if aw, ok := striped.(interface{ AbortWrite() }); ok {
+				aw.AbortWrite()
 			}
+			striped.Close()
 		}
 	}
 	if err != nil {
@@ -669,7 +708,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	pend := 0        // bytes of buf read from the app but not yet retained or sent
 
 	for { // one pass per tunnel the flow is carried on
-		var installCh, suspendCh chan struct{}
+		var installCh, suspendCh, thawCh chan struct{}
 
 		// app -> dst, until the app ends or a freeze is requested.
 	run:
@@ -746,6 +785,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				ack := p.upAck
 				installCh = p.installCh
 				suspendCh = p.suspendCh
+				thawCh = p.thawCh
 				p.mu.Unlock()
 				close(ack)
 				if isTimeout(srcErr) {
@@ -794,6 +834,10 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 		select {
 		case <-installCh:
 		case <-suspendCh:
+		case <-thawCh:
+			// The swap was called off: carry on where the flow is. Anything read
+			// from the app before the freeze goes out first (pend, srcErr).
+			continue
 		case <-p.abortCh:
 			return
 		}
@@ -881,12 +925,13 @@ dl:
 			// this direction is over.
 			p.mu.Lock()
 			waitInstall := !p.installed && p.frozen
-			installCh, suspendCh := p.installCh, p.suspendCh
+			installCh, suspendCh, thawCh := p.installCh, p.suspendCh, p.thawCh
 			p.mu.Unlock()
 			if waitInstall {
 				select {
 				case <-installCh:
 				case <-suspendCh: // the swap died with the tunnel
+				case <-thawCh: // the swap was called off: this was the tunnel's own end
 				case <-p.abortCh:
 					return
 				}

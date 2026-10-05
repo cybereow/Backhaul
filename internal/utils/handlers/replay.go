@@ -54,6 +54,20 @@ func (r *replayRing) setLimit(n int) {
 	}
 }
 
+// discard drops everything retained and the storage with it: the flow no longer
+// replays. (ackTo keeps a small emptied buffer for the next bytes; a ring that
+// will never be used again must not, its share of the budget is being released.)
+func (r *replayRing) discard() {
+	r.mu.Lock()
+	r.base += uint64(r.size)
+	r.head, r.size, r.buf = 0, 0, nil
+	r.mu.Unlock()
+	select {
+	case r.space <- struct{}{}:
+	default:
+	}
+}
+
 func newReplayRing(limit int) *replayRing {
 	return &replayRing{limit: limit, space: make(chan struct{}, 1)}
 }

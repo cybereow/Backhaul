@@ -501,7 +501,7 @@ func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 	if endReplay {
 		// Nothing will be replayed any more: give the retained bytes and the
 		// flow's share of the replay budget back now, not when the flow ends.
-		p.replay.ring.ackTo(p.replay.ring.end())
+		p.replay.ring.discard()
 		if p.replayEnd != nil {
 			p.replayEnd()
 		}

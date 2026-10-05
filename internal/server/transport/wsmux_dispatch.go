@@ -732,19 +732,46 @@ func (s *WsMuxTransport) shouldPromote() bool {
 // new legs are recorded there, so the retirement of any of them moves the flow
 // again. A failure before the freeze leaves the flow where it was.
 func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper *handlers.PumpSwapper, f *resumableFlow) error {
-	legs, sessions, err := s.openStripedLegsOn(s.legsPerFlow())
-	if err != nil {
-		s.logger.Tracef("failed to open striped legs for promotion: %v", err)
-		return err // the flow continues where it is
+	// ctx bounds the whole move, the opening of the legs included: a pool session
+	// that swallows packets without closing would otherwise hold this for smux's
+	// own open timeout and a header write for ever, past the drain or regroup
+	// window the caller is working within.
+	type opened struct {
+		legs     []*smux.Stream
+		sessions []*smux.Session
+		err      error
+	}
+	openCh := make(chan opened, 1)
+	go func() {
+		l, ss, err := s.openStripedLegsOn(s.legsPerFlow())
+		openCh <- opened{l, ss, err}
+	}()
+	var o opened
+	select {
+	case o = <-openCh:
+	case <-ctx.Done():
+		go func() { closeLegs((<-openCh).legs) }() // whatever still arrives is not used
+		return ctx.Err()
+	}
+	legs, sessions := o.legs, o.sessions
+	if o.err != nil {
+		s.logger.Tracef("failed to open striped legs for promotion: %v", o.err)
+		return o.err // the flow continues where it is
 	}
 
+	headerBy := time.Now().Add(handlers.PromoteHandshakeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(headerBy) {
+		headerBy = d
+	}
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
+		_ = stream.SetWriteDeadline(headerBy)
 		if err := utils.SendFlowPromote(stream, flowID, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity)); err != nil {
 			s.logger.Tracef("failed to send promote header: %v", err)
 			closeLegs(legs)
 			return err
 		}
+		_ = stream.SetWriteDeadline(time.Time{})
 	}
 
 	conns := make([]net.Conn, len(legs))
@@ -760,7 +787,7 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 	// every leg), then freeze, answer with ours, build the wrapper and install
 	// it. A failure before the freeze leaves the flow plain; a later one aborts
 	// it (see PumpSwapper.PromoteOpened).
-	err = swapper.PromoteOpened(ctx, conns, func() (net.Conn, error) {
+	err := swapper.PromoteOpened(ctx, conns, func() (net.Conn, error) {
 		if s.config.StripeParity > 0 {
 			return striping.NewFEC(conns, striping.DefaultChunkSize, s.config.StripeFactor, s.config.StripeParity)
 		}
@@ -775,6 +802,7 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 	}
 	if f != nil {
 		f.moved(move, true)
+		s.moveOffRetired(f, sessions)
 	}
 	s.logger.Debugf("flow %d promoted to %d striped legs", flowID, len(conns))
 	return nil

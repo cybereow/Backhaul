@@ -639,14 +639,18 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 		case <-lost:
 			return
 		case <-reqNewConn:
+			// Both this and lost may have been ready, and a write to a connection
+			// whose peer has gone can still succeed here: look again before using it.
+			select {
+			case <-lost:
+				requeue(reqNewConn)
+				return
+			default:
+			}
 			err := utils.WriteControlSignal(conn, utils.SG_Chan)
 			if err != nil {
 				s.logger.Warn("failed to send request new connection signal. ", err)
-				// Not delivered: leave it for the channel that replaces this one.
-				select {
-				case reqNewConn <- struct{}{}:
-				default:
-				}
+				requeue(reqNewConn) // not delivered: for the channel that replaces this one
 				go s.onControlLost(g, conn)
 				return
 			}
@@ -685,6 +689,15 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 			}
 
 		}
+	}
+}
+
+// requeue puts back a request for a new pool connection that its taker could not
+// deliver (dropped if the queue is full, as a request is when it is made).
+func requeue(reqNewConn chan struct{}) {
+	select {
+	case reqNewConn <- struct{}{}:
+	default:
 	}
 }
 

@@ -361,7 +361,44 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow, old 
 		return err
 	}
 	f.moved(m, false)
+	s.moveOffRetired(f, m.to)
 	return nil
+}
+
+// moveOffRetired looks, once a flow has been put on sessions, whether any of them
+// was retired meanwhile, and moves the flow off again if so. A session picked for
+// a move can begin its rotation before the move is on record: that rotation's
+// look at the flows on it then comes too early to see this one, and nothing else
+// would move it off before the session's drain ends.
+func (s *WsMuxTransport) moveOffRetired(f *resumableFlow, sessions []*smux.Session) {
+	for _, sess := range sessions {
+		if sess.IsClosed() || s.registered(sess) {
+			continue
+		}
+		sess := sess
+		go func() {
+			budget := s.config.MaxDrain
+			if budget <= 0 {
+				budget = regroupWindow
+			}
+			ctx, cancel := context.WithTimeout(s.ctx, budget)
+			defer cancel()
+			s.moveFlowsOff(ctx, sess, []*resumableFlow{f}, migrateAttempts, "retiring session")
+		}()
+	}
+}
+
+// registered reports whether session is in the pool's registry: taking new
+// streams, not retired.
+func (s *WsMuxTransport) registered(session *smux.Session) bool {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	for _, ps := range s.sessions {
+		if ps.session == session {
+			return true
+		}
+	}
+	return false
 }
 
 // Moving a flow is tried again when it could not be started: a promotion or

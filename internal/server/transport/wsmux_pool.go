@@ -15,11 +15,14 @@ import (
 // CDNs) and an EWMA round-trip estimate maintained by probeSessionRTT.
 type pooledSession struct {
 	session   *smux.Session
-	halfClose bool          // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
-	cdn       string        // CDN identity: the remote IP the pool connection arrived from
-	rtt       atomic.Int64  // EWMA round-trip in nanoseconds; 0 until the first probe lands
-	born      time.Time     // when the session was admitted
-	maxAge    time.Duration // rotation age (0 = no rotation, so no age preference)
+	halfClose bool // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
+	// replayPromote: the client answered probeReplayPromote, so a promotable flow
+	// opened on this session may keep replay state until it is promoted.
+	replayPromote atomic.Bool
+	cdn           string        // CDN identity: the remote IP the pool connection arrived from
+	rtt           atomic.Int64  // EWMA round-trip in nanoseconds; 0 until the first probe lands
+	born          time.Time     // when the session was admitted
+	maxAge        time.Duration // rotation age (0 = no rotation, so no age preference)
 
 	// pendingOpens counts plain-leg OpenStreams that have picked this session but
 	// not yet returned (see openPlainLegPS). It is guarded by
@@ -245,28 +248,37 @@ func selectLegs(avail []*pooledSession, n int, score func(*pooledSession) float6
 // requeues and the promotion path stays plain - so the flow waits for the pool
 // to grow instead of running mis-striped.
 func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
+	streams, _, err := s.openStripedLegsOn(n)
+	return streams, err
+}
+
+// openStripedLegsOn is openStripedLegs that also says which pool session carries
+// each leg.
+func (s *WsMuxTransport) openStripedLegsOn(n int) ([]*smux.Stream, []*smux.Session, error) {
 	s.sessionsMu.Lock()
 	avail := make([]*pooledSession, len(s.sessions))
 	copy(avail, s.sessions)
 	s.sessionsMu.Unlock()
 
 	if len(avail) < n {
-		return nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
+		return nil, nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
 	}
 
 	chosen := selectLegs(avail, n, legScore)
 	streams := make([]*smux.Stream, 0, n)
+	sessions := make([]*smux.Session, 0, n)
 	for _, ps := range chosen {
 		stream, err := ps.session.OpenStream()
 		if err != nil {
 			for _, st := range streams {
 				st.Close()
 			}
-			return nil, fmt.Errorf("failed to open stripe leg: %w", err)
+			return nil, nil, fmt.Errorf("failed to open stripe leg: %w", err)
 		}
 		streams = append(streams, stream)
+		sessions = append(sessions, ps.session)
 	}
-	return streams, nil
+	return streams, sessions, nil
 }
 
 // openPlainLeg opens one stream for a single-leg (plain, non-striped) flow,

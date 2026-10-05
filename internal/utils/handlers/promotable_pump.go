@@ -15,7 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// errTunnelNoAcks: a flow with replay can only move onto tunnels that carry ACK
+// errTunnelNoAcks: a flow can only be resumed onto a tunnel that carries ACK
 // records (the half-close envelope); anything else would stall once its ring fills.
 var errTunnelNoAcks = errors.New("promotable pump: replay needs a tunnel that carries ACK records")
 
@@ -77,6 +77,7 @@ type PumpSwapper struct {
 	// Replay (level B): nil unless EnableReplay was called before Start.
 	replay      *replayState
 	replayGrow  func(cur int) int // nil: the ring keeps its size
+	replayEnd   func()            // nil, or called once when replay is given up (OnReplayEnd)
 	freezeWake  chan struct{}     // FreezeUp nudges an upload pump parked on a full replay ring
 	upDst       net.Conn          // the tunnel the upload pump writes to (guarded by mu); acks go there too
 	proxyHeader []byte            // the PROXY protocol header written before Start: payload that replay must retain
@@ -166,8 +167,8 @@ func (p *PumpSwapper) switched(up bool) {
 	p.installCh = make(chan struct{})
 	p.swaps++
 	p.mu.Unlock()
-	go old.Close()
-	if p.replay != nil {
+	go release(old)
+	if p.replaying() != nil {
 		// An ACK sent on the old tunnel after the peer stopped reading it never
 		// arrived, and with no more data nothing would trigger another: say again,
 		// on the new tunnel, how much has been delivered (ACKs are cumulative, so
@@ -177,6 +178,29 @@ func (p *PumpSwapper) switched(up bool) {
 		p.replay.resetAcked()
 		p.kickAck()
 	}
+}
+
+// ReleaseLinger is how long a tunnel the flow was moved off is kept for the peer
+// to finish with it. A variable only so tests can shorten it.
+var ReleaseLinger = 30 * time.Second
+
+// release lets go of a tunnel the flow has been moved off. This side has taken
+// everything it was promised from it, but what it sent last may still be on its
+// way: megabytes, on a slow path. Closing the tunnel outright takes its streams
+// off their pool sessions, and a session being retired is closed as soon as it
+// carries none - cutting those bytes off and, with them, the flow. So only the
+// sending side is ended here, and the tunnel is held until the peer, which lets
+// go of it once it has read everything, ends its side too.
+//
+// A tunnel that cannot end one side alone (a bare smux stream) is closed at once,
+// as before; nothing retires the session under one of those.
+func release(old net.Conn) {
+	cw, ok := old.(interface{ CloseWrite() error })
+	if ok && cw.CloseWrite() == nil {
+		_ = old.SetReadDeadline(time.Now().Add(ReleaseLinger))
+		_, _ = io.Copy(io.Discard, old) // until the peer's end, its close, or the deadline
+	}
+	old.Close()
 }
 
 // Abort tears the whole flow down: every conn is closed (destinations that can
@@ -396,10 +420,13 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 // bytes in total are delivered before the download switches. An error means the
 // flow ended or was aborted meanwhile; the caller must then Abort (post-freeze).
 func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
-	if p.replay != nil {
-		if _, ok := newTunnel.(ackConn); !ok {
-			return errTunnelNoAcks
-		}
+	// A tunnel that carries no ACK records (a striped group) ends the flow's
+	// replay: from here on it is a flow that a cut ends, like any other on such a
+	// tunnel. Both ends install the same kind of tunnel, so both drop it here.
+	endReplay := false
+	if p.replaying() != nil {
+		_, acks := newTunnel.(ackConn)
+		endReplay = !acks
 	}
 	p.mu.Lock()
 	if p.aborted || !p.frozen || p.installed || (p.upEnded && p.dlEnded) {
@@ -409,7 +436,9 @@ func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 	p.next = newTunnel
 	p.dlLimit = dlLimit
 	p.installed = true
-	if p.replay != nil {
+	if endReplay {
+		p.replay.off.Store(true)
+	} else if p.replaying() != nil {
 		// The new tunnel's ACKs are parsed by whoever reads it: the download pump
 		// once it switches, or nobody if the download already ended.
 		p.attachAcks(newTunnel)
@@ -433,6 +462,14 @@ func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 	}
 	ic := p.installCh
 	p.mu.Unlock()
+	if endReplay {
+		// Nothing will be replayed any more: give the retained bytes and the
+		// flow's share of the replay budget back now, not when the flow ends.
+		p.replay.ring.ackTo(p.replay.ring.end())
+		if p.replayEnd != nil {
+			p.replayEnd()
+		}
+	}
 	close(ic)
 	if resendEnd {
 		closeWrite(newTunnel) // the upload's EOF goes to the new tunnel too
@@ -641,7 +678,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				}
 				if n > 0 {
 					interrupted := false
-					if p.replay != nil {
+					if p.replaying() != nil {
 						// Keep what is being sent until the peer acknowledges it, and
 						// wait here (not in the app's socket) while a full window of it
 						// is unacknowledged.
@@ -854,7 +891,7 @@ dl:
 				p.dlEnded = true
 				p.checkParkedLocked()
 				p.mu.Unlock()
-				if p.replay != nil {
+				if p.replaying() != nil {
 					p.kickAck() // the peer is still waiting to learn how much arrived
 				}
 				closeWrite(app) // clean end of the download
@@ -917,7 +954,24 @@ type replayState struct {
 	endAckSent atomic.Bool
 	endAcked   atomic.Bool
 	timerSet   atomic.Bool // a delayed ack is armed
+
+	// off: the flow moved onto a tunnel without ACK records and no longer replays
+	// (see Install). Set once, never cleared.
+	off atomic.Bool
 }
+
+// replaying is the flow's replay state while it has one in use: nil for a flow
+// without replay and for one that gave it up.
+func (p *PumpSwapper) replaying() *replayState {
+	if r := p.replay; r != nil && !r.off.Load() {
+		return r
+	}
+	return nil
+}
+
+// OnReplayEnd registers what to do when the flow gives up its replay state before
+// it ends (release its share of the replay budget). Call before Start.
+func (p *PumpSwapper) OnReplayEnd(fn func()) { p.replayEnd = fn }
 
 // resetAcked forgets what was acknowledged: the new tunnel has not heard any of it.
 func (r *replayState) resetAcked() {
@@ -1002,6 +1056,10 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 	return nil
 }
 
+// Replaying reports whether the flow keeps replay state: it was given some and has
+// not given it up at a promotion.
+func (p *PumpSwapper) Replaying() bool { return p.replaying() != nil }
+
 // ReplayLen is the number of sent bytes not yet acknowledged (0 without replay).
 func (p *PumpSwapper) ReplayLen() int {
 	if p.replay == nil {
@@ -1028,7 +1086,7 @@ func (p *PumpSwapper) attachAcks(c net.Conn) {
 // soon, in batches, from a goroutine of their own so that a tunnel that cannot
 // take the ACK right now never stalls the download that produced it.
 func (p *PumpSwapper) noteDelivered() {
-	r := p.replay
+	r := p.replaying()
 	if r == nil {
 		return
 	}
@@ -1053,6 +1111,9 @@ func (p *PumpSwapper) armAckTimer() {
 
 func (p *PumpSwapper) kickAck() {
 	r := p.replay
+	if r.off.Load() {
+		return
+	}
 	if r.ackBusy.CompareAndSwap(false, true) {
 		go p.flushAck()
 	}

@@ -582,6 +582,10 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 10)
+	// Closed by the reader once the connection is gone. Until this handler is
+	// replaced it shares reqNewConn with its successor, and a request it took
+	// after that would be written to a dead connection and lost.
+	lost := make(chan struct{})
 
 	// Separate goroutine to continuously listen for messages. A worker of the
 	// generation, so Restart waits for it; the generation closing the socket is
@@ -607,6 +611,7 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 					// must not take the pool, and every flow running on it,
 					// down as well. Hold everything and wait for a reattach.
 					go s.onControlLost(g, conn)
+					close(lost)
 					return
 				}
 				// A zero-length binary frame (or padding-only payload) would
@@ -631,10 +636,17 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 			_ = conn.SetWriteDeadline(time.Now().Add(controlCloseWriteTimeout))
 			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
 			return
+		case <-lost:
+			return
 		case <-reqNewConn:
 			err := utils.WriteControlSignal(conn, utils.SG_Chan)
 			if err != nil {
 				s.logger.Warn("failed to send request new connection signal. ", err)
+				// Not delivered: leave it for the channel that replaces this one.
+				select {
+				case reqNewConn <- struct{}{}:
+				default:
+				}
 				go s.onControlLost(g, conn)
 				return
 			}
@@ -1177,6 +1189,11 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 				s.unregisterSession(session)
 				atomic.AddInt32(&s.sessionCounter, -1)
 				g.release(session)
+				if s.resumable() {
+					// Nothing to do for a session rotation retired (its flows were
+					// moved first) or once the generation is stopping.
+					s.regroupFlowsOn(g.ctx, session)
+				}
 			}) {
 				// Stopped between dequeue and admission: undo, and close the
 				// session (the generation would have, had it seen it).
@@ -1197,6 +1214,9 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 			}
 			if s.config.MaxConnAge > 0 {
 				g.start(func() { s.rotateStripedSession(g, session) })
+			}
+			if s.resumable() && s.config.ResumeWindow > 0 && s.config.PromoteBytes > 0 {
+				g.start(func() { s.probeReplayPromote(g, ps) })
 			}
 		}
 	}

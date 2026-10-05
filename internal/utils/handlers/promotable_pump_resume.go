@@ -53,10 +53,11 @@ func (p *PumpSwapper) SuspendedCh() <-chan struct{} {
 // what a failing pump does, and what the owner calls when it learns the tunnel is
 // gone before the pumps do (its session died) or when the peer asks to resume a
 // flow whose old tunnel still looks alive. It reports whether the flow is now
-// suspended: false when it cannot be (no replay, aborted, or finished).
+// suspended: false when it cannot be (no replay, or replay given up at a
+// promotion; aborted; or finished).
 func (p *PumpSwapper) Suspend() bool {
 	p.mu.Lock()
-	if p.replay == nil || p.aborted || (p.upEnded && p.dlEnded && p.replay.settled()) {
+	if p.replaying() == nil || p.aborted || (p.upEnded && p.dlEnded && p.replay.settled()) {
 		p.mu.Unlock()
 		return false
 	}
@@ -144,7 +145,7 @@ func (r *replayState) settled() bool {
 // then a cut tunnel would leave the peer short of bytes only this side can replay.
 // It returns at once for a flow without replay or one that was aborted.
 func (p *PumpSwapper) lingerForAcks() {
-	if p.replay == nil {
+	if p.replaying() == nil {
 		return
 	}
 	window := p.resumeWindow

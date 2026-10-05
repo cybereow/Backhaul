@@ -41,6 +41,40 @@ func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 	}
 }
 
+// probeReplayPromote asks the client, once per session, whether a promotable flow
+// may keep replay state (utils.AttachProbe), and records a yes on the session. An
+// older client refuses the mode; a probe that could not be made at all is tried
+// again a few times, and until one is answered the session's promotable flows
+// simply open without replay.
+func (s *WsMuxTransport) probeReplayPromote(g *wsGeneration, ps *pooledSession) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-g.ctx.Done():
+				return
+			case <-ps.session.CloseChan():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+		stream, err := ps.session.OpenStream()
+		if err != nil {
+			continue
+		}
+		_ = stream.SetDeadline(time.Now().Add(rttProbeTimeout))
+		accept := false
+		if err = utils.SendFlowAttach(stream, 0, utils.AttachProbe, 0); err == nil {
+			accept, _, err = utils.ReadAttachVerdict(stream)
+		}
+		stream.Close()
+		if err != nil {
+			continue
+		}
+		ps.replayPromote.Store(accept)
+		return
+	}
+}
+
 // measureRTT opens one ping stream, sends a nonce and times the echo. The stream
 // carries no user data and is closed immediately after.
 func measureRTT(session *smux.Session) (int64, error) {

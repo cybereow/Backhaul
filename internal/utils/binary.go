@@ -297,6 +297,11 @@ const (
 	// exchange how many bytes each has delivered, and replay the rest from their
 	// replay rings (FlowResumableReplay flows only).
 	AttachResume byte = 1
+	// AttachProbe attaches nothing (flowID 0): it asks whether the client lets a
+	// flow that keeps replay state be promoted, giving that state up on the striped
+	// group. A client that does accepts; an older one refuses the mode, and the
+	// server then opens promotable flows without replay, as it always did.
+	AttachProbe byte = 2
 )
 
 // Why a peer refused an attach (second byte of the verdict).

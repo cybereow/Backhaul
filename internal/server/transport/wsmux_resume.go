@@ -23,31 +23,95 @@ import (
 // wrapped in the half-close envelope from the first byte and run through a
 // PumpSwapper, so that when the session carrying them is retired the flow is moved
 // to a stream on another session, byte for byte, instead of being cut.
+//
+// A promotable flow (promote_bytes) is opened the same way, without replay state:
+// once it has been promoted its tunnel is a striped group with a leg on several
+// sessions, and when any of them is retired the whole flow is moved onto a fresh
+// group on the sessions that stay. Promotion and that move are the same swap.
+//
+// ponytail: a flow striped from its first byte (stripe_ports, or no promote_bytes)
+// has no flow id on the wire and is still cut when a session under it is retired;
+// giving it one is a protocol change, to be made when someone runs that with
+// cdn_max_age.
 
 var (
 	errNoOtherSession = errors.New("no other live pool session to move the flow to")
 	errAttachRefused  = errors.New("the client refused to move the flow")
 )
 
-// resumableFlow is one running resumable flow and the pool session carrying it.
+// resumableFlow is one running resumable flow and the pool sessions carrying its
+// tunnel: one for a plain stream, one per leg once it is promoted, and both the
+// old and the new ones while a swap between two tunnels is in flight.
 type resumableFlow struct {
 	id uint64
 	sw *handlers.PumpSwapper
 
-	mu   sync.Mutex
-	sess *smux.Session
+	mu      sync.Mutex
+	sess    []*smux.Session
+	striped bool // promoted: a move builds a new striped group, not a single stream
 }
 
+// session is the session of a flow on a plain stream (the first leg of a
+// promoted one).
 func (f *resumableFlow) session() *smux.Session {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.sess
+	if len(f.sess) == 0 {
+		return nil
+	}
+	return f.sess[0]
 }
 
 func (f *resumableFlow) setSession(s *smux.Session) {
+	f.setSessions([]*smux.Session{s}, false)
+}
+
+func (f *resumableFlow) setSessions(ss []*smux.Session, striped bool) {
 	f.mu.Lock()
-	f.sess = s
+	f.sess, f.striped = ss, striped
 	f.mu.Unlock()
+}
+
+// moving records that a swap is taking the flow onto ss: until it is settled the
+// flow counts as carried by the sessions it is on and by these, so the retirement
+// of any of them sees it. A swap that goes through ends with setSessions, one
+// that is refused with stayed.
+func (f *resumableFlow) moving(ss []*smux.Session) {
+	f.mu.Lock()
+	f.sess = append(append([]*smux.Session(nil), f.sess...), ss...)
+	f.mu.Unlock()
+}
+
+// stayed takes back what moving recorded: the swap onto ss was refused and the
+// flow is where it was (or where another swap, which won, has put it).
+func (f *resumableFlow) stayed(ss []*smux.Session) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, gone := range ss {
+		for i := len(f.sess) - 1; i >= 0; i-- {
+			if f.sess[i] == gone {
+				f.sess = append(f.sess[:i:i], f.sess[i+1:]...)
+				break
+			}
+		}
+	}
+}
+
+func (f *resumableFlow) on(s *smux.Session) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, x := range f.sess {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *resumableFlow) isStriped() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.striped
 }
 
 // newFlowID is a random non-zero 64-bit id. It is not guessable, and it is never
@@ -64,11 +128,9 @@ func newFlowID() uint64 {
 	}
 }
 
-// resumable reports whether plain flows are opened as resumable. Promotion (a
-// plain flow moving onto a striped group) takes precedence: the two use the same
-// swapper for different purposes and are not combined.
-func (s *WsMuxTransport) resumable(promotable bool) bool {
-	return s.config.MuxVersion >= 2 && s.config.MaxConnAge > 0 && !promotable
+// resumable reports whether plain flows are opened as resumable.
+func (s *WsMuxTransport) resumable() bool {
+	return s.config.MuxVersion >= 2 && s.config.MaxConnAge > 0
 }
 
 func (s *WsMuxTransport) registerFlow(f *resumableFlow) {
@@ -92,7 +154,7 @@ func (s *WsMuxTransport) flowsOn(sess *smux.Session) []*resumableFlow {
 	defer s.flowsMu.Unlock()
 	var out []*resumableFlow
 	for _, f := range s.flows {
-		if f.session() == sess {
+		if f.on(sess) {
 			out = append(out, f)
 		}
 	}
@@ -102,8 +164,9 @@ func (s *WsMuxTransport) flowsOn(sess *smux.Session) []*resumableFlow {
 // dispatchResumable runs one resumable flow until it ends. The swapper is
 // registered before its pumps start, so a move can never find a half-built flow.
 // With replayLimit > 0 the flow also keeps what it sent until acknowledged and is
-// resumed on another session if its own is cut without warning.
-func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, grant *handlers.ReplayGrant) {
+// resumed on another session if its own is cut without warning. A promotable flow
+// is also moved onto a striped group once it has sent promote_bytes.
+func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, grant *handlers.ReplayGrant, promotable bool) {
 	defer grant.Release()
 	sw := handlers.NewPromotablePump(g.ctx, s.config.ProxyProtocol, appConn, handlers.NewHalfCloseConn(stream), s.logger, s.usageMonitor, appConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 	if sw == nil {
@@ -113,6 +176,7 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 		// The client was told (by the flow's kind byte) that this flow keeps replay
 		// state, so a flow that cannot is not an option: end it.
 		sw.SetReplayGrower(grant.Grow)
+		sw.OnReplayEnd(grant.Release)
 		if err := sw.EnableReplay(grant.Limit()); err != nil {
 			s.logger.Errorf("resumable flow %d: %v", flowID, err)
 			sw.Abort()
@@ -120,12 +184,15 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 		}
 		sw.SetResumeWindow(s.config.ResumeWindow)
 	}
-	f := &resumableFlow{id: flowID, sw: sw, sess: ps.session}
+	f := &resumableFlow{id: flowID, sw: sw, sess: []*smux.Session{ps.session}}
 	s.registerFlow(f)
 	defer s.unregisterFlow(flowID)
 	sw.Start()
 	if grant != nil {
 		go s.driveResume(g.ctx, f)
+	}
+	if promotable {
+		s.watchPromotion(g, flowID, sw, f)
 	}
 	<-sw.DoneWait()
 }
@@ -216,18 +283,26 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow) error
 	return nil
 }
 
-// migrateFlow moves one flow onto a fresh stream on another live session. The
-// client may refuse before anything freezes (unknown or finished flow, swap
-// already running), in which case the flow is untouched. A failure after both ends
-// froze aborts the flow, which is no worse than the cut it was avoiding.
-func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow) error {
+// migrateFlow moves one flow off the session old, which is being retired: onto a
+// fresh stream on another live session, or, for a promoted flow, onto a fresh
+// striped group. The client may refuse before anything freezes (unknown or
+// finished flow, swap already running), in which case the flow is untouched. A
+// failure after both ends froze aborts the flow, which is no worse than the cut it
+// was avoiding.
+func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow, old *smux.Session) error {
+	if !f.on(old) {
+		return nil // a swap that was in flight has taken it off already
+	}
+	if f.isStriped() {
+		return s.promoteFlow(ctx, f.id, f.sw, f)
+	}
 	// The retiring session has already left the registry, so this picks among the
 	// others: lowest score wins, and the age bias prefers the youngest.
 	stream, ps, err := s.openPlainLegPS()
 	if err != nil {
 		return fmt.Errorf("%w: %v", errNoOtherSession, err)
 	}
-	if ps.session == f.session() {
+	if f.on(ps.session) {
 		stream.Close()
 		return errNoOtherSession
 	}
@@ -251,17 +326,26 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow) erro
 	// Record the new session before the swap, so a retirement of it that lands
 	// during the swap already sees this flow. A swap refused before it froze
 	// leaves the flow where it was.
-	prev := f.session()
-	f.setSession(ps.session)
+	to := []*smux.Session{ps.session}
+	f.moving(to)
 	err = f.sw.Promote(ctx, []net.Conn{stream}, func() (net.Conn, error) {
 		return handlers.NewHalfCloseConn(stream), nil
 	})
 	if err != nil {
-		f.setSession(prev)
+		f.stayed(to)
 		return err
 	}
+	f.setSession(ps.session)
 	return nil
 }
+
+// Moving a flow is tried again when it could not be started: a promotion or
+// another move of the same flow is still settling, or the pool is momentarily too
+// narrow for a group.
+const (
+	migrateAttempts = 5
+	migrateRetry    = time.Second
+)
 
 // migrateParallel bounds how many flows are moved at once, so the handshakes of a
 // busy session do not all compete for the same few streams and time out.
@@ -270,14 +354,39 @@ const migrateParallel = 8
 // migrateFlowsOff moves every resumable flow off a session that is being retired.
 // It returns when all of them have been moved or given up on; ctx bounds it.
 func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session) {
-	var flows []*resumableFlow
-	for _, f := range s.flowsOn(old) {
-		if f.sw.Swappable() { // a flow already suspended or being moved is not ours to move
-			flows = append(flows, f)
+	flows := s.flowsOn(old)
+	if failed := s.moveFlowsOff(ctx, old, flows, "retiring session"); failed > 0 {
+		s.recordEvent("flows_not_moved", fmt.Sprintf("%d of %d flow(s) could not be moved off a retiring session; they stay on it until it drains or is cut", failed, len(flows)))
+	}
+}
+
+// regroupWindow bounds the rebuilding of the striped groups a lost session left
+// short of a leg.
+const regroupWindow = 30 * time.Second
+
+// regroupFlowsOn rebuilds the striped group of every promoted flow that had a leg
+// on dead, a session that ended without being retired first. Only a group with
+// parity to spare (mux_stripe_parity) is still running then, on fewer legs than
+// configured: left like that, the next lost leg could be one too many, so it is
+// moved onto a full group at once. (A flow on a plain stream is not handled
+// here: with replay state it is resumed by driveResume, without it it has ended.)
+func (s *WsMuxTransport) regroupFlowsOn(ctx context.Context, dead *smux.Session) {
+	var striped []*resumableFlow
+	for _, f := range s.flowsOn(dead) {
+		if f.isStriped() {
+			striped = append(striped, f)
 		}
 	}
+	ctx, cancel := context.WithTimeout(ctx, regroupWindow)
+	defer cancel()
+	s.moveFlowsOff(ctx, dead, striped, "lost session")
+}
+
+// moveFlowsOff moves flows off the session old, a few at a time, trying again the
+// ones that could not be started. It returns how many it had to leave.
+func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, flows []*resumableFlow, what string) int {
 	if len(flows) == 0 {
-		return
+		return 0
 	}
 	var moved, failed, finished int
 	var mu sync.Mutex
@@ -298,7 +407,24 @@ func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session)
 		go func(f *resumableFlow) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			err := s.migrateFlow(ctx, f)
+			var err error
+			for attempt := 1; ; attempt++ {
+				// A flow that is suspended or being swapped right now is not ours to
+				// move; it may be by the next look.
+				if err = handlers.ErrPromoteUnavailable; f.sw.Swappable() || !f.on(old) {
+					err = s.migrateFlow(ctx, f, old)
+				}
+				if err == nil || attempt == migrateAttempts {
+					break
+				}
+				select {
+				case <-f.sw.DoneWait():
+				case <-ctx.Done():
+				case <-time.After(migrateRetry):
+					continue
+				}
+				break
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {
@@ -311,15 +437,13 @@ func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session)
 				default:
 				}
 				failed++
-				s.logger.Debugf("moving flow %d off a retiring session: %v", f.id, err)
+				s.logger.Debugf("%s: moving flow %d off it: %v", what, f.id, err)
 				return
 			}
 			moved++
 		}(f)
 	}
 	wg.Wait()
-	s.logger.Debugf("retiring session: %d flow(s) moved, %d finished meanwhile, %d left on it", moved, finished, failed)
-	if failed > 0 {
-		s.recordEvent("flows_not_moved", fmt.Sprintf("%d of %d flow(s) could not be moved off a retiring session; they stay on it until it drains or is cut", failed, len(flows)))
-	}
+	s.logger.Debugf("%s: %d flow(s) moved, %d finished meanwhile, %d left on it", what, moved, finished, failed)
+	return failed
 }

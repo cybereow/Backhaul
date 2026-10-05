@@ -546,6 +546,14 @@ func (s *Stream) Close() error {
 	}
 }
 
+// FinCh is closed once the peer has closed its side of the stream (its FIN
+// arrived). It says nothing about data: what the peer sent before the FIN may
+// still be unread here. A stream whose session ends never gets a FIN; watch
+// GetDieCh for that.
+func (s *Stream) FinCh() <-chan struct{} {
+	return s.chFinEvent
+}
+
 // GetDieCh returns a readonly chan which can be readable
 // when the stream is to be closed.
 func (s *Stream) GetDieCh() <-chan struct{} {

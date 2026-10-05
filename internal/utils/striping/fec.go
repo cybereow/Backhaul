@@ -879,6 +879,9 @@ func (c *FECConn) teardown() error {
 func (c *FECConn) LocalAddr() net.Addr  { return c.legs[0].LocalAddr() }
 func (c *FECConn) RemoteAddr() net.Addr { return c.legs[0].RemoteAddr() }
 
+// PeerClosed: see legsPeerClosed.
+func (c *FECConn) PeerClosed() <-chan struct{} { return legsPeerClosed(c.legs) }
+
 func (c *FECConn) SetDeadline(t time.Time) error {
 	c.rd.set(t)
 	return c.SetWriteDeadline(t)

@@ -1371,6 +1371,38 @@ func (d *readDeadline) timer() <-chan time.Time {
 	return time.After(time.Until(time.Unix(0, at)))
 }
 
+// legsPeerClosed is closed once the peer has closed every leg (or the leg is
+// gone: closed here, or its session ended); nil when a leg cannot tell (not a
+// smux stream). The peer closes the legs of a striped connection when it has
+// finished with it, so this is "the peer has read everything it wanted from
+// here" - unlike the end marker, which only ends its data.
+func legsPeerClosed(legs []net.Conn) <-chan struct{} {
+	type closer interface {
+		FinCh() <-chan struct{}
+		GetDieCh() <-chan struct{}
+	}
+	for _, leg := range legs {
+		if _, ok := leg.(closer); !ok {
+			return nil
+		}
+	}
+	gone := make(chan struct{})
+	go func() {
+		for _, leg := range legs {
+			st := leg.(closer)
+			select {
+			case <-st.FinCh():
+			case <-st.GetDieCh():
+			}
+		}
+		close(gone)
+	}()
+	return gone
+}
+
+// PeerClosed: see legsPeerClosed.
+func (c *Conn) PeerClosed() <-chan struct{} { return legsPeerClosed(c.legs) }
+
 func (c *Conn) SetDeadline(t time.Time) error {
 	c.rd.set(t)
 	return c.SetWriteDeadline(t)

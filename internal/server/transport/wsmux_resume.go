@@ -172,6 +172,7 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 	if sw == nil {
 		return // failed proxy protocol
 	}
+	sw.HoldReleasedTunnels() // this end closes the sessions; see PumpSwapper.release
 	if grant != nil {
 		// The client was told (by the flow's kind byte) that this flow keeps replay
 		// state, so a flow that cannot is not an option: end it.

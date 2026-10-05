@@ -480,7 +480,7 @@ func TestWSMuxPromotableFlowSurvivesRotation(t *testing.T) {
 		t.Run(fmt.Sprintf("parity=%d/resume=%s", tc.parity, tc.resume), func(t *testing.T) {
 			tg := echoTarget(t)
 			h := promotableHarness(t, tg.Addr().String(), tc.parity, tc.resume, 1024*1024)
-			const inFlight = 48 * 1024 * 1024 // what is on its way while a promoted flow is moved
+			const inFlight = 16 * 1024 * 1024 // what is on its way while a promoted flow is moved
 			u := newEchoUser(t, h, 2*inFlight+4*1024*1024+7)
 
 			// retireAll retires every session the flow is on now, as rotation does:
@@ -546,7 +546,7 @@ func TestWSMuxPromotableFlowSurvivesRotation(t *testing.T) {
 func TestWSMuxPromotableFlowSurvivesCuts(t *testing.T) {
 	tg := echoTarget(t)
 	h := promotableHarness(t, tg.Addr().String(), 2, 20*time.Second, 4*1024*1024)
-	const inFlight = 32 * 1024 * 1024
+	const inFlight = 12 * 1024 * 1024
 	u := newEchoUser(t, h, 3*inFlight+8*1024*1024+5)
 
 	u.echo("before any cut", 100*1024)

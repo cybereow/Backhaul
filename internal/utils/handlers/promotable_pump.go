@@ -75,12 +75,14 @@ type PumpSwapper struct {
 	done    chan struct{}
 
 	// Replay (level B): nil unless EnableReplay was called before Start.
-	replay      *replayState
-	replayGrow  func(cur int) int // nil: the ring keeps its size
-	replayEnd   func()            // nil, or called once when replay is given up (OnReplayEnd)
-	freezeWake  chan struct{}     // FreezeUp nudges an upload pump parked on a full replay ring
-	upDst       net.Conn          // the tunnel the upload pump writes to (guarded by mu); acks go there too
-	proxyHeader []byte            // the PROXY protocol header written before Start: payload that replay must retain
+	replay     *replayState
+	replayGrow func(cur int) int // nil: the ring keeps its size
+	replayEnd  func()            // nil, or called once when replay is given up (OnReplayEnd)
+
+	holdReleased bool          // HoldReleasedTunnels
+	freezeWake   chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
+	upDst        net.Conn      // the tunnel the upload pump writes to (guarded by mu); acks go there too
+	proxyHeader  []byte        // the PROXY protocol header written before Start: payload that replay must retain
 
 	// What Start needs.
 	ctx        context.Context
@@ -167,7 +169,7 @@ func (p *PumpSwapper) switched(up bool) {
 	p.installCh = make(chan struct{})
 	p.swaps++
 	p.mu.Unlock()
-	go release(old)
+	go p.release(old)
 	if p.replaying() != nil {
 		// An ACK sent on the old tunnel after the peer stopped reading it never
 		// arrived, and with no more data nothing would trigger another: say again,
@@ -184,21 +186,32 @@ func (p *PumpSwapper) switched(up bool) {
 // to finish with it. A variable only so tests can shorten it.
 var ReleaseLinger = 30 * time.Second
 
+// HoldReleasedTunnels makes the flow keep a tunnel it was moved off until the
+// peer has closed it (see release). It is for the end that decides when the
+// sessions under the tunnels are closed - the server, which retires them - and
+// only that end: the peer must close at once, or each would wait for the other.
+// Call before Start.
+func (p *PumpSwapper) HoldReleasedTunnels() { p.holdReleased = true }
+
 // release lets go of a tunnel the flow has been moved off. This side has taken
 // everything it was promised from it, but what it sent last may still be on its
-// way: megabytes, on a slow path. Closing the tunnel outright takes its streams
-// off their pool sessions, and a session being retired is closed as soon as it
-// carries none - cutting those bytes off and, with them, the flow. So only the
-// sending side is ended here, and the tunnel is held until the peer, which lets
-// go of it once it has read everything, ends its side too.
-//
-// A tunnel that cannot end one side alone (a bare smux stream) is closed at once,
-// as before; nothing retires the session under one of those.
-func release(old net.Conn) {
-	cw, ok := old.(interface{ CloseWrite() error })
-	if ok && cw.CloseWrite() == nil {
-		_ = old.SetReadDeadline(time.Now().Add(ReleaseLinger))
-		_, _ = io.Copy(io.Discard, old) // until the peer's end, its close, or the deadline
+// way: megabytes, on a slow path. Closing the tunnel takes its streams off their
+// pool sessions, and a session being retired is closed as soon as it carries
+// none - cutting those bytes off and, with them, the flow. So the end that
+// closes sessions (HoldReleasedTunnels) keeps the tunnel until the peer has
+// closed its side, which it does once it has read everything it was promised.
+// Nothing is read from or written to the tunnel meanwhile.
+func (p *PumpSwapper) release(old net.Conn) {
+	if pc, ok := old.(interface{ PeerClosed() <-chan struct{} }); ok && p.holdReleased {
+		if gone := pc.PeerClosed(); gone != nil {
+			linger := time.NewTimer(ReleaseLinger)
+			select {
+			case <-gone:
+			case <-linger.C:
+			case <-p.abortCh:
+			}
+			linger.Stop()
+		}
 	}
 	old.Close()
 }

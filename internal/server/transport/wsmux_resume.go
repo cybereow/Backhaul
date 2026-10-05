@@ -47,9 +47,15 @@ type resumableFlow struct {
 	sw *handlers.PumpSwapper
 
 	mu      sync.Mutex
-	sess    []*smux.Session
-	striped bool // promoted: a move builds a new striped group, not a single stream
+	sess    []*smux.Session // where its tunnel is
+	striped bool            // promoted: a move builds a new striped group, not a single stream
+	moves   []*flowMove     // swaps in flight, each with the sessions it is taking the flow onto
 }
+
+// flowMove is one swap in flight. Each attempt keeps its own entry: two of them
+// often pick the same sessions, and the one that is refused must take back only
+// what it recorded, not what the other, which went through, has made the flow's.
+type flowMove struct{ to []*smux.Session }
 
 // session is the session of a flow on a plain stream (the first leg of a
 // promoted one).
@@ -74,25 +80,37 @@ func (f *resumableFlow) setSessions(ss []*smux.Session, striped bool) {
 
 // moving records that a swap is taking the flow onto ss: until it is settled the
 // flow counts as carried by the sessions it is on and by these, so the retirement
-// of any of them sees it. A swap that goes through ends with setSessions, one
-// that is refused with stayed.
-func (f *resumableFlow) moving(ss []*smux.Session) {
+// of any of them sees it. A swap that goes through ends with moved, one that is
+// refused with stayed.
+func (f *resumableFlow) moving(ss []*smux.Session) *flowMove {
+	m := &flowMove{to: ss}
 	f.mu.Lock()
-	f.sess = append(append([]*smux.Session(nil), f.sess...), ss...)
+	f.moves = append(f.moves, m)
+	f.mu.Unlock()
+	return m
+}
+
+// stayed ends a swap that was refused: the flow is where it was (or where
+// another swap, which went through, has put it).
+func (f *resumableFlow) stayed(m *flowMove) {
+	f.mu.Lock()
+	f.dropMoveLocked(m)
 	f.mu.Unlock()
 }
 
-// stayed takes back what moving recorded: the swap onto ss was refused and the
-// flow is where it was (or where another swap, which won, has put it).
-func (f *resumableFlow) stayed(ss []*smux.Session) {
+// moved ends a swap that went through: the flow's tunnel is now on m's sessions.
+func (f *resumableFlow) moved(m *flowMove, striped bool) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, gone := range ss {
-		for i := len(f.sess) - 1; i >= 0; i-- {
-			if f.sess[i] == gone {
-				f.sess = append(f.sess[:i:i], f.sess[i+1:]...)
-				break
-			}
+	f.dropMoveLocked(m)
+	f.sess, f.striped = m.to, striped
+	f.mu.Unlock()
+}
+
+func (f *resumableFlow) dropMoveLocked(m *flowMove) {
+	for i, x := range f.moves {
+		if x == m {
+			f.moves = append(f.moves[:i:i], f.moves[i+1:]...)
+			return
 		}
 	}
 }
@@ -103,6 +121,13 @@ func (f *resumableFlow) on(s *smux.Session) bool {
 	for _, x := range f.sess {
 		if x == s {
 			return true
+		}
+	}
+	for _, m := range f.moves {
+		for _, x := range m.to {
+			if x == s {
+				return true
+			}
 		}
 	}
 	return false
@@ -327,22 +352,24 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow, old 
 	// Record the new session before the swap, so a retirement of it that lands
 	// during the swap already sees this flow. A swap refused before it froze
 	// leaves the flow where it was.
-	to := []*smux.Session{ps.session}
-	f.moving(to)
+	m := f.moving([]*smux.Session{ps.session})
 	err = f.sw.Promote(ctx, []net.Conn{stream}, func() (net.Conn, error) {
 		return handlers.NewHalfCloseConn(stream), nil
 	})
 	if err != nil {
-		f.stayed(to)
+		f.stayed(m)
 		return err
 	}
-	f.setSession(ps.session)
+	f.moved(m, false)
 	return nil
 }
 
 // Moving a flow is tried again when it could not be started: a promotion or
 // another move of the same flow is still settling, or the pool is momentarily too
-// narrow for a group.
+// narrow for a group. A rotation gives a flow a few tries, so that flows that
+// cannot be moved do not hold the others up; rebuilding a group after a lost
+// session keeps trying for its whole window, because what it waits for is the
+// client dialling a replacement, which can take that long.
 const (
 	migrateAttempts = 5
 	migrateRetry    = time.Second
@@ -356,7 +383,7 @@ const migrateParallel = 8
 // It returns when all of them have been moved or given up on; ctx bounds it.
 func (s *WsMuxTransport) migrateFlowsOff(ctx context.Context, old *smux.Session) {
 	flows := s.flowsOn(old)
-	if failed := s.moveFlowsOff(ctx, old, flows, "retiring session"); failed > 0 {
+	if failed := s.moveFlowsOff(ctx, old, flows, migrateAttempts, "retiring session"); failed > 0 {
 		s.recordEvent("flows_not_moved", fmt.Sprintf("%d of %d flow(s) could not be moved off a retiring session; they stay on it until it drains or is cut", failed, len(flows)))
 	}
 }
@@ -380,12 +407,13 @@ func (s *WsMuxTransport) regroupFlowsOn(ctx context.Context, dead *smux.Session)
 	}
 	ctx, cancel := context.WithTimeout(ctx, regroupWindow)
 	defer cancel()
-	s.moveFlowsOff(ctx, dead, striped, "lost session")
+	s.moveFlowsOff(ctx, dead, striped, 0, "lost session")
 }
 
 // moveFlowsOff moves flows off the session old, a few at a time, trying again the
-// ones that could not be started. It returns how many it had to leave.
-func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, flows []*resumableFlow, what string) int {
+// ones that could not be started: attempts times each, or until ctx ends when
+// attempts is 0. It returns how many it had to leave.
+func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, flows []*resumableFlow, attempts int, what string) int {
 	if len(flows) == 0 {
 		return 0
 	}
@@ -415,7 +443,7 @@ func (s *WsMuxTransport) moveFlowsOff(ctx context.Context, old *smux.Session, fl
 				if err = handlers.ErrPromoteUnavailable; f.sw.Swappable() || !f.on(old) {
 					err = s.migrateFlow(ctx, f, old)
 				}
-				if err == nil || attempt == migrateAttempts {
+				if err == nil || attempt == attempts {
 					break
 				}
 				select {

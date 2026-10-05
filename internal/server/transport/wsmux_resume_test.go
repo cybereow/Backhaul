@@ -581,3 +581,32 @@ func TestWSMuxPromotableFlowSurvivesCuts(t *testing.T) {
 	}
 	u.finish()
 }
+
+// Two swaps of one flow in flight at once usually pick the same sessions. The one
+// that is refused takes back only its own claim: the flow stays on record for
+// every session the other, which went through, put it on - or rotation and a
+// lost session would no longer find it there.
+func TestFlowMoveRefusedLeavesTheWinnersSessions(t *testing.T) {
+	a, b, c := &smux.Session{}, &smux.Session{}, &smux.Session{}
+	for _, loserFirst := range []bool{false, true} {
+		f := &resumableFlow{sess: []*smux.Session{a}}
+		won := f.moving([]*smux.Session{b, c})
+		lost := f.moving([]*smux.Session{b, c})
+		if !f.on(a) || !f.on(b) || !f.on(c) {
+			t.Fatal("a flow being moved is not on record for both its old and its new sessions")
+		}
+		if loserFirst {
+			f.stayed(lost)
+			if !f.on(a) || !f.on(b) || !f.on(c) {
+				t.Fatal("the refused swap took the other swap's sessions with it")
+			}
+			f.moved(won, true)
+		} else {
+			f.moved(won, true)
+			f.stayed(lost)
+		}
+		if f.on(a) || !f.on(b) || !f.on(c) || !f.isStriped() || len(f.sessions()) != 2 {
+			t.Fatalf("loserFirst=%v: after the swap the flow is on %d session(s), old=%v new=%v,%v", loserFirst, len(f.sessions()), f.on(a), f.on(b), f.on(c))
+		}
+	}
+}

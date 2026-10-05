@@ -752,8 +752,9 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 		conns[i] = st
 	}
 
+	var move *flowMove
 	if f != nil {
-		f.moving(sessions)
+		move = f.moving(sessions)
 	}
 	// Wait for the client's byte count on raw leg 0 (it sends it once it has
 	// every leg), then freeze, answer with ours, build the wrapper and install
@@ -767,13 +768,13 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 	})
 	if err != nil {
 		if f != nil {
-			f.stayed(sessions)
+			f.stayed(move)
 		}
 		s.logger.Warnf("promotion of flow %d failed: %v", flowID, err)
 		return err
 	}
 	if f != nil {
-		f.setSessions(sessions, true)
+		f.moved(move, true)
 	}
 	s.logger.Debugf("flow %d promoted to %d striped legs", flowID, len(conns))
 	return nil

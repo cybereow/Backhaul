@@ -16,27 +16,37 @@ import (
 func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 	ticker := time.NewTicker(rttProbeEvery)
 	defer ticker.Stop()
+	// The first probe goes out at once: until one has been answered nothing says
+	// that a new connection gets through at all, and a new one is the cheapest
+	// to place flows on.
+	first := make(chan struct{}, 1)
+	first <- struct{}{}
 	for {
 		select {
 		case <-g.ctx.Done():
 			return
 		case <-ps.session.CloseChan():
 			return
+		case <-first:
 		case <-ticker.C:
-			rtt, err := measureRTT(ps.session)
-			if err != nil {
-				// A transient probe failure (a busy session refusing a stream)
-				// shouldn't discard a good estimate; just try again next tick.
-				s.logger.Tracef("rtt probe on %s failed: %v", ps.cdn, err)
-				continue
-			}
-			// EWMA (7/8 old, 1/8 new) so a single jittery sample doesn't swing
-			// selection; the first sample seeds it directly.
-			if old := ps.rtt.Load(); old > 0 {
-				ps.rtt.Store((old*7 + rtt) / 8)
-			} else {
-				ps.rtt.Store(rtt)
-			}
+		}
+		rtt, err := measureRTT(ps.session)
+		if err != nil {
+			// A transient probe failure (a busy session refusing a stream)
+			// shouldn't discard a good estimate; just try again next tick. But
+			// an unanswered probe is also how a connection that has stopped
+			// getting through shows from end to end (see wsmux_stall.go).
+			ps.probeFails.Add(1)
+			s.logger.Tracef("rtt probe on %s failed: %v", ps.cdn, err)
+			continue
+		}
+		ps.probeFails.Store(0)
+		// EWMA (7/8 old, 1/8 new) so a single jittery sample doesn't swing
+		// selection; the first sample seeds it directly.
+		if old := ps.rtt.Load(); old > 0 {
+			ps.rtt.Store((old*7 + rtt) / 8)
+		} else {
+			ps.rtt.Store(rtt)
 		}
 	}
 }

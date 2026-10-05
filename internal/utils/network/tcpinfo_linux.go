@@ -23,6 +23,11 @@ type TCPDelivery struct {
 	// AppLimited is set when the latest delivery-rate sample was taken with less
 	// to send than the path would take.
 	AppLimited bool
+	// Backoff is how many times in a row the retransmission (or zero-window
+	// probe) timer has fired without the peer acknowledging anything since: 0
+	// on a connection that is getting through, 2 and more on one that has been
+	// silent for about a second or longer.
+	Backoff uint8
 }
 
 // tcpInfoFlagsOffset is the byte of struct tcp_info that carries
@@ -65,6 +70,7 @@ func TCPDeliveryInfo(c net.Conn) (d TCPDelivery, ok bool) {
 			Busy:       time.Duration(info.Busy_time) * time.Microsecond,
 			NotSent:    info.Notsent_bytes,
 			AppLimited: flags&appLimitedMask != 0,
+			Backoff:    info.Backoff,
 		}
 		ok = true
 	})

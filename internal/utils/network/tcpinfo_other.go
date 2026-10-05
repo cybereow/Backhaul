@@ -13,6 +13,7 @@ type TCPDelivery struct {
 	Busy       time.Duration
 	NotSent    uint32
 	AppLimited bool
+	Backoff    uint8
 }
 
 // TCPDeliveryInfo needs Linux's TCP_INFO; elsewhere there is nothing to report.

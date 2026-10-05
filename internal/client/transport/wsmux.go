@@ -1046,7 +1046,12 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 				c.logger.Debug("session is closed: ", err)
 				return
 			}
-			c.setupStream(stream, tunnelConn.RemoteAddr().String(), run)
+			// Each stream reads its own header: one whose header is late (it waits
+			// behind queued data, or its opener is still opening the other legs of
+			// a group) must not hold up the streams accepted after it for the
+			// whole header timeout - they are other flows.
+			remote := tunnelConn.RemoteAddr().String()
+			run(stream, func() { c.setupStream(stream, remote, run) })
 		}
 	}
 }

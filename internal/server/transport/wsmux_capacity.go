@@ -148,10 +148,14 @@ func hostKey(host string) string {
 // slowness is the session's placement penalty: 1 for a session whose domain is
 // not known to be slow.
 func (ps *pooledSession) slowness() float64 {
+	slow := 1.0
 	if b := ps.slow.Load(); b != 0 {
-		return math.Float64frombits(b)
+		slow = math.Float64frombits(b)
 	}
-	return 1
+	if ps.stalledSince.Load() != 0 {
+		slow *= stallPenalty
+	}
+	return slow
 }
 
 // capacityPenalty is the charge for a host that carries est when the best
@@ -179,6 +183,7 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 			copy(sessions, s.sessions)
 			s.sessionsMu.Unlock()
 			sampleCapacity(sessions, hosts, now, network.TCPDeliveryInfo)
+			s.moveOffStalled(g, sessions, now)
 		}
 	}
 }
@@ -192,6 +197,7 @@ func sampleCapacity(sessions []*pooledSession, hosts map[string]*hostCapacity, n
 		if ps.conn != nil {
 			cur.d, cur.valid = info(ps.conn)
 		}
+		ps.noteHealth(now, cur.valid && cur.d.Backoff >= stallBackoff)
 		rate, backlogged, ok := deliveredRate(ps.capLast, cur)
 		ps.capLast = cur
 		if !ok {

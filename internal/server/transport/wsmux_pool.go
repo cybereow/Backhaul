@@ -32,11 +32,16 @@ type pooledSession struct {
 	// Capacity-aware placement (see wsmux_capacity.go). host and conn are fixed
 	// at registration; capLast belongs to capacityLoop alone; slow and capEst are
 	// what it publishes.
-	host    string        // domain the client dialed for this connection (the CDN identity when unknown)
-	conn    net.Conn      // the socket under the session, for TCP_INFO; nil when unknown
-	capLast capSample     // the previous look at the socket
-	capEst  atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
-	slow    atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
+	host    string    // domain the client dialed for this connection (the CDN identity when unknown)
+	conn    net.Conn  // the socket under the session, for TCP_INFO; nil when unknown
+	capLast capSample // the previous look at the socket
+	// Whether the connection is getting through right now (see wsmux_stall.go):
+	// stalledSince is when it stopped looking like it (unix nanos, 0 = it does),
+	// probeFails how many RTT probes in a row went unanswered.
+	stalledSince atomic.Int64
+	probeFails   atomic.Int32
+	capEst       atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
+	slow         atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
 }
 
 // Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;
@@ -62,8 +67,8 @@ type pooledSession struct {
 // unfairly preferred nor shunned before its first probe.
 const (
 	unprobedRTTms   = 40.0
-	rttProbeEvery   = 5 * time.Second
-	rttProbeTimeout = 10 * time.Second
+	rttProbeEvery   = 2 * time.Second
+	rttProbeTimeout = 2 * time.Second
 )
 
 // registerSession adds a pool session to the live registry and returns its

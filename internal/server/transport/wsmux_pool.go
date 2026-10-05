@@ -269,7 +269,7 @@ func (s *WsMuxTransport) openStripedLegsOn(n int) ([]*smux.Stream, []*smux.Sessi
 		return nil, nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
 	}
 
-	chosen := selectLegs(avail, n, legScore)
+	chosen := selectLegs(withoutStalled(avail, n), n, legScore)
 	streams := make([]*smux.Stream, 0, n)
 	sessions := make([]*smux.Session, 0, n)
 	for _, ps := range chosen {

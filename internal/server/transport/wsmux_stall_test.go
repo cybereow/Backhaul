@@ -163,3 +163,77 @@ func TestWSMuxSilentStreamDoesNotHoldUpTheSession(t *testing.T) {
 		t.Fatalf("a flow opened after a silent stream on the same connection did not get through in time: %v", err)
 	}
 }
+
+// Striped legs are picked one per CDN before anything else, so a charge alone
+// would not keep a stalled CDN's only session out of a group: it is left out
+// while enough sessions that get through remain, and used when they do not.
+func TestStripedLegsLeaveOutAStalledSession(t *testing.T) {
+	a1, a2 := &pooledSession{cdn: "A"}, &pooledSession{cdn: "A"}
+	b := &pooledSession{cdn: "B"}
+	b.stalledSince.Store(time.Now().UnixNano())
+	score := func(ps *pooledSession) float64 { return 1 }
+
+	for _, ps := range selectLegs(withoutStalled([]*pooledSession{a1, b, a2}, 2), 2, score) {
+		if ps == b {
+			t.Fatal("a two-leg group took the stalled session although two others get through")
+		}
+	}
+	got := selectLegs(withoutStalled([]*pooledSession{a1, b, a2}, 3), 3, score)
+	if len(got) != 3 {
+		t.Fatalf("a three-leg group got %d legs: with too few healthy sessions the stalled one must still be used", len(got))
+	}
+}
+
+// With nowhere to go, flows stay where they are: taking them off the only
+// connection (or one of several that are all stalled) would end them at the end
+// of the resume window, although the stall may simply pass. And a flow whose
+// resume is still under way is not reported again on every pass.
+func TestWSMuxStalledFlowsStayWithoutADestination(t *testing.T) {
+	tg := echoTarget(t)
+	h := newLCHarness(t, toTarget(tg.Addr().String()), func(c *WsMuxConfig) {
+		c.MaxConnAge = time.Hour
+		c.MaxDrain = time.Minute
+		c.ResumeWindow = 20 * time.Second
+	})
+	startResumeClient(t, h, 2)
+	user := h.user().(*net.TCPConn)
+	_ = user.SetDeadline(time.Now().Add(20 * time.Second))
+	msg := promoPayload(64*1024, 5)
+	user.Write(msg)
+	if _, err := io.ReadFull(user, make([]byte, len(msg))); err != nil {
+		t.Fatal(err)
+	}
+	f := soleFlow(t, h)
+
+	h.s.sessionsMu.Lock()
+	sessions := append([]*pooledSession(nil), h.s.sessions...)
+	h.s.sessionsMu.Unlock()
+	now := time.Now()
+	for _, ps := range sessions { // every connection is stalled
+		ps.probeFails.Store(1)
+		ps.noteHealth(now, false)
+	}
+	h.s.moveOffStalled(h.s.gen, sessions, now.Add(2*stallMoveAfter))
+	select {
+	case <-f.sw.SuspendedCh():
+		t.Fatal("a flow was suspended with no connection left to resume it on")
+	default:
+	}
+
+	// One of them gets through again: the flow on the other is moved, once.
+	var other *pooledSession
+	for _, ps := range sessions {
+		if ps.session != f.session() {
+			other = ps
+		}
+	}
+	other.probeFails.Store(0)
+	other.noteHealth(now, false)
+	for i := 0; i < 5; i++ {
+		h.s.moveOffStalled(h.s.gen, sessions, now.Add(2*stallMoveAfter))
+	}
+	lcWaitFor(t, "the flow to resume on the connection that gets through", func() bool { return f.sw.Resumes() >= 1 })
+	if n := graceEvents(h.s, "session_stalled"); n != 1 {
+		t.Fatalf("%d session_stalled events for one flow moved once", n)
+	}
+}

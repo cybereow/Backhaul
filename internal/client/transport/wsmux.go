@@ -1035,6 +1035,11 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 			stream.Close()
 		}
 	}
+	// How many streams of this session may be waiting for their header at once.
+	// With that many silent ones the accept loop waits for a slot, as it used to
+	// for every single one: a peer that opens streams and sends no headers costs
+	// a bounded number of workers, not one per stream.
+	headers := make(chan struct{}, headerReaders)
 
 	for {
 		select {
@@ -1050,11 +1055,29 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 			// behind queued data, or its opener is still opening the other legs of
 			// a group) must not hold up the streams accepted after it for the
 			// whole header timeout - they are other flows.
+			select {
+			case headers <- struct{}{}:
+			case <-ctx.Done():
+				stream.Close()
+				return
+			}
 			remote := tunnelConn.RemoteAddr().String()
-			run(stream, func() { c.setupStream(stream, remote, run) })
+			if !g.start(func() {
+				defer func() { <-headers }()
+				c.setupStream(stream, remote, run)
+			}) {
+				<-headers
+				stream.Close()
+			}
 		}
 	}
 }
+
+// headerReaders is how many accepted streams of one session read their header
+// at the same time (see handleSession). Reading a header takes one round trip
+// at most on a healthy connection, so this is far above what ordinary traffic
+// needs and only ever fills with streams whose header is not coming.
+const headerReaders = 64
 
 // setupHeaderTimeout bounds how long a peer may take to send a new stream's
 // initial header: the configured dial timeout (cmd normalizes it to at least one

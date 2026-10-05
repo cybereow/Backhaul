@@ -249,6 +249,24 @@ func (c *WsMuxTransport) nextEndpoint() wsEndpoint {
 	return c.endpoints[int(uint32(i))%len(c.endpoints)]
 }
 
+// endpointRound is every entry point once, starting with the one next in turn:
+// what one dial works through until an entry point answers. The turn is taken
+// once and the round walked from there, not one turn per attempt: dials overlap,
+// and with a shared turn another dial could take the live entry point in between
+// and leave this one trying the dead one twice.
+func (c *WsMuxTransport) endpointRound() []wsEndpoint {
+	n := len(c.endpoints)
+	if n <= 1 {
+		return c.endpoints
+	}
+	start := int(uint32(atomic.AddInt32(&c.dialSeq, 1))) % n
+	round := make([]wsEndpoint, 0, n)
+	for i := 0; i < n; i++ {
+		round = append(round, c.endpoints[(start+i)%n])
+	}
+	return round
+}
+
 // stripeGroup accumulates the legs the server opened for one logical
 // connection (one per stripe.Factor) until all of them have shown up.
 type stripeGroup struct {
@@ -938,14 +956,14 @@ func (c *WsMuxTransport) tunnelDialer() {
 	// it - and when that dial is the replacement a rotation on the server is
 	// waiting for, the server only asks again half a minute later, with every
 	// other rotation queued behind it.
-	attempts, retries := len(c.endpoints), 1
-	if attempts <= 1 {
-		attempts, retries = 1, 3
+	round := c.endpointRound()
+	retries := 1
+	if len(round) == 1 {
+		retries = 3
 	}
 	var tunnelWSConn *network.WebSocketConn
 	var err error
-	for try := 0; try < attempts; try++ {
-		ep := c.nextEndpoint()
+	for _, ep := range round {
 		c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
 		tunnelWSConn, err = network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, retries, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify, c.dialOptions()...)
 		if err == nil {

@@ -53,3 +53,34 @@ func TestNextEndpointSingleIsStable(t *testing.T) {
 		}
 	}
 }
+
+// One dial's round covers every entry point exactly once, whatever other dials
+// do to the shared turn in between: with one dead and one live entry point, a
+// dial that starts on the dead one always gets to the live one.
+func TestEndpointRoundCoversEveryEndpointOnce(t *testing.T) {
+	addrs := []string{"a:443", "b:443", "c:443"}
+	c := &WsMuxTransport{endpoints: buildEndpoints(addrs, nil, "", "")}
+	starts := map[string]int{}
+	for i := 0; i < 30; i++ {
+		round := c.endpointRound()
+		c.nextEndpoint() // another dial takes a turn while this one is on its round
+		if len(round) != len(addrs) {
+			t.Fatalf("round has %d entry points, want %d", len(round), len(addrs))
+		}
+		seen := map[string]bool{}
+		for _, ep := range round {
+			seen[ep.addr] = true
+		}
+		if len(seen) != len(addrs) {
+			t.Fatalf("round %v repeats an entry point", round)
+		}
+		starts[round[0].addr]++
+	}
+	if len(starts) != len(addrs) {
+		t.Fatalf("rounds only ever start on %v: the dials are not spread", starts)
+	}
+	single := &WsMuxTransport{endpoints: buildEndpoints(nil, nil, "only:443", "")}
+	if r := single.endpointRound(); len(r) != 1 || r[0].addr != "only:443" {
+		t.Fatalf("single entry point: %v", r)
+	}
+}

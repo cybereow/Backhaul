@@ -366,25 +366,37 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow, old 
 }
 
 // moveOffRetired looks, once a flow has been put on sessions, whether any of them
-// was retired meanwhile, and moves the flow off again if so. A session picked for
+// was retired or lost meanwhile, and moves the flow off again if so. A session picked for
 // a move can begin its rotation before the move is on record: that rotation's
 // look at the flows on it then comes too early to see this one, and nothing else
 // would move it off before the session's drain ends.
 func (s *WsMuxTransport) moveOffRetired(f *resumableFlow, sessions []*smux.Session) {
 	for _, sess := range sessions {
-		if sess.IsClosed() || s.registered(sess) {
-			continue
-		}
 		sess := sess
-		go func() {
-			budget := s.config.MaxDrain
-			if budget <= 0 {
-				budget = regroupWindow
+		switch {
+		case sess.IsClosed():
+			// It ended while the move was under way, and its close was looked at
+			// before the move was on record (see regroupFlowsOn). A striped group
+			// that got through on its other legs is a leg short: rebuild it. A
+			// single stream on it is gone with it (or is resumed by driveResume).
+			if f.isStriped() {
+				go func() {
+					ctx, cancel := context.WithTimeout(s.ctx, regroupWindow)
+					defer cancel()
+					s.moveFlowsOff(ctx, sess, []*resumableFlow{f}, 0, "lost session")
+				}()
 			}
-			ctx, cancel := context.WithTimeout(s.ctx, budget)
-			defer cancel()
-			s.moveFlowsOff(ctx, sess, []*resumableFlow{f}, migrateAttempts, "retiring session")
-		}()
+		case !s.registered(sess):
+			go func() {
+				budget := s.config.MaxDrain
+				if budget <= 0 {
+					budget = regroupWindow
+				}
+				ctx, cancel := context.WithTimeout(s.ctx, budget)
+				defer cancel()
+				s.moveFlowsOff(ctx, sess, []*resumableFlow{f}, migrateAttempts, "retiring session")
+			}()
+		}
 	}
 }
 

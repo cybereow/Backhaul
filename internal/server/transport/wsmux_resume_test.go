@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -366,6 +367,20 @@ func promotableHarness(t *testing.T, target string, parity int, resume time.Dura
 		MaxStreamBuffer: 65536, StripeFactor: 2, StripeParity: parity,
 	}, logger)
 	go client.Start()
+	// Both ends run in this process: if the test fails, where each of them stands
+	// is in the goroutines. Registered last, so it runs before anything is torn down.
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		h.s.flowsMu.Lock()
+		for _, f := range h.s.flows {
+			t.Logf("flow %d: on %d session(s), striped=%v swappable=%v replaying=%v up=%d dl=%d swaps=%d", f.id, len(f.sessions()), f.isStriped(), f.sw.Swappable(), f.sw.Replaying(), f.sw.UpBytes(), f.sw.DlBytes(), f.sw.Swaps())
+		}
+		h.s.flowsMu.Unlock()
+		buf := make([]byte, 4<<20)
+		t.Log("goroutines at the failure:", string(buf[:runtime.Stack(buf, true)]))
+	})
 	lcWaitFor(t, "the whole pool", func() bool { return h.sessions() >= 8 })
 	if resume > 0 {
 		// Whether a promotable flow gets replay state depends on the client's

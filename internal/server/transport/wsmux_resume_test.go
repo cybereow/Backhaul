@@ -466,11 +466,16 @@ func (f *resumableFlow) sessions() []*smux.Session {
 // byte arrives, in both directions, although every session the flow was ever on
 // has been closed by then. With a resume window the flow keeps replay state until
 // it is promoted, and gives it up there.
+//
+// The FEC cases use two parity legs. With one, this much load in both directions
+// ends a flow whether or not it is ever moved: a row sent on dataShards legs
+// waits for the slower of them, and the receiver fails once the rows behind it
+// fill its reassembly budget.
 func TestWSMuxPromotableFlowSurvivesRotation(t *testing.T) {
 	for _, tc := range []struct {
 		parity int
 		resume time.Duration
-	}{{0, 0}, {1, 0}, {0, 20 * time.Second}, {1, 20 * time.Second}} {
+	}{{0, 0}, {2, 0}, {0, 20 * time.Second}, {2, 20 * time.Second}} {
 		tc := tc
 		t.Run(fmt.Sprintf("parity=%d/resume=%s", tc.parity, tc.resume), func(t *testing.T) {
 			tg := echoTarget(t)

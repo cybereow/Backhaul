@@ -668,6 +668,10 @@ func (s *WsMuxTransport) dispatchPromotable(g *wsGeneration, appConn net.Conn, p
 	<-swapper.DoneWait()
 }
 
+// promoteTries is how many times a promotion that was started and failed is
+// attempted in all.
+const promoteTries = 3
+
 // watchPromotion promotes the flow once it has sent promote_bytes, if the pool
 // has room for another striped group. f is the flow's entry when it is resumable
 // (nil otherwise).
@@ -675,22 +679,38 @@ func (s *WsMuxTransport) watchPromotion(g *wsGeneration, flowID uint64, swapper 
 	// A worker of the generation: it may be inside promoteFlow (blocking reads on
 	// legs the generation owns) when a restart begins, and the restart waits for it.
 	g.start(func() {
+		wait, tries := 100*time.Millisecond, 0
 		for {
 			select {
 			case <-g.ctx.Done():
 				return
 			case <-swapper.DoneWait(): // Need a wait channel
 				return
-			case <-time.After(100 * time.Millisecond):
-				if swapper.UpBytes() >= s.config.PromoteBytes {
-					if s.shouldPromote() {
-						_ = s.promoteFlow(g.ctx, flowID, swapper, f) // it logs its own failure
-					}
-					// Whether or not it promoted, stop checking: a flow that
-					// stayed plain because the pool was busy keeps running plain
-					// (already spread across CDNs by load-balancing) for its life.
+			case <-time.After(wait):
+				if swapper.UpBytes() < s.config.PromoteBytes {
+					continue
+				}
+				// The flow may be in the middle of another swap just now (a move at
+				// rotation, a resume): that is no verdict on promoting it, so wait
+				// for it to settle rather than give the promotion up for good.
+				if !swapper.Swappable() {
+					continue
+				}
+				// A flow that stays plain because the pool is busy keeps running
+				// plain (already spread across CDNs by load-balancing) for its
+				// life: that decision is taken once.
+				if !s.shouldPromote() {
 					return
 				}
+				if s.promoteFlow(g.ctx, flowID, swapper, f) == nil { // it logs its own failure
+					return
+				}
+				// The attempt can also lose to a swap that started under it, on
+				// either end; a few more tries, further apart, cover that.
+				if tries++; tries == promoteTries {
+					return
+				}
+				wait = time.Second
 			}
 		}
 	})

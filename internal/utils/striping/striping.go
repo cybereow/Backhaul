@@ -271,6 +271,11 @@ type Conn struct {
 	// forcedSeq is the sequence last admitted over the budget, plus one (see
 	// admit). Atomic.
 	forcedSeq uint64
+	// advMu makes "Read moved on to the next sequence" and "the awaited chunk is
+	// charged over the budget" exclusive: a copy that finds, under it, that its
+	// sequence has been delivered is not charged, so it cannot add its charge
+	// after the next sequence's copy has taken the exception.
+	advMu sync.Mutex
 	// parkAt is, for each leg reader waiting for reassembly room (see admit), the
 	// sequence it is holding plus one; zero for a reader that is not waiting.
 	// Atomic. parkCh wakes Read when one starts to wait.
@@ -470,13 +475,12 @@ func (c *Conn) readLeg(i int, leg net.Conn) {
 			// it is here it may claim the one admission over the budget; if a
 			// copy on another leg got there first, or it was delivered in the
 			// meantime, this one is not needed.
-			if !c.claimForced(seq) || seq < atomic.LoadUint32(&c.nextSeqSeen) {
+			if !c.claimForced(seq) || !c.forceAwaited(seq, cost) {
 				if ch.base != nil {
 					c.readPool.Put(ch.base)
 				}
 				continue
 			}
-			c.budget.force(cost)
 		}
 		select {
 		case c.chunkCh <- ch:
@@ -611,8 +615,23 @@ func sameParked(a, b []uint64) bool {
 
 // advance moves Read on to the next sequence. Caller holds rmu.
 func (c *Conn) advance() {
+	c.advMu.Lock()
 	c.nextSeq++
 	atomic.StoreUint32(&c.nextSeqSeen, c.nextSeq)
+	c.advMu.Unlock()
+}
+
+// forceAwaited charges the awaited chunk seq over the budget, unless Read has
+// moved past seq meanwhile (another copy of it was delivered). It reports
+// whether it charged.
+func (c *Conn) forceAwaited(seq uint32, cost int64) bool {
+	c.advMu.Lock()
+	defer c.advMu.Unlock()
+	if seq < atomic.LoadUint32(&c.nextSeqSeen) {
+		return false
+	}
+	c.budget.force(cost)
+	return true
 }
 
 // setTotal records the announced total chunk count and wakes any blocked Read

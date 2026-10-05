@@ -102,3 +102,27 @@ func TestAdmitLetsOneCopyOfTheAwaitedChunkOverTheBudget(t *testing.T) {
 		t.Fatal("the following sequence could not be claimed")
 	}
 }
+
+// A copy of the awaited chunk that holds the claim but finds, when it comes to
+// charge, that Read has already moved past its sequence (another copy was
+// delivered meanwhile) is not charged: or it would add its charge on top of the
+// one the next sequence's copy takes.
+func TestForcedChargeIsRefusedOnceReadMovedOn(t *testing.T) {
+	const cost = retainedEntryOverhead + 16
+	c := &Conn{chunkSize: 16, budget: reassemblyBudget{limit: 5 * cost, used: 5 * cost, peak: 5 * cost}}
+	c.nextSeq, c.nextSeqSeen = 7, 7
+
+	if !c.claimForced(7) {
+		t.Fatal("the awaited chunk could not claim the admission")
+	}
+	c.advance() // another copy of 7 was delivered before this one charged
+	if c.forceAwaited(7, cost) {
+		t.Fatal("a copy of a delivered sequence was charged over the budget")
+	}
+	if !c.claimForced(8) || !c.forceAwaited(8, cost) {
+		t.Fatal("the next awaited chunk could not take the admission")
+	}
+	if used, peak := c.budget.used, c.budget.peak; used != 6*cost || peak != 6*cost {
+		t.Fatalf("retained %d (peak %d), want the %d budget plus exactly one chunk", used, peak, 5*cost)
+	}
+}

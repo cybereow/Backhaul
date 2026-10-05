@@ -39,6 +39,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -297,6 +298,7 @@ type Conn struct {
 	// idle connection has no timer. Guarded by rmu (Read holds it for its whole
 	// duration), so one timer serves every Read call and every loop turn.
 	readTimer *time.Timer
+	rd        *readDeadline
 	// readPool recycles chunkSize payload buffers on the read/reassembly path,
 	// mirroring chunkPool on the write side: readLeg borrows one per inbound
 	// chunk instead of allocating a fresh buffer for every 16KB chunk, and Read
@@ -357,6 +359,7 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 		legsDone:    make(chan struct{}),
 		totalKnown:  make(chan struct{}),
 		closed:      make(chan struct{}),
+		rd:          newReadDeadline(),
 		parkAt:      make([]uint64, len(legs)),
 		legWaited:   make([]uint32, len(legs)),
 		parkCh:      make(chan struct{}, 1),
@@ -1058,7 +1061,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	// Once Read reports EOF or a terminal error nothing retained can ever be
 	// delivered: release it.
 	defer func() {
-		if err != nil {
+		if err != nil && err != os.ErrDeadlineExceeded {
 			c.dropReassembly()
 		}
 	}()
@@ -1097,6 +1100,9 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			c.advance()
 			continue
 		}
+		if c.rd.expired() {
+			return 0, os.ErrDeadlineExceeded
+		}
 
 		// Only arm the totalKnown case while the END marker hasn't been seen.
 		// totalKnown is closed (never reopened) once the marker arrives, so
@@ -1130,6 +1136,10 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		select {
 		case ch := <-c.chunkCh:
 			c.stash(ch)
+
+		case <-c.rd.change:
+		case <-c.rd.timer():
+			// The read deadline was set or has passed: look again.
 
 		case <-totalKnown:
 			// The total just became known; loop to re-check completion and
@@ -1320,12 +1330,58 @@ func (c *Conn) teardown() error {
 func (c *Conn) LocalAddr() net.Addr  { return c.legs[0].LocalAddr() }
 func (c *Conn) RemoteAddr() net.Addr { return c.legs[0].RemoteAddr() }
 
-func (c *Conn) SetDeadline(t time.Time) error {
-	return c.forEachLeg(func(l net.Conn) error { return l.SetDeadline(t) })
+// readDeadline is the read deadline of a striped connection, kept by the
+// connection itself. The legs are read by goroutines for which an expired
+// deadline is a failed leg, so a deadline passed down to them would end the
+// whole connection where the caller only meant to interrupt one Read (as a flow
+// being moved off this connection does to wake its reader).
+type readDeadline struct {
+	at     atomic.Int64  // unix nanoseconds; 0 = none
+	change chan struct{} // tells a waiting Read to look again
 }
 
+func newReadDeadline() *readDeadline {
+	return &readDeadline{change: make(chan struct{}, 1)}
+}
+
+func (d *readDeadline) set(t time.Time) {
+	at := int64(0)
+	if !t.IsZero() {
+		at = t.UnixNano()
+	}
+	d.at.Store(at)
+	select {
+	case d.change <- struct{}{}:
+	default:
+	}
+}
+
+func (d *readDeadline) expired() bool {
+	at := d.at.Load()
+	return at != 0 && time.Now().UnixNano() >= at
+}
+
+// timer fires when the deadline passes (nil without one).
+// ponytail: a timer per wait; nothing sets a deadline on a busy connection.
+func (d *readDeadline) timer() <-chan time.Time {
+	at := d.at.Load()
+	if at == 0 {
+		return nil
+	}
+	return time.After(time.Until(time.Unix(0, at)))
+}
+
+func (c *Conn) SetDeadline(t time.Time) error {
+	c.rd.set(t)
+	return c.SetWriteDeadline(t)
+}
+
+// SetReadDeadline makes a Read that has nothing to deliver past t fail with
+// os.ErrDeadlineExceeded. Nothing is lost: once the deadline is cleared, Read
+// carries on where it was.
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	return c.forEachLeg(func(l net.Conn) error { return l.SetReadDeadline(t) })
+	c.rd.set(t)
+	return nil
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {

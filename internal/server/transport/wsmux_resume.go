@@ -45,17 +45,23 @@ var (
 type resumableFlow struct {
 	id uint64
 	sw *handlers.PumpSwapper
+	g  *wsGeneration // the generation it runs in: its follow-up work is that one's
 
 	mu      sync.Mutex
 	sess    []*smux.Session // where its tunnel is
 	striped bool            // promoted: a move builds a new striped group, not a single stream
 	moves   []*flowMove     // swaps in flight, each with the sessions it is taking the flow onto
+	swaps   uint64          // tunnels built so far (see took)
+	at      uint64          // which of them sess and striped describe
 }
 
 // flowMove is one swap in flight. Each attempt keeps its own entry: two of them
 // often pick the same sessions, and the one that is refused must take back only
 // what it recorded, not what the other, which went through, has made the flow's.
-type flowMove struct{ to []*smux.Session }
+type flowMove struct {
+	to  []*smux.Session
+	seq uint64 // its place among the flow's swaps, once its tunnel is built
+}
 
 // session is the session of a flow on a plain stream (the first leg of a
 // promoted one).
@@ -66,16 +72,6 @@ func (f *resumableFlow) session() *smux.Session {
 		return nil
 	}
 	return f.sess[0]
-}
-
-func (f *resumableFlow) setSession(s *smux.Session) {
-	f.setSessions([]*smux.Session{s}, false)
-}
-
-func (f *resumableFlow) setSessions(ss []*smux.Session, striped bool) {
-	f.mu.Lock()
-	f.sess, f.striped = ss, striped
-	f.mu.Unlock()
 }
 
 // moving records that a swap is taking the flow onto ss: until it is settled the
@@ -98,11 +94,26 @@ func (f *resumableFlow) stayed(m *flowMove) {
 	f.mu.Unlock()
 }
 
-// moved ends a swap that went through: the flow's tunnel is now on m's sessions.
+// took gives m its place among the flow's swaps. It is called while m's tunnel is
+// being built: the swapper is frozen or suspended then and runs one swap at a
+// time, so the order taken here is the order the tunnels were installed in.
+func (f *resumableFlow) took(m *flowMove) {
+	f.mu.Lock()
+	f.swaps++
+	m.seq = f.swaps
+	f.mu.Unlock()
+}
+
+// moved ends a swap that went through: the flow's tunnel is now on m's sessions,
+// unless a later swap has been through meanwhile. The caller of an earlier one
+// can get here after it, and must not put the flow back on record where it no
+// longer is.
 func (f *resumableFlow) moved(m *flowMove, striped bool) {
 	f.mu.Lock()
 	f.dropMoveLocked(m)
-	f.sess, f.striped = m.to, striped
+	if m.seq > f.at {
+		f.sess, f.striped, f.at = m.to, striped, m.seq
+	}
 	f.mu.Unlock()
 }
 
@@ -210,7 +221,7 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 		}
 		sw.SetResumeWindow(s.config.ResumeWindow)
 	}
-	f := &resumableFlow{id: flowID, sw: sw, sess: []*smux.Session{ps.session}}
+	f := &resumableFlow{id: flowID, sw: sw, g: g, sess: []*smux.Session{ps.session}}
 	s.registerFlow(f)
 	defer s.unregisterFlow(flowID)
 	sw.Start()
@@ -299,13 +310,16 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow) error
 	}
 	_ = stream.SetDeadline(time.Time{})
 
+	m := f.moving([]*smux.Session{ps.session})
 	err = f.sw.Resume(ctx, stream, func() (net.Conn, error) {
+		f.took(m)
 		return handlers.NewHalfCloseConn(stream), nil
 	})
 	if err != nil {
+		f.stayed(m)
 		return err
 	}
-	f.setSession(ps.session)
+	f.moved(m, false)
 	return nil
 }
 
@@ -354,6 +368,7 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow, old 
 	// leaves the flow where it was.
 	m := f.moving([]*smux.Session{ps.session})
 	err = f.sw.Promote(ctx, []net.Conn{stream}, func() (net.Conn, error) {
+		f.took(m)
 		return handlers.NewHalfCloseConn(stream), nil
 	})
 	if err != nil {
@@ -370,7 +385,11 @@ func (s *WsMuxTransport) migrateFlow(ctx context.Context, f *resumableFlow, old 
 // a move can begin its rotation before the move is on record: that rotation's
 // look at the flows on it then comes too early to see this one, and nothing else
 // would move it off before the session's drain ends.
+//
+// The follow-up is work of the flow's own generation: counted by it, so a Restart
+// waits for it before it resets the registries, and bounded by its context.
 func (s *WsMuxTransport) moveOffRetired(f *resumableFlow, sessions []*smux.Session) {
+	g := f.g
 	for _, sess := range sessions {
 		sess := sess
 		switch {
@@ -380,22 +399,22 @@ func (s *WsMuxTransport) moveOffRetired(f *resumableFlow, sessions []*smux.Sessi
 			// that got through on its other legs is a leg short: rebuild it. A
 			// single stream on it is gone with it (or is resumed by driveResume).
 			if f.isStriped() {
-				go func() {
-					ctx, cancel := context.WithTimeout(s.ctx, regroupWindow)
+				g.start(func() {
+					ctx, cancel := context.WithTimeout(g.ctx, regroupWindow)
 					defer cancel()
 					s.moveFlowsOff(ctx, sess, []*resumableFlow{f}, 0, "lost session")
-				}()
+				})
 			}
 		case !s.registered(sess):
-			go func() {
+			g.start(func() {
 				budget := s.config.MaxDrain
 				if budget <= 0 {
 					budget = regroupWindow
 				}
-				ctx, cancel := context.WithTimeout(s.ctx, budget)
+				ctx, cancel := context.WithTimeout(g.ctx, budget)
 				defer cancel()
 				s.moveFlowsOff(ctx, sess, []*resumableFlow{f}, migrateAttempts, "retiring session")
-			}()
+			})
 		}
 	}
 }

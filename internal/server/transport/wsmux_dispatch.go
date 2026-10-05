@@ -808,6 +808,9 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 	// it. A failure before the freeze leaves the flow plain; a later one aborts
 	// it (see PumpSwapper.PromoteOpened).
 	err := swapper.PromoteOpened(ctx, conns, func() (net.Conn, error) {
+		if f != nil {
+			f.took(move)
+		}
 		if s.config.StripeParity > 0 {
 			return striping.NewFEC(conns, striping.DefaultChunkSize, s.config.StripeFactor, s.config.StripeParity)
 		}

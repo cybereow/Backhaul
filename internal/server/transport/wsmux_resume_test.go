@@ -610,6 +610,7 @@ func TestFlowMoveRefusedLeavesTheWinnersSessions(t *testing.T) {
 		if !f.on(a) || !f.on(b) || !f.on(c) {
 			t.Fatal("a flow being moved is not on record for both its old and its new sessions")
 		}
+		f.took(won)
 		if loserFirst {
 			f.stayed(lost)
 			if !f.on(a) || !f.on(b) || !f.on(c) {
@@ -623,5 +624,23 @@ func TestFlowMoveRefusedLeavesTheWinnersSessions(t *testing.T) {
 		if f.on(a) || !f.on(b) || !f.on(c) || !f.isStriped() || len(f.sessions()) != 2 {
 			t.Fatalf("loserFirst=%v: after the swap the flow is on %d session(s), old=%v new=%v,%v", loserFirst, len(f.sessions()), f.on(a), f.on(b), f.on(c))
 		}
+	}
+}
+
+// The caller of a swap can be held up between the swap going through and its
+// result being put on record, long enough for a later swap to be through and on
+// record first. The earlier one then changes nothing: the flow is where the
+// later swap put it, and rotation and a lost session must go on finding it there.
+func TestFlowMoveRecordedLateDoesNotUndoALaterOne(t *testing.T) {
+	a, b, c, d := &smux.Session{}, &smux.Session{}, &smux.Session{}, &smux.Session{}
+	f := &resumableFlow{sess: []*smux.Session{a}}
+	first := f.moving([]*smux.Session{b})
+	f.took(first) // its tunnel is installed, its caller not yet back
+	second := f.moving([]*smux.Session{c, d})
+	f.took(second)
+	f.moved(second, true)
+	f.moved(first, false)
+	if f.on(a) || f.on(b) || !f.on(c) || !f.on(d) || !f.isStriped() {
+		t.Fatalf("the flow is on record on a=%v b=%v c=%v d=%v striped=%v, want only c and d, striped", f.on(a), f.on(b), f.on(c), f.on(d), f.isStriped())
 	}
 }

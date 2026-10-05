@@ -391,7 +391,9 @@ func New(legs []net.Conn, chunkSize int) *Conn {
 }
 
 func (c *Conn) readLeg(i int, leg net.Conn) {
-	HoldLeg(leg)
+	if len(c.legs) > 1 { // a leg on its own runs ahead of nothing (and windowLoop leaves it alone)
+		HoldLeg(leg)
+	}
 	header := make([]byte, headerSize)
 	for {
 		if _, err := io.ReadFull(leg, header); err != nil {

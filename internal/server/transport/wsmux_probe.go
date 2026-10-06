@@ -67,7 +67,7 @@ func (s *WsMuxTransport) probeReplayPromote(g *wsGeneration, ps *pooledSession) 
 			case <-time.After(time.Second):
 			}
 		}
-		stream, err := ps.session.OpenStream()
+		stream, err := ps.session.OpenStreamWithin(rttProbeTimeout)
 		if err != nil {
 			continue
 		}
@@ -88,7 +88,10 @@ func (s *WsMuxTransport) probeReplayPromote(g *wsGeneration, ps *pooledSession) 
 // measureRTT opens one ping stream, sends a nonce and times the echo. The stream
 // carries no user data and is closed immediately after.
 func measureRTT(session *smux.Session) (int64, error) {
-	stream, err := session.OpenStream()
+	// Bounded like the echo itself: on a connection that has stopped getting
+	// through, the open is where the probe waits, and an unanswered probe is one
+	// of the two signs the stall is read from (see wsmux_stall.go).
+	stream, err := session.OpenStreamWithin(rttProbeTimeout)
 	if err != nil {
 		return 0, err
 	}

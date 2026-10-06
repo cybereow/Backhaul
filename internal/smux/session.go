@@ -185,6 +185,14 @@ func (s *Session) OpenStreamWithin(d time.Duration) (*Stream, error) {
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
 	if _, err := s.writeFrameInternal(newFrame(byte(s.config.Version), cmdSYN, sid), time.After(d), CLSCTRL); err != nil {
+		if err == ErrTimeout {
+			// The SYN may already be queued, and is then still written should the
+			// connection get through again - opening, on the peer, a stream nobody
+			// here will ever use or close. A FIN queued behind it closes that
+			// stream as soon as it exists (for a SYN that was never queued the
+			// peer ignores it). Not waited for: it is stuck behind the same SYN.
+			go s.writeFrame(newFrame(byte(s.config.Version), cmdFIN, sid))
+		}
 		return nil, err
 	}
 

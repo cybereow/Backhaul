@@ -1,6 +1,7 @@
 package smux
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -27,5 +28,22 @@ func TestOpenStreamWithinGivesUpOnAStalledConnection(t *testing.T) {
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("gave up after %v, want about 200ms", d)
+	}
+
+	// The connection gets through again: the SYN that was left queued arrives
+	// after all, and the stream it opens on the peer is closed right behind it
+	// instead of staying there with nobody on this side.
+	srv, err := Server(b, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	ghost, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = ghost.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := ghost.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("the stream left behind by a timed-out open was not closed: %v", err)
 	}
 }

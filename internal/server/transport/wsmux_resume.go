@@ -320,6 +320,7 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow) error
 		return err
 	}
 	f.moved(m, false)
+	s.moveOffRetired(f, m.to)
 	return nil
 }
 

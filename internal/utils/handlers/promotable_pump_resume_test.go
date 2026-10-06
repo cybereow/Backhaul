@@ -459,3 +459,37 @@ func TestResumeWhileTheAppIsNotReading(t *testing.T) {
 		t.Fatalf("resumes: %d, want 2", B.pump.Resumes())
 	}
 }
+
+// slowCloseConn is a connection that has stopped getting through: closing it
+// waits, the way a stream's FIN waits on a stalled session.
+type slowCloseConn struct {
+	*net.TCPConn
+	wait time.Duration
+}
+
+func (c slowCloseConn) Close() error {
+	time.Sleep(c.wait)
+	return c.TCPConn.Close()
+}
+
+// Suspending a flow does not wait for its dead tunnel to be closed: on a stalled
+// connection that takes smux's whole close timeout, and whoever is taking flows
+// off such a connection would get to the next one only after it.
+func TestSuspendDoesNotWaitForTheTunnelToClose(t *testing.T) {
+	ctx, _ := testCtx(t)
+	a, b := tcpConnPair(t)
+	A := newResumableEnd(t, ctx, NewHalfCloseConn(slowCloseConn{a, 3 * time.Second}))
+	B := newResumableEnd(t, ctx, NewHalfCloseConn(b))
+
+	A.user.Write([]byte("hello"))
+	readExact(t, B.user, 5)
+
+	start := time.Now()
+	if !A.pump.Suspend() {
+		t.Fatal("the flow could not be suspended")
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("Suspend took %v: it waited for the tunnel to close", d)
+	}
+	B.pump.Suspend()
+}

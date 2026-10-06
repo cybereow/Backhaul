@@ -99,8 +99,16 @@ func (p *PumpSwapper) Suspend() bool {
 	}
 	p.mu.Unlock()
 
-	dropTunnel(old)
-	dropTunnel(next)
+	// Not waited for: closing a stream tells the peer (a FIN frame), and on a
+	// connection that has stopped getting through that write waits out smux's own
+	// timeout, half a minute. Whoever suspends flows because their connection is
+	// stalled would be held for that long per flow, the others left on it meanwhile.
+	// The pumps do not need it either: the stream is dead to them the moment the
+	// close begins.
+	go func() {
+		dropTunnel(old)
+		dropTunnel(next)
+	}()
 	time.AfterFunc(window, func() {
 		p.mu.Lock()
 		stale := !p.suspended || p.suspendGen != gen

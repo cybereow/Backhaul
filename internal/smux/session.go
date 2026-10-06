@@ -154,6 +154,14 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
+	return s.OpenStreamWithin(openCloseTimeout)
+}
+
+// OpenStreamWithin is OpenStream that gives up when the stream's SYN could not be
+// written within d. On a connection that has stopped getting through the write
+// waits for room that does not come; a caller with other sessions to choose from
+// should not wait out the default half minute on this one.
+func (s *Session) OpenStreamWithin(d time.Duration) (*Stream, error) {
 	if s.IsClosed() {
 		return nil, io.ErrClosedPipe
 	}
@@ -176,7 +184,7 @@ func (s *Session) OpenStream() (*Stream, error) {
 
 	stream := newStream(sid, s.config.MaxFrameSize, s)
 
-	if _, err := s.writeFrame(newFrame(byte(s.config.Version), cmdSYN, sid)); err != nil {
+	if _, err := s.writeFrameInternal(newFrame(byte(s.config.Version), cmdSYN, sid), time.After(d), CLSCTRL); err != nil {
 		return nil, err
 	}
 

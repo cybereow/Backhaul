@@ -337,6 +337,10 @@ func (s *WsMuxTransport) openPlainLeg() (*smux.Stream, error) {
 // caller like any other (the setup attempt closes it if it has expired), and a
 // session that started draining after the pick is not re-admitted: eligibility
 // is only ever decided at selection, from the live registry.
+// plainOpenTimeout is how long opening a stream on one session may take before
+// the next session is tried.
+const plainOpenTimeout = 3 * time.Second
+
 func (s *WsMuxTransport) openPlainLegPS() (*smux.Stream, *pooledSession, error) {
 	tried := make(map[*pooledSession]bool)
 	for {
@@ -348,7 +352,10 @@ func (s *WsMuxTransport) openPlainLegPS() (*smux.Stream, *pooledSession, error) 
 			return nil, nil, fmt.Errorf("all %d pool session(s) failed to open a plain leg", live)
 		}
 
-		stream, err := ps.session.OpenStream() // may block: no lock held
+		// Bounded: a session that has just stopped getting through is not marked
+		// yet (see wsmux_stall.go), and a flow placed on it would otherwise wait
+		// half a minute for its stream before the next session is tried.
+		stream, err := ps.session.OpenStreamWithin(plainOpenTimeout) // may block: no lock held
 		s.releasePlainLeg(ps)
 		if err == nil {
 			return stream, ps, nil

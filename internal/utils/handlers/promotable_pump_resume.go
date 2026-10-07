@@ -41,6 +41,18 @@ func (p *PumpSwapper) Resumes() uint64 {
 	return p.resumes
 }
 
+// HeardFromPeer reports whether anything of this flow has come back from the
+// peer yet: payload, or an acknowledgement of what was sent. Until then nothing
+// says the peer knows the flow at all - its opening may still be on its way -
+// and a flow the peer does not know cannot be resumed, only ended.
+func (p *PumpSwapper) HeardFromPeer() bool {
+	if p.dlBytes.Load() > 0 {
+		return true
+	}
+	r := p.replaying()
+	return r != nil && (r.ring.firstOffset() > 0 || r.endAcked.Load())
+}
+
 // SuspendedCh is closed while the flow is suspended and replaced by a fresh
 // channel when it resumes: read it again after each resume.
 func (p *PumpSwapper) SuspendedCh() <-chan struct{} {

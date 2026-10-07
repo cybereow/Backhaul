@@ -112,6 +112,8 @@ type Session struct {
 	chAccepts chan *Stream
 
 	dataReady int32 // flag data has arrived
+	// lastRecv is when the last frame arrived from the peer (unix nanoseconds).
+	lastRecv atomic.Int64
 
 	goAway int32 // flag id exhausted
 
@@ -156,6 +158,11 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 func (s *Session) OpenStream() (*Stream, error) {
 	return s.OpenStreamWithin(openCloseTimeout)
 }
+
+// LastRecv is when the last frame of any kind arrived from the peer, in unix
+// nanoseconds (0 = nothing has arrived yet). A connection that is getting
+// through keeps this moving for as long as anything is expected on it.
+func (s *Session) LastRecv() int64 { return s.lastRecv.Load() }
 
 // OpenStreamWithin is OpenStream that gives up when the stream's SYN could not be
 // written within d. On a connection that has stopped getting through the write
@@ -383,6 +390,7 @@ func (s *Session) recvLoop() {
 		// read header first
 		if _, err := io.ReadFull(s.conn, hdr[:]); err == nil {
 			atomic.StoreInt32(&s.dataReady, 1)
+			s.lastRecv.Store(time.Now().UnixNano())
 			if hdr.Version() != byte(s.config.Version) {
 				s.notifyProtoError(ErrInvalidProtocol)
 				return

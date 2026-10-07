@@ -30,6 +30,9 @@ func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 		case <-first:
 		case <-ticker.C:
 		}
+		// The oldest probe still unanswered is what the stall check times: it is
+		// only cleared by an echo.
+		ps.probeSent.CompareAndSwap(0, time.Now().UnixNano())
 		rtt, err := measureRTT(ps.session)
 		if err != nil {
 			// A transient probe failure (a busy session refusing a stream)
@@ -41,6 +44,7 @@ func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 			continue
 		}
 		ps.probeFails.Store(0)
+		ps.probeSent.Store(0)
 		// EWMA (7/8 old, 1/8 new) so a single jittery sample doesn't swing
 		// selection; the first sample seeds it directly.
 		if old := ps.rtt.Load(); old > 0 {

@@ -237,3 +237,49 @@ func TestWSMuxStalledFlowsStayWithoutADestination(t *testing.T) {
 		t.Fatalf("%d session_stalled events for one flow moved once", n)
 	}
 }
+
+// The sign that needs no waiting: a probe unanswered and nothing at all arriving
+// on the connection for probeSilent. A frame arriving after the probe left only
+// restarts the wait: the connection may have stopped right behind it.
+func TestEchoSilentNeedsTotalSilenceSinceTheProbe(t *testing.T) {
+	now := time.Now()
+	sent := now.Add(-probeSilent).UnixNano()
+	if !echoSilent(sent, sent-1, now) {
+		t.Fatal("a probe unanswered for probeSilent on a silent connection is not a stall")
+	}
+	if echoSilent(sent, sent+1, now) {
+		t.Fatal("a connection that delivered a frame after the probe left counts as silent at once")
+	}
+	if !echoSilent(sent, sent+1, now.Add(time.Millisecond)) {
+		t.Fatal("a frame that arrived just after the probe left hides a stall that began behind it")
+	}
+	if echoSilent(sent, sent-1, now.Add(-time.Millisecond)) {
+		t.Fatal("a probe is taken for unanswered before probeSilent has passed")
+	}
+	if echoSilent(0, 0, now) {
+		t.Fatal("no probe is out, yet the connection counts as silent")
+	}
+}
+
+// A session that shows a sure sign is due at once; one whose only sign is a
+// timed-out probe has to keep showing it for stallMoveAfter.
+func TestSureStallIsDueAtOnce(t *testing.T) {
+	now := time.Now()
+	sure, weak := &pooledSession{}, &pooledSession{}
+	sure.noteHealth(now, true)
+	weak.probeFails.Store(1)
+	weak.noteHealth(now, false)
+	if !sure.dueToMove(now.Add(stallMoveAfterSure)) {
+		t.Fatal("a session whose socket is in backoff is not due to be cleared")
+	}
+	if weak.dueToMove(now.Add(stallMoveAfter / 2)) {
+		t.Fatal("a session with only a timed-out probe is due before stallMoveAfter")
+	}
+	if !weak.dueToMove(now.Add(stallMoveAfter)) {
+		t.Fatal("a session with a timed-out probe is not due after stallMoveAfter")
+	}
+	sure.noteHealth(now.Add(time.Second), false)
+	if sure.dueToMove(now.Add(time.Minute)) {
+		t.Fatal("a session stays due after it got through again")
+	}
+}

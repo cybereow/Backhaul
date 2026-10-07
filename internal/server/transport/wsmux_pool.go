@@ -40,6 +40,10 @@ type pooledSession struct {
 	// probeFails how many RTT probes in a row went unanswered.
 	stalledSince atomic.Int64
 	probeFails   atomic.Int32
+	// sureSince is since when there has been no doubt about it (see noteHealth),
+	// probeSent when the oldest RTT probe still unanswered left (0 = none is out).
+	sureSince atomic.Int64
+	probeSent atomic.Int64
 	capEst       atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
 	slow         atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
 }
@@ -67,7 +71,7 @@ type pooledSession struct {
 // unfairly preferred nor shunned before its first probe.
 const (
 	unprobedRTTms   = 40.0
-	rttProbeEvery   = 2 * time.Second
+	rttProbeEvery   = time.Second
 	rttProbeTimeout = 2 * time.Second
 )
 
@@ -342,7 +346,16 @@ func (s *WsMuxTransport) openPlainLeg() (*smux.Stream, error) {
 const plainOpenTimeout = 3 * time.Second
 
 func (s *WsMuxTransport) openPlainLegPS() (*smux.Stream, *pooledSession, error) {
-	tried := make(map[*pooledSession]bool)
+	return s.openPlainLegAvoiding(nil)
+}
+
+// openPlainLegAvoiding is openPlainLegPS that leaves out the sessions in avoid:
+// the ones a caller has just tried and got nothing from.
+func (s *WsMuxTransport) openPlainLegAvoiding(avoid map[*pooledSession]bool) (*smux.Stream, *pooledSession, error) {
+	tried := make(map[*pooledSession]bool, len(avoid))
+	for ps := range avoid {
+		tried[ps] = true
+	}
 	for {
 		ps, live := s.reservePlainLeg(tried)
 		if ps == nil {

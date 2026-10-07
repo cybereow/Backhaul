@@ -261,8 +261,12 @@ func (s *WsMuxTransport) driveResume(ctx context.Context, f *resumableFlow) {
 		}
 		backoff := 100 * time.Millisecond
 		started := time.Now()
+		// The sessions an attempt got no answer on are left out of the next ones:
+		// connections stop getting through several at a time, and one that has not
+		// been marked yet is as likely a pick as any.
+		avoid := make(map[*pooledSession]bool)
 		for attempt := 1; ; attempt++ {
-			err := s.resumeOnce(ctx, f)
+			err := s.resumeOnce(ctx, f, avoid)
 			if err == nil {
 				s.logger.Debugf("flow %d resumed on another session after %v (%d attempt(s))", f.id, time.Since(started).Round(time.Millisecond), attempt)
 				break
@@ -271,6 +275,7 @@ func (s *WsMuxTransport) driveResume(ctx context.Context, f *resumableFlow) {
 				f.sw.Abort()
 				return
 			}
+			s.logger.Debugf("flow %d: resume attempt %d: %v", f.id, attempt, err)
 			select {
 			case <-f.sw.DoneWait():
 				return
@@ -285,20 +290,31 @@ func (s *WsMuxTransport) driveResume(ctx context.Context, f *resumableFlow) {
 	}
 }
 
-// resumeOnce makes one attempt to resume a suspended flow on a fresh stream.
-func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow) error {
-	stream, ps, err := s.openPlainLegPS()
+// resumeTryTimeout bounds each step of one attempt to resume a flow: the client's
+// verdict, then the handshake. Both are a round trip on a session that works; on
+// one that does not, the flow's user is waiting while this one waits.
+const resumeTryTimeout = 2 * time.Second
+
+// resumeOnce makes one attempt to resume a suspended flow on a fresh stream, on a
+// session not in avoid; a session that gave no answer is added to it.
+func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow, avoid map[*pooledSession]bool) error {
+	stream, ps, err := s.openPlainLegAvoiding(avoid)
 	if err != nil {
+		for x := range avoid { // every session has been tried: start over
+			delete(avoid, x)
+		}
 		return fmt.Errorf("%w: %v", errNoOtherSession, err)
 	}
-	_ = stream.SetDeadline(time.Now().Add(handlers.PromoteHandshakeTimeout))
+	_ = stream.SetDeadline(time.Now().Add(resumeTryTimeout))
 	if err := utils.SendFlowAttach(stream, f.id, utils.AttachResume, 0); err != nil {
 		stream.Close()
+		avoid[ps] = true
 		return err
 	}
 	accept, reason, err := utils.ReadAttachVerdict(stream)
 	if err != nil {
 		stream.Close()
+		avoid[ps] = true
 		return err
 	}
 	if !accept {
@@ -311,12 +327,15 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow) error
 	_ = stream.SetDeadline(time.Time{})
 
 	m := f.moving([]*smux.Session{ps.session})
-	err = f.sw.Resume(ctx, stream, func() (net.Conn, error) {
+	rctx, cancel := context.WithTimeout(ctx, resumeTryTimeout)
+	err = f.sw.Resume(rctx, stream, func() (net.Conn, error) {
 		f.took(m)
 		return handlers.NewHalfCloseConn(stream), nil
 	})
+	cancel()
 	if err != nil {
 		f.stayed(m)
+		avoid[ps] = true
 		return err
 	}
 	f.moved(m, false)

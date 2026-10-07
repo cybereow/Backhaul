@@ -172,17 +172,31 @@ func capacityPenalty(est, best float64) float64 {
 func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 	t := time.NewTicker(capSampleEvery)
 	defer t.Stop()
+	// Stalls are looked for more often than capacity is sampled: every look that
+	// is late is that much longer a flow sits on a connection that has stopped.
+	st := time.NewTicker(stallEvery)
+	defer st.Stop()
 	hosts := make(map[string]*hostCapacity)
+	snapshot := func() []*pooledSession {
+		s.sessionsMu.Lock()
+		defer s.sessionsMu.Unlock()
+		return append([]*pooledSession(nil), s.sessions...)
+	}
 	for {
 		select {
 		case <-g.ctx.Done():
 			return
 		case now := <-t.C:
-			s.sessionsMu.Lock()
-			sessions := make([]*pooledSession, len(s.sessions))
-			copy(sessions, s.sessions)
-			s.sessionsMu.Unlock()
-			sampleCapacity(sessions, hosts, now, network.TCPDeliveryInfo)
+			sampleCapacity(snapshot(), hosts, now, network.TCPDeliveryInfo)
+		case now := <-st.C:
+			sessions := snapshot()
+			for _, ps := range sessions {
+				d, ok := network.TCPDelivery{}, false
+				if ps.conn != nil {
+					d, ok = network.TCPDeliveryInfo(ps.conn)
+				}
+				ps.noteHealth(now, ok && d.Backoff >= stallBackoff)
+			}
 			s.moveOffStalled(g, sessions, now)
 		}
 	}

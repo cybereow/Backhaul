@@ -44,8 +44,8 @@ type pooledSession struct {
 	// probeSent when the oldest RTT probe still unanswered left (0 = none is out).
 	sureSince atomic.Int64
 	probeSent atomic.Int64
-	capEst       atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
-	slow         atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
+	capEst    atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
+	slow      atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
 }
 
 // Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;

@@ -292,6 +292,32 @@ func (p *PumpSwapper) ResumeBegin(ctx context.Context) (uint64, error) {
 	return p.dlBytes.Load(), nil
 }
 
+// Reopen puts the suspended flow on a tunnel whose peer starts the flow from its
+// first byte, because it has never seen it: the flow's opening was lost with the
+// tunnel it was on. Only a flow that has delivered nothing and still retains
+// everything it sent can be; everything is then sent again.
+func (p *PumpSwapper) Reopen(ctx context.Context, build func() (net.Conn, error)) error {
+	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	defer cancel()
+
+	own, err := p.ResumeBegin(ctx)
+	if err != nil {
+		return err
+	}
+	if own != 0 || p.replay.ring.firstOffset() != 0 {
+		return errors.New("reopen: the flow has already exchanged data with its peer")
+	}
+	tunnel, err := build()
+	if err != nil {
+		return err
+	}
+	if err := p.ResumeFinish(tunnel, 0); err != nil {
+		dropTunnel(tunnel)
+		return err
+	}
+	return nil
+}
+
 // ResumeFinish puts the suspended flow on tunnel, whose peer has delivered
 // peerRecv bytes of this side's upload. It returns an error, and aborts the flow,
 // when peerRecv cannot be right (beyond what was sent, or older than the replay

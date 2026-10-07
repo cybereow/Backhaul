@@ -277,6 +277,8 @@ type WsMuxTransport struct {
 	plainSelectMu sync.Mutex
 
 	fallbackProxy http.Handler
+	// reopenSeen: the client has announced utils.AttachCapReopen on some session.
+	reopenSeen atomic.Bool
 
 	// controlMu guards controlChannel, handlersStarted, graceTimer, graceEpoch
 	// and restartClaim. The HTTP handler goroutine may be adopting a reattached
@@ -1228,7 +1230,7 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 			if s.config.MaxConnAge > 0 {
 				g.start(func() { s.rotateStripedSession(g, session) })
 			}
-			if s.resumable() && s.config.ResumeWindow > 0 && s.config.PromoteBytes > 0 {
+			if s.resumable() && s.config.ResumeWindow > 0 {
 				g.start(func() { s.probeReplayPromote(g, ps) })
 			}
 		}

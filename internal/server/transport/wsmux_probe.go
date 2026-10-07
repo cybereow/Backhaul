@@ -59,7 +59,8 @@ func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 // may keep replay state (utils.AttachProbe), and records a yes on the session. An
 // older client refuses the mode; a probe that could not be made at all is tried
 // again a few times, and until one is answered the session's promotable flows
-// simply open without replay.
+// simply open without replay. The answer also says whether the client lets a flow
+// it has never seen be opened again (utils.AttachCapReopen).
 func (s *WsMuxTransport) probeReplayPromote(g *wsGeneration, ps *pooledSession) {
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -76,15 +77,19 @@ func (s *WsMuxTransport) probeReplayPromote(g *wsGeneration, ps *pooledSession) 
 			continue
 		}
 		_ = stream.SetDeadline(time.Now().Add(rttProbeTimeout))
-		accept := false
+		accept, caps := false, byte(0)
 		if err = utils.SendFlowAttach(stream, 0, utils.AttachProbe, 0); err == nil {
-			accept, _, err = utils.ReadAttachVerdict(stream)
+			accept, caps, err = utils.ReadAttachVerdict(stream)
 		}
 		stream.Close()
 		if err != nil {
 			continue
 		}
 		ps.replayPromote.Store(accept)
+		if accept && caps&utils.AttachCapReopen != 0 {
+			ps.reopenCap.Store(true)
+			s.reopenSeen.Store(true)
+		}
 		return
 	}
 }

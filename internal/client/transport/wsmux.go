@@ -210,6 +210,7 @@ type WsMuxTransport struct {
 
 	promotableFlowsMu sync.Mutex
 	promotableFlows   map[uint64]*handlers.PumpSwapper
+	gone              goneFlows // under promotableFlowsMu
 }
 
 // wsEndpoint is a single tunnel entry point: the domain dialed (which also
@@ -534,6 +535,7 @@ func (c *WsMuxTransport) Restart() {
 	c.closeStripeGroups()
 	c.promotableFlowsMu.Lock()
 	c.promotableFlows = make(map[uint64]*handlers.PumpSwapper)
+	c.gone = goneFlows{}
 	c.promotableFlowsMu.Unlock()
 
 	c.Start()
@@ -1492,13 +1494,27 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 	if replay {
 		// Known but not running yet: a resume attach that arrives while the target
 		// is still being dialed must be told to retry, not that the flow is gone.
+		// And an opening for a flow that is running, or that ran, is not a new
+		// flow (see goneFlows): it is dropped.
 		c.promotableFlowsMu.Lock()
-		c.promotableFlows[flowID] = nil
+		_, running := c.promotableFlows[flowID]
+		admit := !running && c.gone.admit(flowID, time.Now())
+		if admit {
+			c.promotableFlows[flowID] = nil
+		}
 		c.promotableFlowsMu.Unlock()
+		if !admit {
+			c.logger.Debugf("a second opening of flow %d was dropped", flowID)
+			stream.Close()
+			return
+		}
 	}
 	forget := func() {
 		c.promotableFlowsMu.Lock()
 		delete(c.promotableFlows, flowID)
+		if replay {
+			c.gone.finished(flowID, time.Now())
+		}
 		c.promotableFlowsMu.Unlock()
 	}
 
@@ -1549,10 +1565,7 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 	swapper.Start()
 
 	<-swapper.DoneWait()
-
-	c.promotableFlowsMu.Lock()
-	delete(c.promotableFlows, flowID)
-	c.promotableFlowsMu.Unlock()
+	forget()
 }
 
 // handleAttachStream answers the server's request to move flow flowID onto this
@@ -1574,13 +1587,22 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 		_ = utils.WriteAttachVerdict(stream, false, reason)
 		stream.Close()
 	}
-	if mode == utils.AttachResume && flags == 0 {
+	if mode == utils.AttachResume && flags&^utils.AttachFlagReopen == 0 {
+		if !known && flags&utils.AttachFlagReopen != 0 {
+			c.promotableFlowsMu.Lock()
+			never := c.gone.neverSeen(flowID, time.Now())
+			c.promotableFlowsMu.Unlock()
+			if never {
+				reject(utils.AttachRejectNeverSeen, "never seen: to be opened again")
+				return
+			}
+		}
 		c.handleResumeAttach(ctx, stream, flowID, swapper, pending, reject)
 		return
 	}
 	if mode == utils.AttachProbe && flags == 0 {
 		_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
-		_ = utils.WriteAttachVerdict(stream, true, 0)
+		_ = utils.WriteAttachCaps(stream, utils.AttachCapReopen)
 		stream.Close()
 		return
 	}

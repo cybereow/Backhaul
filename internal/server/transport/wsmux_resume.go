@@ -46,6 +46,8 @@ type resumableFlow struct {
 	id uint64
 	sw *handlers.PumpSwapper
 	g  *wsGeneration // the generation it runs in: its follow-up work is that one's
+	// remoteAddr is what the flow was opened for, to open it again (reopenFlow).
+	remoteAddr string
 
 	mu      sync.Mutex
 	sess    []*smux.Session // where its tunnel is
@@ -202,7 +204,7 @@ func (s *WsMuxTransport) flowsOn(sess *smux.Session) []*resumableFlow {
 // With replayLimit > 0 the flow also keeps what it sent until acknowledged and is
 // resumed on another session if its own is cut without warning. A promotable flow
 // is also moved onto a striped group once it has sent promote_bytes.
-func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, grant *handlers.ReplayGrant, promotable bool) {
+func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, stream *smux.Stream, ps *pooledSession, flowID uint64, remoteAddr string, grant *handlers.ReplayGrant, promotable bool) {
 	defer grant.Release()
 	sw := handlers.NewPromotablePump(g.ctx, s.config.ProxyProtocol, appConn, handlers.NewHalfCloseConn(stream), s.logger, s.usageMonitor, appConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 	if sw == nil {
@@ -221,7 +223,7 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 		}
 		sw.SetResumeWindow(s.config.ResumeWindow)
 	}
-	f := &resumableFlow{id: flowID, sw: sw, g: g, sess: []*smux.Session{ps.session}}
+	f := &resumableFlow{id: flowID, sw: sw, g: g, remoteAddr: remoteAddr, sess: []*smux.Session{ps.session}}
 	s.registerFlow(f)
 	defer s.unregisterFlow(flowID)
 	sw.Start()
@@ -306,7 +308,13 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow, avoid
 		return fmt.Errorf("%w: %v", errNoOtherSession, err)
 	}
 	_ = stream.SetDeadline(time.Now().Add(resumeTryTimeout))
-	if err := utils.SendFlowAttach(stream, f.id, utils.AttachResume, 0); err != nil {
+	// Nothing has come back for this flow: the client may never have seen it, its
+	// opening held up on the session it was on. A client that can say so is asked.
+	var flags byte
+	if ps.reopenCap.Load() && !f.sw.HeardFromPeer() {
+		flags = utils.AttachFlagReopen
+	}
+	if err := utils.SendFlowAttach(stream, f.id, utils.AttachResume, flags); err != nil {
 		stream.Close()
 		avoid[ps] = true
 		return err
@@ -319,6 +327,9 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow, avoid
 	}
 	if !accept {
 		stream.Close()
+		if reason == utils.AttachRejectNeverSeen && flags != 0 {
+			return s.reopenFlow(ctx, f, ps, avoid)
+		}
 		if reason == utils.AttachRejectUnknownFlow {
 			return errFlowGone
 		}
@@ -340,6 +351,45 @@ func (s *WsMuxTransport) resumeOnce(ctx context.Context, f *resumableFlow, avoid
 	}
 	f.moved(m, false)
 	s.moveOffRetired(f, m.to)
+	return nil
+}
+
+// reopenFlow opens a suspended flow again, from its first byte, on a fresh stream
+// of ps: the client has just said, on ps, that it has never seen the flow. The
+// client expects exactly one such opening and drops any other for this flow -
+// the original one included, should the session it is held up on get through
+// after all.
+func (s *WsMuxTransport) reopenFlow(ctx context.Context, f *resumableFlow, ps *pooledSession, avoid map[*pooledSession]bool) error {
+	stream, err := ps.session.OpenStreamWithin(plainOpenTimeout)
+	if err != nil {
+		avoid[ps] = true
+		return err
+	}
+	_ = stream.SetWriteDeadline(time.Now().Add(resumeTryTimeout))
+	if err := utils.SendFlowResumableReplay(stream, f.id, f.remoteAddr); err != nil {
+		stream.Close()
+		avoid[ps] = true
+		return err
+	}
+	_ = stream.SetWriteDeadline(time.Time{})
+
+	m := f.moving([]*smux.Session{ps.session})
+	rctx, cancel := context.WithTimeout(ctx, resumeTryTimeout)
+	err = f.sw.Reopen(rctx, func() (net.Conn, error) {
+		f.took(m)
+		return handlers.NewHalfCloseConn(stream), nil
+	})
+	cancel()
+	if err != nil {
+		// The client now has the flow, on a stream that ends here: it suspends it,
+		// and the next attempt is an ordinary resume.
+		stream.Close()
+		f.stayed(m)
+		return err
+	}
+	f.moved(m, false)
+	s.moveOffRetired(f, m.to)
+	s.logger.Debugf("flow %d opened again on another session: the client had not seen it", f.id)
 	return nil
 }
 

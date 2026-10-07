@@ -138,10 +138,11 @@ func (s *WsMuxTransport) moveOffStalled(g *wsGeneration, sessions []*pooledSessi
 				continue
 			}
 			// A flow nothing has come back for may be one the client has not heard
-			// of yet, its opening held up on this very connection: resuming it
-			// would be refused, and the flow ended. It is given stallMoveAfter for
-			// the connection to get through after all before that is risked.
-			if !f.sw.HeardFromPeer() && ps.stalledFor(now) < stallMoveAfter {
+			// of yet, its opening held up on this very connection. A client that
+			// can say so has it opened again elsewhere (reopenFlow). An older one
+			// only refuses the resume, which ends the flow: there it is given
+			// stallMoveAfter for the connection to get through after all.
+			if !f.sw.HeardFromPeer() && !s.reopenSeen.Load() && ps.stalledFor(now) < stallMoveAfter {
 				continue
 			}
 			select {

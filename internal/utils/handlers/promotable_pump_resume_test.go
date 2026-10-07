@@ -493,3 +493,47 @@ func TestSuspendDoesNotWaitForTheTunnelToClose(t *testing.T) {
 	}
 	B.pump.Suspend()
 }
+
+// A flow whose opening never reached the peer is opened again on a new tunnel:
+// the peer there is a brand-new flow end, and it gets everything from the first
+// byte, once. A flow that has already exchanged data cannot be.
+func TestReopenSendsEverythingFromTheFirstByte(t *testing.T) {
+	ctx, _ := testCtx(t)
+	a0, lost := tcpConnPair(t) // the peer's end is never read: the opening is "held up"
+	defer lost.Close()
+	A := newResumableEnd(t, ctx, NewHalfCloseConn(a0))
+
+	msg := genPayload(100 << 10)
+	A.user.Write(msg)
+	time.Sleep(100 * time.Millisecond)
+	if A.pump.HeardFromPeer() {
+		t.Fatal("nothing came back, yet the flow says it heard from its peer")
+	}
+	if !A.pump.Suspend() {
+		t.Fatal("the flow could not be suspended")
+	}
+
+	a1, b1 := tcpConnPair(t)
+	B := newResumableEnd(t, ctx, NewHalfCloseConn(b1)) // the peer, starting from scratch
+	if err := A.pump.Reopen(ctx, func() (net.Conn, error) { return NewHalfCloseConn(a1), nil }); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if !bytes.Equal(readExact(t, B.user, len(msg)), msg) {
+		t.Fatal("the reopened flow did not deliver what was sent before it")
+	}
+	B.user.Write([]byte("pong"))
+	if got := readExact(t, A.user, 4); string(got) != "pong" {
+		t.Fatalf("the reopened flow does not carry the way back: %q", got)
+	}
+
+	// Now that data has come back, the peer knows the flow: no second reopen.
+	if !A.pump.HeardFromPeer() {
+		t.Fatal("data came back, yet the flow says it has not heard from its peer")
+	}
+	A.pump.Suspend()
+	a2, b2 := tcpConnPair(t)
+	defer b2.Close()
+	if err := A.pump.Reopen(ctx, func() (net.Conn, error) { return NewHalfCloseConn(a2), nil }); err == nil {
+		t.Fatal("a flow that had exchanged data was reopened: its peer would get it twice")
+	}
+}

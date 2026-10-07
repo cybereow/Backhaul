@@ -479,7 +479,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 		defer atomic.AddInt32(&s.plainFlows, -1)
 		defer atomic.AddInt32(&s.streamCounter, -1)
 		if resumable {
-			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID, replayGrant, promotable)
+			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID, incomingConn.remoteAddr, replayGrant, promotable)
 		} else if promotable {
 			// dispatchPromotable blocks until the flow (and any mid-stream
 			// promotion) completes, so the counters above are released only when

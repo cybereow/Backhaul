@@ -421,7 +421,8 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 
 		// A resumable flow (cdn_max_age set) can be moved to another session when
 		// its own is retired; it takes the envelope and the swapper pump instead.
-		resumable := s.resumable(promotable)
+		// A promotable flow is resumable too, or rotation would cut it.
+		resumable := s.resumable()
 
 		// The header write shares the setup's expiry, and the deadline is cleared
 		// before the stream carries data.
@@ -436,9 +437,11 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 			if resumable {
 				flowID = newFlowID()
 				send = utils.SendFlowResumable
-				if s.config.ResumeWindow > 0 {
+				if s.config.ResumeWindow > 0 && (!promotable || ps.replayPromote.Load()) {
 					// Survive a cut without warning too, if the memory budget allows:
-					// the peer follows the kind byte.
+					// the peer follows the kind byte. A promotable flow gives this up
+					// when it is promoted (a striped group carries no ACK records), so
+					// it only gets it from a client that knows to do the same.
 					if replayGrant = handlers.DefaultReplayBudget.Open(false); replayGrant != nil {
 						send = utils.SendFlowResumableReplay
 					}
@@ -476,7 +479,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 		defer atomic.AddInt32(&s.plainFlows, -1)
 		defer atomic.AddInt32(&s.streamCounter, -1)
 		if resumable {
-			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID, replayGrant)
+			s.dispatchResumable(g, incomingConn.conn, stream, ps, flowID, incomingConn.remoteAddr, replayGrant, promotable)
 		} else if promotable {
 			// dispatchPromotable blocks until the flow (and any mid-stream
 			// promotion) completes, so the counters above are released only when
@@ -658,33 +661,59 @@ func (s *WsMuxTransport) dispatchPromotable(g *wsGeneration, appConn net.Conn, p
 	if swapper == nil {
 		return // failed proxy protocol
 	}
+	s.watchPromotion(g, flowID, swapper, nil)
 
+	// Block until the flow (and any promotion) is fully done, so the caller's
+	// pool-slot accounting is released only when the flow actually finishes.
+	<-swapper.DoneWait()
+}
+
+// promoteTries is how many times a promotion that was started and failed is
+// attempted in all.
+const promoteTries = 3
+
+// watchPromotion promotes the flow once it has sent promote_bytes, if the pool
+// has room for another striped group. f is the flow's entry when it is resumable
+// (nil otherwise).
+func (s *WsMuxTransport) watchPromotion(g *wsGeneration, flowID uint64, swapper *handlers.PumpSwapper, f *resumableFlow) {
 	// A worker of the generation: it may be inside promoteFlow (blocking reads on
 	// legs the generation owns) when a restart begins, and the restart waits for it.
 	g.start(func() {
+		wait, tries := 100*time.Millisecond, 0
 		for {
 			select {
 			case <-g.ctx.Done():
 				return
 			case <-swapper.DoneWait(): // Need a wait channel
 				return
-			case <-time.After(100 * time.Millisecond):
-				if swapper.UpBytes() >= s.config.PromoteBytes {
-					if s.shouldPromote() {
-						s.promoteFlow(g.ctx, flowID, swapper)
-					}
-					// Whether or not it promoted, stop checking: a flow that
-					// stayed plain because the pool was busy keeps running plain
-					// (already spread across CDNs by load-balancing) for its life.
+			case <-time.After(wait):
+				if swapper.UpBytes() < s.config.PromoteBytes {
+					continue
+				}
+				// The flow may be in the middle of another swap just now (a move at
+				// rotation, a resume): that is no verdict on promoting it, so wait
+				// for it to settle rather than give the promotion up for good.
+				if !swapper.Swappable() {
+					continue
+				}
+				// A flow that stays plain because the pool is busy keeps running
+				// plain (already spread across CDNs by load-balancing) for its
+				// life: that decision is taken once.
+				if !s.shouldPromote() {
 					return
 				}
+				if s.promoteFlow(g.ctx, flowID, swapper, f) == nil { // it logs its own failure
+					return
+				}
+				// The attempt can also lose to a swap that started under it, on
+				// either end; a few more tries, further apart, cover that.
+				if tries++; tries == promoteTries {
+					return
+				}
+				wait = time.Second
 			}
 		}
 	})
-
-	// Block until the flow (and any promotion) is fully done, so the caller's
-	// pool-slot accounting is released only when the flow actually finishes.
-	<-swapper.DoneWait()
 }
 
 // shouldPromote decides whether a flow that has crossed promote_bytes should
@@ -717,23 +746,52 @@ func (s *WsMuxTransport) shouldPromote() bool {
 	return atomic.LoadInt32(&s.plainFlows) <= budget
 }
 
-func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper *handlers.PumpSwapper) {
-	// 2. Open legs
-	legs, err := s.openStripedLegs(s.legsPerFlow())
-	if err != nil {
-		s.logger.Tracef("failed to open striped legs for promotion: %v", err)
-		return // abort, flow continues on plain
+// promoteFlow moves a flow from the tunnel it is on (a plain stream, or the
+// striped group of an earlier promotion) onto a new striped group. f is the
+// flow's entry when it is resumable (nil otherwise); the sessions carrying the
+// new legs are recorded there, so the retirement of any of them moves the flow
+// again. A failure before the freeze leaves the flow where it was.
+func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper *handlers.PumpSwapper, f *resumableFlow) error {
+	// ctx bounds the whole move, the opening of the legs included: a pool session
+	// that swallows packets without closing would otherwise hold this for smux's
+	// own open timeout and a header write for ever, past the drain or regroup
+	// window the caller is working within.
+	type opened struct {
+		legs     []*smux.Stream
+		sessions []*smux.Session
+		err      error
+	}
+	openCh := make(chan opened, 1)
+	go func() {
+		l, ss, err := s.openStripedLegsOn(s.legsPerFlow())
+		openCh <- opened{l, ss, err}
+	}()
+	var o opened
+	select {
+	case o = <-openCh:
+	case <-ctx.Done():
+		go func() { closeLegs((<-openCh).legs) }() // whatever still arrives is not used
+		return ctx.Err()
+	}
+	legs, sessions := o.legs, o.sessions
+	if o.err != nil {
+		s.logger.Tracef("failed to open striped legs for promotion: %v", o.err)
+		return o.err // the flow continues where it is
 	}
 
+	headerBy := time.Now().Add(handlers.PromoteHandshakeTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(headerBy) {
+		headerBy = d
+	}
 	gid := atomic.AddUint32(&s.stripeGroupID, 1)
 	for i, stream := range legs {
+		_ = stream.SetWriteDeadline(headerBy)
 		if err := utils.SendFlowPromote(stream, flowID, gid, uint8(i), uint8(len(legs)), uint8(s.config.StripeParity)); err != nil {
 			s.logger.Tracef("failed to send promote header: %v", err)
-			for _, st := range legs {
-				st.Close()
-			}
-			return
+			closeLegs(legs)
+			return err
 		}
+		_ = stream.SetWriteDeadline(time.Time{})
 	}
 
 	conns := make([]net.Conn, len(legs))
@@ -741,18 +799,34 @@ func (s *WsMuxTransport) promoteFlow(ctx context.Context, flowID uint64, swapper
 		conns[i] = st
 	}
 
-	// Freeze, exchange the byte counts on raw leg 0 (no striped reader exists
-	// yet), then build the wrapper and install it. A failure before the freeze
-	// leaves the flow plain; a later one aborts it (see PumpSwapper.Promote).
-	err = swapper.Promote(ctx, conns, func() (net.Conn, error) {
+	var move *flowMove
+	if f != nil {
+		move = f.moving(sessions)
+	}
+	// Wait for the client's byte count on raw leg 0 (it sends it once it has
+	// every leg), then freeze, answer with ours, build the wrapper and install
+	// it. A failure before the freeze leaves the flow plain; a later one aborts
+	// it (see PumpSwapper.PromoteOpened).
+	err := swapper.PromoteOpened(ctx, conns, func() (net.Conn, error) {
+		if f != nil {
+			f.took(move)
+		}
 		if s.config.StripeParity > 0 {
 			return striping.NewFEC(conns, striping.DefaultChunkSize, s.config.StripeFactor, s.config.StripeParity)
 		}
 		return striping.New(conns, striping.DefaultChunkSize), nil
 	})
 	if err != nil {
+		if f != nil {
+			f.stayed(move)
+		}
 		s.logger.Warnf("promotion of flow %d failed: %v", flowID, err)
-		return
+		return err
+	}
+	if f != nil {
+		f.moved(move, true)
+		s.moveOffRetired(f, sessions)
 	}
 	s.logger.Debugf("flow %d promoted to %d striped legs", flowID, len(conns))
+	return nil
 }

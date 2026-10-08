@@ -123,6 +123,29 @@ func newHalfCloseConn(stream net.Conn) *halfCloseConn {
 	return &halfCloseConn{Conn: stream}
 }
 
+// PeerClosed is closed once the peer has closed the stream under the envelope,
+// or the stream is gone; nil when the stream cannot tell (not a smux stream).
+// This is the stream's own end, not the envelope's END, which only ends the
+// peer's data and may have come long before.
+func (c *halfCloseConn) PeerClosed() <-chan struct{} {
+	st, ok := c.Conn.(interface {
+		FinCh() <-chan struct{}
+		GetDieCh() <-chan struct{}
+	})
+	if !ok {
+		return nil
+	}
+	gone := make(chan struct{})
+	go func() {
+		select {
+		case <-st.FinCh():
+		case <-st.GetDieCh():
+		}
+		close(gone)
+	}()
+	return gone
+}
+
 func isTimeout(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()

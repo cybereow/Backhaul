@@ -1,0 +1,128 @@
+package striping
+
+import (
+	"bytes"
+	"io"
+	"net"
+	"testing"
+	"time"
+)
+
+// TestStripedBudgetPressureDeliversEverything runs many small transfers over
+// eight legs with room for only five chunks, so leg readers are waiting for room
+// all the time. Waiting is never a reason to fail a flow whose chunks all
+// arrive: in particular, a leg that hands over the awaited chunk and then waits
+// on a later one must not be taken for a flow that can no longer make progress.
+// That mistake showed about once in two hundred transfers, so this run is a
+// check under pressure rather than a sure catch; raise runs to hunt for it.
+func TestStripedBudgetPressureDeliversEverything(t *testing.T) {
+	const (
+		nLegs = 8
+		chunk = 16
+		size  = 4096
+		runs  = 40
+	)
+	payload := bytes.Repeat([]byte("0123456789abcdef"), size/16)
+	for run := 0; run < runs; run++ {
+		a, b := pipePair(nLegs)
+		sender, receiver := New(a, chunk), New(b, chunk)
+		receiver.budget.limit = 5 * (retainedEntryOverhead + chunk) // before any I/O
+
+		sent := make(chan error, 1)
+		go func() {
+			_, err := sender.Write(payload)
+			sender.Close()
+			sent <- err
+		}()
+		_ = receiver.SetReadDeadline(time.Now().Add(20 * time.Second))
+		got, err := io.ReadAll(receiver)
+		receiver.Close()
+		if err != nil || !bytes.Equal(got, payload) {
+			t.Fatalf("transfer %d: %d of %d bytes, read error %v, write error %v", run, len(got), size, err, <-sent)
+		}
+		for _, c := range append(a, b...) {
+			c.(net.Conn).Close()
+		}
+	}
+}
+
+// With the budget full, the chunk Read is waiting for is let in over it - once.
+// A second copy of it on another leg (the reroute watchdog makes those), and a
+// copy of anything already delivered, are not retained at all.
+func TestAdmitLetsOneCopyOfTheAwaitedChunkOverTheBudget(t *testing.T) {
+	const cost = retainedEntryOverhead + 16
+	c := &Conn{
+		chunkSize: 16,
+		budget:    reassemblyBudget{limit: 5 * cost, used: 5 * cost, peak: 5 * cost},
+		parkAt:    make([]uint64, 3),
+		legWaited: make([]uint32, 3),
+		parkCh:    make(chan struct{}, 1),
+		closed:    make(chan struct{}),
+	}
+	c.nextSeq, c.nextSeqSeen = 7, 7
+
+	// two legs hold a copy of the awaited chunk: both may read it, one gets in
+	for leg := 0; leg < 2; leg++ {
+		if v, ok := c.admit(leg, 7, cost); v != admitAwaited || !ok {
+			t.Fatalf("a copy of the awaited chunk on leg %d: verdict=%v ok=%v, want it read and then claimed", leg, v, ok)
+		}
+	}
+	if !c.claimForced(7) {
+		t.Fatal("the first whole copy of the awaited chunk could not claim the admission")
+	}
+	c.budget.force(cost)
+	if c.claimForced(7) {
+		t.Fatal("a second copy of the awaited chunk claimed the admission too")
+	}
+	if v, ok := c.admit(1, 7, cost); v != admitDrop || !ok {
+		t.Fatalf("a copy arriving after one is in: verdict=%v ok=%v, want it discarded", v, ok)
+	}
+	if v, ok := c.admit(2, 5, cost); v != admitDrop || !ok {
+		t.Fatalf("a copy of a delivered chunk: verdict=%v ok=%v, want it discarded", v, ok)
+	}
+	if used, peak := c.budget.used, c.budget.peak; used != 6*cost || peak != 6*cost {
+		t.Fatalf("retained %d (peak %d), want the %d budget plus exactly one chunk", used, peak, 5*cost)
+	}
+
+	// once Read moves on, the next awaited chunk gets the same treatment
+	c.advance()
+	if v, ok := c.admit(1, 8, cost); v != admitAwaited || !ok || !c.claimForced(8) {
+		t.Fatalf("the next awaited chunk: verdict=%v ok=%v, want it read and admitted", v, ok)
+	}
+
+	// A reader that acts on an old view of the awaited sequence cannot take the
+	// claim back: a late claim for 7 fails, and 8 stays claimed.
+	if c.claimForced(7) {
+		t.Fatal("a claim for a sequence behind the last one admitted succeeded")
+	}
+	if c.claimForced(8) {
+		t.Fatal("the awaited sequence could be claimed twice after a stale claim")
+	}
+	if !c.claimForced(9) {
+		t.Fatal("the following sequence could not be claimed")
+	}
+}
+
+// A copy of the awaited chunk that holds the claim but finds, when it comes to
+// charge, that Read has already moved past its sequence (another copy was
+// delivered meanwhile) is not charged: or it would add its charge on top of the
+// one the next sequence's copy takes.
+func TestForcedChargeIsRefusedOnceReadMovedOn(t *testing.T) {
+	const cost = retainedEntryOverhead + 16
+	c := &Conn{chunkSize: 16, budget: reassemblyBudget{limit: 5 * cost, used: 5 * cost, peak: 5 * cost}}
+	c.nextSeq, c.nextSeqSeen = 7, 7
+
+	if !c.claimForced(7) {
+		t.Fatal("the awaited chunk could not claim the admission")
+	}
+	c.advance() // another copy of 7 was delivered before this one charged
+	if c.forceAwaited(7, cost) {
+		t.Fatal("a copy of a delivered sequence was charged over the budget")
+	}
+	if !c.claimForced(8) || !c.forceAwaited(8, cost) {
+		t.Fatal("the next awaited chunk could not take the admission")
+	}
+	if used, peak := c.budget.used, c.budget.peak; used != 6*cost || peak != 6*cost {
+		t.Fatalf("retained %d (peak %d), want the %d budget plus exactly one chunk", used, peak, 5*cost)
+	}
+}

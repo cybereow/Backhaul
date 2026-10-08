@@ -297,13 +297,33 @@ const (
 	// exchange how many bytes each has delivered, and replay the rest from their
 	// replay rings (FlowResumableReplay flows only).
 	AttachResume byte = 1
+	// AttachProbe attaches nothing (flowID 0): it asks whether the client lets a
+	// flow that keeps replay state be promoted, giving that state up on the striped
+	// group. A client that does accepts; an older one refuses the mode, and the
+	// server then opens promotable flows without replay, as it always did.
+	AttachProbe byte = 2
 )
+
+// AttachFlagReopen, on an AttachResume: the server has heard nothing back for
+// this flow and can open it again from its first byte, so a client that has
+// never seen it should say so (AttachRejectNeverSeen) rather than unknown. Only
+// sent to a client that announced AttachCapReopen.
+const AttachFlagReopen byte = 1
+
+// AttachCapReopen is set in the second byte of the verdict that accepts an
+// AttachProbe, by a client that understands AttachFlagReopen. (An older client
+// leaves the byte zero; an older server does not look at it.)
+const AttachCapReopen byte = 1
 
 // Why a peer refused an attach (second byte of the verdict).
 const (
 	AttachRejectUnknownFlow byte = 1 // no such flow, or it already finished
 	AttachRejectBusy        byte = 2 // a swap of that flow is already in progress
 	AttachRejectUnsupported byte = 3 // mode or flags not understood
+	// AttachRejectNeverSeen answers an AttachResume with AttachFlagReopen: the
+	// flow is not running here and never was, and one opening of it is now
+	// expected.
+	AttachRejectNeverSeen byte = 4
 )
 
 // SendFlowResumable writes the FlowResumable header (same layout as FlowPlain).
@@ -357,6 +377,14 @@ func WriteAttachVerdict(conn net.Conn, accept bool, reason byte) error {
 		buf[1] = 0
 	}
 	if _, err := conn.Write(buf[:]); err != nil {
+		return fmt.Errorf("failed to send attach verdict: %w", err)
+	}
+	return nil
+}
+
+// WriteAttachCaps accepts an AttachProbe, announcing caps (AttachCap* bits).
+func WriteAttachCaps(conn net.Conn, caps byte) error {
+	if _, err := conn.Write([]byte{1, caps}); err != nil {
 		return fmt.Errorf("failed to send attach verdict: %w", err)
 	}
 	return nil

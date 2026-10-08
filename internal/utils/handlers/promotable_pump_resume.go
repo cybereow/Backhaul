@@ -41,6 +41,18 @@ func (p *PumpSwapper) Resumes() uint64 {
 	return p.resumes
 }
 
+// HeardFromPeer reports whether anything of this flow has come back from the
+// peer yet: payload, or an acknowledgement of what was sent. Until then nothing
+// says the peer knows the flow at all - its opening may still be on its way -
+// and a flow the peer does not know cannot be resumed, only ended.
+func (p *PumpSwapper) HeardFromPeer() bool {
+	if p.dlBytes.Load() > 0 {
+		return true
+	}
+	r := p.replaying()
+	return r != nil && (r.ring.firstOffset() > 0 || r.endAcked.Load())
+}
+
 // SuspendedCh is closed while the flow is suspended and replaced by a fresh
 // channel when it resumes: read it again after each resume.
 func (p *PumpSwapper) SuspendedCh() <-chan struct{} {
@@ -53,10 +65,11 @@ func (p *PumpSwapper) SuspendedCh() <-chan struct{} {
 // what a failing pump does, and what the owner calls when it learns the tunnel is
 // gone before the pumps do (its session died) or when the peer asks to resume a
 // flow whose old tunnel still looks alive. It reports whether the flow is now
-// suspended: false when it cannot be (no replay, aborted, or finished).
+// suspended: false when it cannot be (no replay, or replay given up at a
+// promotion; aborted; or finished).
 func (p *PumpSwapper) Suspend() bool {
 	p.mu.Lock()
-	if p.replay == nil || p.aborted || (p.upEnded && p.dlEnded && p.replay.settled()) {
+	if p.replaying() == nil || p.aborted || (p.upEnded && p.dlEnded && p.replay.settled()) {
 		p.mu.Unlock()
 		return false
 	}
@@ -81,9 +94,13 @@ func (p *PumpSwapper) Suspend() bool {
 	close(p.suspendCh)
 	p.checkParkedLocked() // a direction that already ended has nothing to park
 
-	// Wake whatever the pumps are blocked in: the app read, a wait for ring room
-	// (the tunnel read and write fail on their own once the tunnel is dropped).
+	// Wake whatever the pumps are blocked in: the app read, a wait for ring room,
+	// and a write the app is not taking - an app that has stopped reading (a
+	// paused download) would otherwise keep the download pump from parking, and
+	// the flow from resuming, for as long as it does. The tunnel read and write
+	// fail on their own once the tunnel is dropped.
 	_ = p.app.SetReadDeadline(time.Unix(1, 0))
+	_ = p.app.SetWriteDeadline(time.Unix(1, 0))
 	select {
 	case p.freezeWake <- struct{}{}:
 	default:
@@ -94,8 +111,16 @@ func (p *PumpSwapper) Suspend() bool {
 	}
 	p.mu.Unlock()
 
-	dropTunnel(old)
-	dropTunnel(next)
+	// Not waited for: closing a stream tells the peer (a FIN frame), and on a
+	// connection that has stopped getting through that write waits out smux's own
+	// timeout, half a minute. Whoever suspends flows because their connection is
+	// stalled would be held for that long per flow, the others left on it meanwhile.
+	// The pumps do not need it either: the stream is dead to them the moment the
+	// close begins.
+	go func() {
+		dropTunnel(old)
+		dropTunnel(next)
+	}()
 	time.AfterFunc(window, func() {
 		p.mu.Lock()
 		stale := !p.suspended || p.suspendGen != gen
@@ -144,7 +169,7 @@ func (r *replayState) settled() bool {
 // then a cut tunnel would leave the peer short of bytes only this side can replay.
 // It returns at once for a flow without replay or one that was aborted.
 func (p *PumpSwapper) lingerForAcks() {
-	if p.replay == nil {
+	if p.replaying() == nil {
 		return
 	}
 	window := p.resumeWindow
@@ -202,6 +227,7 @@ func (p *PumpSwapper) parkUp() (dst net.Conn, ok bool) {
 // tunnel to read from.
 func (p *PumpSwapper) parkDl() (src net.Conn, ok bool) {
 	p.mu.Lock()
+	_ = p.app.SetWriteDeadline(time.Time{}) // the suspension's wakeup has done its job
 	p.dlParked = true
 	p.checkParkedLocked()
 	rc := p.resumeCh
@@ -264,6 +290,32 @@ func (p *PumpSwapper) ResumeBegin(ctx context.Context) (uint64, error) {
 		return 0, ErrNotSuspended
 	}
 	return p.dlBytes.Load(), nil
+}
+
+// Reopen puts the suspended flow on a tunnel whose peer starts the flow from its
+// first byte, because it has never seen it: the flow's opening was lost with the
+// tunnel it was on. Only a flow that has delivered nothing and still retains
+// everything it sent can be; everything is then sent again.
+func (p *PumpSwapper) Reopen(ctx context.Context, build func() (net.Conn, error)) error {
+	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	defer cancel()
+
+	own, err := p.ResumeBegin(ctx)
+	if err != nil {
+		return err
+	}
+	if own != 0 || p.replay.ring.firstOffset() != 0 {
+		return errors.New("reopen: the flow has already exchanged data with its peer")
+	}
+	tunnel, err := build()
+	if err != nil {
+		return err
+	}
+	if err := p.ResumeFinish(tunnel, 0); err != nil {
+		dropTunnel(tunnel)
+		return err
+	}
+	return nil
 }
 
 // ResumeFinish puts the suspended flow on tunnel, whose peer has delivered

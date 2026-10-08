@@ -433,3 +433,107 @@ func TestResumeReplaysProxyHeader(t *testing.T) {
 		t.Fatal("the header or the payload after the resume differs")
 	}
 }
+
+// An app that has stopped reading (a paused download) keeps the download pump in
+// a write to it. A cut then must not wait for the app: the flow is suspended and
+// resumed with that write interrupted, and when the app reads again it gets
+// every byte, once and in order.
+func TestResumeWhileTheAppIsNotReading(t *testing.T) {
+	ctx, _ := testCtx(t)
+	rt, a0, b0 := newRawTunnel(t)
+	A, B := newResumableEnd(t, ctx, a0), newResumableEnd(t, ctx, b0)
+
+	msg := genPayload(8 << 20)
+	go A.user.Write(msg) // far more than B's app, which reads nothing, will take
+	for i := 0; i < 2; i++ {
+		time.Sleep(300 * time.Millisecond) // B's pump is stuck writing to its app by now
+		rt.cut()
+		if rt = resumeBoth(t, ctx, A.pump, B.pump); rt == nil {
+			t.Fatal("the flow could not be suspended")
+		}
+	}
+	if !bytes.Equal(readExact(t, B.user, len(msg)), msg) {
+		t.Fatal("the download differs after resuming under a blocked app")
+	}
+	if B.pump.Resumes() != 2 {
+		t.Fatalf("resumes: %d, want 2", B.pump.Resumes())
+	}
+}
+
+// slowCloseConn is a connection that has stopped getting through: closing it
+// waits, the way a stream's FIN waits on a stalled session.
+type slowCloseConn struct {
+	*net.TCPConn
+	wait time.Duration
+}
+
+func (c slowCloseConn) Close() error {
+	time.Sleep(c.wait)
+	return c.TCPConn.Close()
+}
+
+// Suspending a flow does not wait for its dead tunnel to be closed: on a stalled
+// connection that takes smux's whole close timeout, and whoever is taking flows
+// off such a connection would get to the next one only after it.
+func TestSuspendDoesNotWaitForTheTunnelToClose(t *testing.T) {
+	ctx, _ := testCtx(t)
+	a, b := tcpConnPair(t)
+	A := newResumableEnd(t, ctx, NewHalfCloseConn(slowCloseConn{a, 3 * time.Second}))
+	B := newResumableEnd(t, ctx, NewHalfCloseConn(b))
+
+	A.user.Write([]byte("hello"))
+	readExact(t, B.user, 5)
+
+	start := time.Now()
+	if !A.pump.Suspend() {
+		t.Fatal("the flow could not be suspended")
+	}
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Fatalf("Suspend took %v: it waited for the tunnel to close", d)
+	}
+	B.pump.Suspend()
+}
+
+// A flow whose opening never reached the peer is opened again on a new tunnel:
+// the peer there is a brand-new flow end, and it gets everything from the first
+// byte, once. A flow that has already exchanged data cannot be.
+func TestReopenSendsEverythingFromTheFirstByte(t *testing.T) {
+	ctx, _ := testCtx(t)
+	a0, lost := tcpConnPair(t) // the peer's end is never read: the opening is "held up"
+	defer lost.Close()
+	A := newResumableEnd(t, ctx, NewHalfCloseConn(a0))
+
+	msg := genPayload(100 << 10)
+	A.user.Write(msg)
+	time.Sleep(100 * time.Millisecond)
+	if A.pump.HeardFromPeer() {
+		t.Fatal("nothing came back, yet the flow says it heard from its peer")
+	}
+	if !A.pump.Suspend() {
+		t.Fatal("the flow could not be suspended")
+	}
+
+	a1, b1 := tcpConnPair(t)
+	B := newResumableEnd(t, ctx, NewHalfCloseConn(b1)) // the peer, starting from scratch
+	if err := A.pump.Reopen(ctx, func() (net.Conn, error) { return NewHalfCloseConn(a1), nil }); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if !bytes.Equal(readExact(t, B.user, len(msg)), msg) {
+		t.Fatal("the reopened flow did not deliver what was sent before it")
+	}
+	B.user.Write([]byte("pong"))
+	if got := readExact(t, A.user, 4); string(got) != "pong" {
+		t.Fatalf("the reopened flow does not carry the way back: %q", got)
+	}
+
+	// Now that data has come back, the peer knows the flow: no second reopen.
+	if !A.pump.HeardFromPeer() {
+		t.Fatal("data came back, yet the flow says it has not heard from its peer")
+	}
+	A.pump.Suspend()
+	a2, b2 := tcpConnPair(t)
+	defer b2.Close()
+	if err := A.pump.Reopen(ctx, func() (net.Conn, error) { return NewHalfCloseConn(a2), nil }); err == nil {
+		t.Fatal("a flow that had exchanged data was reopened: its peer would get it twice")
+	}
+}

@@ -15,16 +15,43 @@ import (
 // CDNs) and an EWMA round-trip estimate maintained by probeSessionRTT.
 type pooledSession struct {
 	session   *smux.Session
-	halfClose bool          // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
-	cdn       string        // CDN identity: the remote IP the pool connection arrived from
-	rtt       atomic.Int64  // EWMA round-trip in nanoseconds; 0 until the first probe lands
-	born      time.Time     // when the session was admitted
-	maxAge    time.Duration // rotation age (0 = no rotation, so no age preference)
+	halfClose bool // negotiated halfclose-v1: plain flows on it may use FlowPlainHC
+	// replayPromote: the client answered probeReplayPromote, so a promotable flow
+	// opened on this session may keep replay state until it is promoted.
+	replayPromote atomic.Bool
+	cdn           string        // CDN identity: the remote IP the pool connection arrived from
+	rtt           atomic.Int64  // EWMA round-trip in nanoseconds; 0 until the first probe lands
+	born          time.Time     // when the session was admitted
+	maxAge        time.Duration // rotation age (0 = no rotation, so no age preference)
 
 	// pendingOpens counts plain-leg OpenStreams that have picked this session but
 	// not yet returned (see openPlainLegPS). It is guarded by
 	// WsMuxTransport.plainSelectMu, never read or written without it.
 	pendingOpens int
+
+	// Capacity-aware placement (see wsmux_capacity.go). host and conn are fixed
+	// at registration; capLast belongs to capacityLoop alone; slow and capEst are
+	// what it publishes.
+	host    string    // domain the client dialed for this connection (the CDN identity when unknown)
+	conn    net.Conn  // the socket under the session, for TCP_INFO; nil when unknown
+	capLast capSample // the previous look at the socket
+	// Whether the connection is getting through right now (see wsmux_stall.go):
+	// stalledSince is when it stopped looking like it (unix nanos, 0 = it does),
+	// probeFails how many RTT probes in a row went unanswered.
+	stalledSince atomic.Int64
+	probeFails   atomic.Int32
+	// sureSince is since when there has been no doubt about it (see noteHealth),
+	// probeSent when the oldest RTT probe still unanswered left (0 = none is out).
+	sureSince atomic.Int64
+	probeSent atomic.Int64
+	// overdueSent is the probe (its probeSent) whose echo was last taken for
+	// overdue, overdueAt when: see echoIsOverdue.
+	overdueSent atomic.Int64
+	overdueAt   atomic.Int64
+	// reopenCap: the client on this session understands AttachFlagReopen.
+	reopenCap atomic.Bool
+	capEst    atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
+	slow      atomic.Uint64 // float64 bits of the placement penalty; 0 = not charged
 }
 
 // Leg-selection scoring. A leg's score is (open streams + 1) x its RTT in ms;
@@ -50,14 +77,25 @@ type pooledSession struct {
 // unfairly preferred nor shunned before its first probe.
 const (
 	unprobedRTTms   = 40.0
-	rttProbeEvery   = 5 * time.Second
-	rttProbeTimeout = 10 * time.Second
+	rttProbeEvery   = time.Second
+	rttProbeTimeout = 2 * time.Second
 )
 
 // registerSession adds a pool session to the live registry and returns its
 // wrapper so the caller can start probing it. unregisterSession removes it.
 func (s *WsMuxTransport) registerSession(session *smux.Session, halfClose bool) *pooledSession {
-	ps := &pooledSession{session: session, halfClose: halfClose, cdn: cdnKey(session.RemoteAddr()), born: time.Now(), maxAge: s.config.MaxConnAge}
+	return s.registerCarriedSession(tunnelSession{session: session, halfClose: halfClose})
+}
+
+// registerCarriedSession is registerSession for a session whose socket and
+// dialed domain are known, which is what capacity-aware placement measures and
+// groups by.
+func (s *WsMuxTransport) registerCarriedSession(ts tunnelSession) *pooledSession {
+	session := ts.session
+	ps := &pooledSession{session: session, halfClose: ts.halfClose, cdn: cdnKey(session.RemoteAddr()), born: time.Now(), maxAge: s.config.MaxConnAge, conn: ts.conn, host: ts.host}
+	if ps.host == "" {
+		ps.host = ps.cdn
+	}
 	s.sessionsMu.Lock()
 	s.sessions = append(s.sessions, ps)
 	s.sessionsMu.Unlock()
@@ -142,7 +180,11 @@ func ageFactor(age, maxAge time.Duration) float64 {
 	return 1 + ageWeight*frac
 }
 
+// agedScore applies the two per-session factors to a load x RTT score: the age
+// bias above, and the charge for a connection measured to deliver far less than
+// the best one in the pool (see wsmux_capacity.go).
 func agedScore(base float64, ps *pooledSession) float64 {
+	base *= ps.slowness()
 	if ps.maxAge <= 0 {
 		return base
 	}
@@ -221,28 +263,37 @@ func selectLegs(avail []*pooledSession, n int, score func(*pooledSession) float6
 // requeues and the promotion path stays plain - so the flow waits for the pool
 // to grow instead of running mis-striped.
 func (s *WsMuxTransport) openStripedLegs(n int) ([]*smux.Stream, error) {
+	streams, _, err := s.openStripedLegsOn(n)
+	return streams, err
+}
+
+// openStripedLegsOn is openStripedLegs that also says which pool session carries
+// each leg.
+func (s *WsMuxTransport) openStripedLegsOn(n int) ([]*smux.Stream, []*smux.Session, error) {
 	s.sessionsMu.Lock()
 	avail := make([]*pooledSession, len(s.sessions))
 	copy(avail, s.sessions)
 	s.sessionsMu.Unlock()
 
 	if len(avail) < n {
-		return nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
+		return nil, nil, fmt.Errorf("striping needs %d live pool session(s), only %d available", n, len(avail))
 	}
 
-	chosen := selectLegs(avail, n, legScore)
+	chosen := selectLegs(withoutStalled(avail, n), n, legScore)
 	streams := make([]*smux.Stream, 0, n)
+	sessions := make([]*smux.Session, 0, n)
 	for _, ps := range chosen {
 		stream, err := ps.session.OpenStream()
 		if err != nil {
 			for _, st := range streams {
 				st.Close()
 			}
-			return nil, fmt.Errorf("failed to open stripe leg: %w", err)
+			return nil, nil, fmt.Errorf("failed to open stripe leg: %w", err)
 		}
 		streams = append(streams, stream)
+		sessions = append(sessions, ps.session)
 	}
-	return streams, nil
+	return streams, sessions, nil
 }
 
 // openPlainLeg opens one stream for a single-leg (plain, non-striped) flow,
@@ -296,8 +347,21 @@ func (s *WsMuxTransport) openPlainLeg() (*smux.Stream, error) {
 // caller like any other (the setup attempt closes it if it has expired), and a
 // session that started draining after the pick is not re-admitted: eligibility
 // is only ever decided at selection, from the live registry.
+// plainOpenTimeout is how long opening a stream on one session may take before
+// the next session is tried.
+const plainOpenTimeout = 3 * time.Second
+
 func (s *WsMuxTransport) openPlainLegPS() (*smux.Stream, *pooledSession, error) {
-	tried := make(map[*pooledSession]bool)
+	return s.openPlainLegAvoiding(nil)
+}
+
+// openPlainLegAvoiding is openPlainLegPS that leaves out the sessions in avoid:
+// the ones a caller has just tried and got nothing from.
+func (s *WsMuxTransport) openPlainLegAvoiding(avoid map[*pooledSession]bool) (*smux.Stream, *pooledSession, error) {
+	tried := make(map[*pooledSession]bool, len(avoid))
+	for ps := range avoid {
+		tried[ps] = true
+	}
 	for {
 		ps, live := s.reservePlainLeg(tried)
 		if ps == nil {
@@ -307,7 +371,10 @@ func (s *WsMuxTransport) openPlainLegPS() (*smux.Stream, *pooledSession, error) 
 			return nil, nil, fmt.Errorf("all %d pool session(s) failed to open a plain leg", live)
 		}
 
-		stream, err := ps.session.OpenStream() // may block: no lock held
+		// Bounded: a session that has just stopped getting through is not marked
+		// yet (see wsmux_stall.go), and a flow placed on it would otherwise wait
+		// half a minute for its stream before the next session is tried.
+		stream, err := ps.session.OpenStreamWithin(plainOpenTimeout) // may block: no lock held
 		s.releasePlainLeg(ps)
 		if err == nil {
 			return stream, ps, nil

@@ -53,6 +53,10 @@ func NewServer(domain, key string, logger *logrus.Logger) *Server {
 	return s
 }
 
+// SetDecoys makes the server also answer "<payload>.<decoy>.<domain>" names
+// (see Responder.SetDecoys). Call it before Serve.
+func (s *Server) SetDecoys(decoys []string) error { return s.responder.SetDecoys(decoys) }
+
 // SetRel sets the rel parameters (RTO bounds, buffers) for sessions created from
 // now on; call it before Serve.
 func (s *Server) SetRel(cfg rel.Config) { s.relCfg = cfg }

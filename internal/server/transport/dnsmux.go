@@ -25,6 +25,7 @@ import (
 // exactly like tcpmux.
 type DnsMuxConfig struct {
 	Domain           string
+	Decoys           []string // also answer <payload>.<decoy>.<domain>
 	Key              string
 	Listen           string
 	Token            string
@@ -108,6 +109,9 @@ func (s *DnsMuxTransport) Start() {
 	s.config.TunnelStatus = "Disconnected (DNSMUX)"
 
 	srv := dnsx.NewServer(s.config.Domain, s.config.Key, s.logger)
+	if err := srv.SetDecoys(s.config.Decoys); err != nil {
+		s.logger.Fatalf("dnsmux: dns_decoys: %v", err)
+	}
 	// Real DNS round trips take 0.1-1.5s and vary widely; a 300ms minimum RTO
 	// would retransmit most segments spuriously and waste the scarce capacity.
 	srv.SetRel(rel.Config{MinRTO: time.Second, MaxRTO: 4 * time.Second, MaxInflight: 32 * 1024})

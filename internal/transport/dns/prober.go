@@ -43,6 +43,7 @@ const (
 // is not proof of a usable path).
 type ProfileResult struct {
 	Resolver    string `json:"resolver"`
+	Decoy       string `json:"decoy,omitempty"` // name shape tried: "" = plain domain, else "<payload>.<decoy>.<domain>"
 	RRType      string `json:"rr_type"`
 	Transport   string `json:"transport"` // outside->resolver hop
 	EDNS        bool   `json:"edns"`
@@ -80,6 +81,7 @@ type attempt struct {
 // never learns or dials the authoritative address (resolver-only path, §4).
 type Prober struct {
 	domain    string
+	decoys    []string // name shapes tried besides the plain domain
 	key       []byte
 	resolvers []string
 	rrTypes   []uint16
@@ -97,6 +99,7 @@ type Prober struct {
 // ProberParams is the flattened, already-validated config the prober needs.
 type ProberParams struct {
 	Domain      string
+	Decoys      []string // also try "<payload>.<decoy>.<domain>" for each; the plain domain is always tried
 	Key         string
 	Resolvers   []string // "ip:port"
 	RRTypes     []uint16
@@ -125,6 +128,7 @@ func NewProber(p ProberParams, logger *logrus.Logger) *Prober {
 	}
 	return &Prober{
 		domain:    dns.Fqdn(p.Domain),
+		decoys:    p.Decoys,
 		key:       []byte(p.Key),
 		resolvers: p.Resolvers,
 		rrTypes:   p.RRTypes,
@@ -160,6 +164,7 @@ func randNonce() uint64 {
 
 // profileKey identifies one probe profile; Run repeats each key p.repeat times.
 type profileKey struct {
+	decoy     string
 	resolver  string
 	rrType    uint16
 	transport string
@@ -172,13 +177,19 @@ type profileKey struct {
 // EDNS modes × requested response sizes.
 func (p *Prober) Run(ctx context.Context) []ProfileResult {
 	var profiles []profileKey
-	for _, res := range p.resolvers {
-		for _, t := range p.rrTypes {
-			for _, edns := range p.ednsModes {
-				for _, sz := range p.respSizes {
-					profiles = append(profiles, profileKey{res, t, "udp", edns, sz})
-					if p.useTCP {
-						profiles = append(profiles, profileKey{res, t, "tcp", edns, sz})
+	for _, decoy := range append([]string{""}, p.decoys...) {
+		if _, err := WithDecoy(p.domain, decoy); err != nil {
+			p.logger.Warnf("prober: skipping decoy %q: %v", decoy, err)
+			continue
+		}
+		for _, res := range p.resolvers {
+			for _, t := range p.rrTypes {
+				for _, edns := range p.ednsModes {
+					for _, sz := range p.respSizes {
+						profiles = append(profiles, profileKey{decoy, res, t, "udp", edns, sz})
+						if p.useTCP {
+							profiles = append(profiles, profileKey{decoy, res, t, "tcp", edns, sz})
+						}
 					}
 				}
 			}
@@ -205,7 +216,7 @@ func (p *Prober) Run(ctx context.Context) []ProfileResult {
 			go func(i, rep int, prof profileKey) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				a := p.probe(ctx, prof.resolver, prof.rrType, prof.transport, prof.edns, prof.respSize)
+				a := p.probe(ctx, prof.decoy, prof.resolver, prof.rrType, prof.transport, prof.edns, prof.respSize)
 				a.ran = true
 				attempts[i][rep] = a
 			}(i, rep, prof)
@@ -234,10 +245,11 @@ func (p *Prober) aggregate(profiles []profileKey, attempts [][]attempt) []Profil
 		}
 		r := ProfileResult{
 			Resolver:    prof.resolver,
+			Decoy:       prof.decoy,
 			RRType:      dns.TypeToString[prof.rrType],
 			Transport:   prof.transport,
 			EDNS:        prof.edns,
-			QueryBudget: p.effectiveQLen(),
+			QueryBudget: p.effectiveQLen(p.domainFor(prof.decoy)),
 			RespBudget:  prof.respSize,
 			Attempts:    len(ran),
 			Stage:       StageUnknown,
@@ -277,9 +289,18 @@ func (p *Prober) aggregate(profiles []profileKey, attempts [][]attempt) []Profil
 	return out
 }
 
-func (p *Prober) effectiveQLen() int {
+// domainFor is the tunnel domain with the given decoy (or none) in front of it.
+func (p *Prober) domainFor(decoy string) string {
+	d, err := WithDecoy(p.domain, decoy)
+	if err != nil {
+		return dns.Fqdn(p.domain)
+	}
+	return dns.Fqdn(d)
+}
+
+func (p *Prober) effectiveQLen(domain string) int {
 	qLen := p.qBudget
-	if m := maxQueryData(p.domain); qLen > m {
+	if m := maxQueryData(domain); qLen > m {
 		qLen = m
 	}
 	if qLen < 0 {
@@ -315,9 +336,10 @@ func percentiles(rtts []int64) (min, p50, p90 int64) {
 	return s[0], at(50), at(90)
 }
 
-func (p *Prober) probe(ctx context.Context, resolver string, rrType uint16, transport string, edns bool, respSize int) attempt {
+func (p *Prober) probe(ctx context.Context, decoy, resolver string, rrType uint16, transport string, edns bool, respSize int) attempt {
 	res := attempt{stage: StageUnknown}
-	qLen := p.effectiveQLen()
+	domain := p.domainFor(decoy)
+	qLen := p.effectiveQLen(domain)
 
 	var reqNonce uint64
 	qDataFunc := func(nonce uint64) []byte {
@@ -325,7 +347,7 @@ func (p *Prober) probe(ctx context.Context, resolver string, rrType uint16, tran
 		return patternBytes(nonce^querySalt, qLen)
 	}
 
-	respData, qSeen, insideTCP, rttMs, stage, err := Exchange(ctx, p.domain, p.key, resolver, rrType, transport, edns, respSize, qDataFunc, p.timeout)
+	respData, qSeen, insideTCP, rttMs, stage, err := Exchange(ctx, domain, p.key, resolver, rrType, transport, edns, respSize, qDataFunc, p.timeout)
 	res.rttMs = rttMs
 	res.stage = stage
 	if err != nil {
@@ -380,43 +402,73 @@ func exchangeVia(pool *connPool, ctx context.Context, domain string, key []byte,
 		msg.SetEdns0(1232, false)
 		client.UDPSize = 1232
 	}
+	c := codecByType(domain, rrType)
+
+	// evaluate turns one reply into an outcome. Only a MAC-valid reply echoing our
+	// nonce is StageOK; anything else (a hijacked answer, an NXDOMAIN, a cached or
+	// foreign reply) is a failure that says how far it got.
+	type outcome struct {
+		data  []byte
+		qSeen uint16
+		inTCP bool
+		stage Stage
+		err   error
+	}
+	evaluate := func(reply *dns.Msg) outcome {
+		if reply.Rcode != dns.RcodeSuccess {
+			return outcome{stage: StageResolver, err: fmt.Errorf("rcode=%s", dns.RcodeToString[reply.Rcode])}
+		}
+		if c == nil {
+			return outcome{stage: StageResolver, err: fmt.Errorf("no codec for type %s", dns.TypeToString[rrType])}
+		}
+		blob, extErr := c.extract(name, reply.Answer)
+		if extErr != nil {
+			return outcome{stage: StageResolver, err: fmt.Errorf("no usable answer payload: %w", extErr)}
+		}
+		resp, prsErr := parseResponse(key, blob)
+		if prsErr != nil || resp.Nonce != nonce {
+			errMsg := "nonce mismatch (cached or foreign answer)"
+			if prsErr != nil {
+				errMsg = prsErr.Error()
+			}
+			return outcome{stage: StageBadPeer, err: fmt.Errorf("%s", errMsg)}
+		}
+		return outcome{data: resp.Data, qSeen: resp.QSeen, inTCP: resp.InTCP, stage: StageOK}
+	}
+
 	var (
 		reply  *dns.Msg
 		rtt    time.Duration
 		netErr error
+		out    outcome
 	)
-	if pool != nil && transport == "tcp" {
-		reply, rtt, netErr = pool.exchange(ctx, client, msg, resolver)
+	if transport == "udp" {
+		// An on-path hijacker answers first with a forged reply (it has seen the
+		// query ID); the real reply follows. Keep listening past a reply that does
+		// not validate instead of letting the forgery end the exchange.
+		reply, rtt, netErr = exchangeUDPRace(ctx, client, msg, resolver, func(r *dns.Msg) bool {
+			out = evaluate(r)
+			return out.stage == StageOK
+		})
+		if netErr == nil {
+			out = evaluate(reply) // the accepted reply, or the first one if none validated
+		}
 	} else {
-		reply, rtt, netErr = client.ExchangeContext(ctx, msg, resolver)
+		if pool != nil && transport == "tcp" {
+			reply, rtt, netErr = pool.exchange(ctx, client, msg, resolver)
+		} else {
+			reply, rtt, netErr = client.ExchangeContext(ctx, msg, resolver)
+		}
+		if netErr == nil {
+			out = evaluate(reply)
+		}
 	}
 	rttMs = rtt.Milliseconds()
 	if netErr != nil {
 		return nil, 0, false, rttMs, StageUnknown, netErr
 	}
-
-	if reply.Rcode != dns.RcodeSuccess {
-		return nil, 0, false, rttMs, StageResolver, fmt.Errorf("rcode=%s", dns.RcodeToString[reply.Rcode])
+	if out.stage != StageOK {
+		return nil, 0, false, rttMs, out.stage, out.err
 	}
-
-	c := codecByType(domain, rrType)
-	if c == nil {
-		return nil, 0, false, rttMs, StageResolver, fmt.Errorf("no codec for type %s", dns.TypeToString[rrType])
-	}
-
-	blob, extErr := c.extract(name, reply.Answer)
-	if extErr != nil {
-		return nil, 0, false, rttMs, StageResolver, fmt.Errorf("no usable answer payload: %w", extErr)
-	}
-
-	resp, prsErr := parseResponse(key, blob)
-	if prsErr != nil || resp.Nonce != nonce {
-		errMsg := "nonce mismatch (cached or foreign answer)"
-		if prsErr != nil {
-			errMsg = prsErr.Error()
-		}
-		return nil, 0, false, rttMs, StageBadPeer, fmt.Errorf("%s", errMsg)
-	}
-
-	return resp.Data, resp.QSeen, resp.InTCP, rttMs, StageOK, nil
+	return out.data, out.qSeen, out.inTCP, rttMs, StageOK, nil
 }

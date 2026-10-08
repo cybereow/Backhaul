@@ -101,6 +101,7 @@ func (s *Server) Start() {
 		}
 		dnsMuxServer := transport.NewDnsMuxServer(s.ctx, &transport.DnsMuxConfig{
 			Domain:           s.config.DNSDomain,
+			Decoys:           s.config.DNSDecoys,
 			Key:              dnsKey,
 			Listen:           dnsListen,
 			Token:            s.config.Token,

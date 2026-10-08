@@ -283,3 +283,41 @@ func TestSureStallIsDueAtOnce(t *testing.T) {
 		t.Fatal("a session stays due after it got through again")
 	}
 }
+
+// A target that speaks first (an SSH server's banner) reaches a user who has
+// sent nothing: the flow's first bytes travel from the client, and nothing on
+// the way may wait for the user to write.
+func TestWSMuxTargetSpeaksFirst(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	banner := []byte("SSH-2.0-test\r\n")
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Write(banner)
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+		}
+	}()
+	h := newLCHarness(t, toTarget(ln.Addr().String()), func(c *WsMuxConfig) {
+		c.MaxConnAge = time.Hour
+		c.MaxDrain = time.Minute
+		c.ResumeWindow = 20 * time.Second
+	})
+	startResumeClient(t, h, 2)
+
+	for i := 0; i < 3; i++ {
+		user := h.user().(*net.TCPConn)
+		_ = user.SetDeadline(time.Now().Add(5 * time.Second))
+		got := make([]byte, len(banner))
+		if _, err := io.ReadFull(user, got); err != nil || !bytes.Equal(got, banner) {
+			t.Fatalf("connection %d: the target's banner did not arrive: %q %v", i, got, err)
+		}
+		user.Close()
+	}
+}

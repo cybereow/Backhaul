@@ -321,3 +321,62 @@ func TestWSMuxTargetSpeaksFirst(t *testing.T) {
 		user.Close()
 	}
 }
+
+// The sign for a connection that still delivers but no longer answers: an echo
+// several times later than the connection's echoes have been. It is a sign only
+// where echoes were prompt: on a connection whose echoes were slow, or that was
+// never timed, a late echo is what a full connection looks like.
+func TestEchoOverdueOnlyOnAConnectionWhoseEchoesWerePrompt(t *testing.T) {
+	now := time.Now()
+	ago := func(d time.Duration) int64 { return now.Add(-d).UnixNano() }
+	fast, mid, slow := int64(150*time.Millisecond), int64(400*time.Millisecond), int64(900*time.Millisecond)
+
+	if echoOverdue(ago(probeSilent-time.Millisecond), fast, now) {
+		t.Fatal("an echo is overdue before probeSilent on a fast connection")
+	}
+	if !echoOverdue(ago(probeSilent), fast, now) {
+		t.Fatal("an echo a second late on a 150 ms connection is not overdue")
+	}
+	if echoOverdue(ago(1500*time.Millisecond), mid, now) || !echoOverdue(ago(1600*time.Millisecond), mid, now) {
+		t.Fatal("a 400 ms connection's echo is not overdue at four times that")
+	}
+	if echoOverdue(ago(time.Minute), slow, now) {
+		t.Fatal("a slow connection's late echo was taken for a stall")
+	}
+	if echoOverdue(ago(time.Minute), 0, now) {
+		t.Fatal("a connection never timed was judged by its echo")
+	}
+	if echoOverdue(0, fast, now) {
+		t.Fatal("no probe is out, yet its echo is overdue")
+	}
+}
+
+// A connection's late echo is believed once: the sign holds while that probe
+// stays unanswered, and the next late echo on the same connection, within
+// overdueQuiet, is not one - or a pool of full connections would pass its flows
+// round and round.
+func TestOverdueEchoIsBelievedOncePerConnection(t *testing.T) {
+	now := time.Now()
+	ps := &pooledSession{}
+	ps.rtt.Store(int64(150 * time.Millisecond))
+	first := now.UnixNano()
+
+	if ps.echoIsOverdue(first, now.Add(probeSilent-time.Millisecond)) {
+		t.Fatal("overdue too early")
+	}
+	if !ps.echoIsOverdue(first, now.Add(probeSilent)) {
+		t.Fatal("a prompt connection's echo, a second late, is not overdue")
+	}
+	if !ps.echoIsOverdue(first, now.Add(10*time.Second)) {
+		t.Fatal("the sign did not hold while the same probe stayed unanswered")
+	}
+
+	second := now.Add(12 * time.Second)
+	if ps.echoIsOverdue(second.UnixNano(), second.Add(5*time.Second)) {
+		t.Fatal("a second late echo on the same connection was believed within overdueQuiet")
+	}
+	third := now.Add(overdueQuiet + time.Second)
+	if !ps.echoIsOverdue(third.UnixNano(), third.Add(probeSilent)) {
+		t.Fatal("a late echo is still not believed after overdueQuiet")
+	}
+}

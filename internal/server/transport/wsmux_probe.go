@@ -1,6 +1,8 @@
 package transport
 
 import (
+	"errors"
+	"net"
 	"time"
 
 	"github.com/musix/backhaul/internal/smux"
@@ -40,6 +42,18 @@ func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
 			// an unanswered probe is also how a connection that has stopped
 			// getting through shows from end to end (see wsmux_stall.go).
 			ps.probeFails.Add(1)
+			// Only an echo that did not come is still being waited for: a probe
+			// that failed at once says nothing about how long the peer has been
+			// silent.
+			var ne net.Error
+			if !errors.As(err, &ne) || !ne.Timeout() {
+				ps.probeSent.Store(0)
+			} else if old := ps.rtt.Load(); old > 0 {
+				// An echo that took longer than the probe waits is at least that
+				// slow: the estimate has to say so, or a connection that has filled
+				// up would go on being taken for a prompt one that fell silent.
+				ps.rtt.Store((old*7 + int64(rttProbeTimeout)) / 8)
+			}
 			s.logger.Tracef("rtt probe on %s failed: %v", ps.cdn, err)
 			continue
 		}

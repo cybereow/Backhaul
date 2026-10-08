@@ -44,6 +44,10 @@ type pooledSession struct {
 	// probeSent when the oldest RTT probe still unanswered left (0 = none is out).
 	sureSince atomic.Int64
 	probeSent atomic.Int64
+	// overdueSent is the probe (its probeSent) whose echo was last taken for
+	// overdue, overdueAt when: see echoIsOverdue.
+	overdueSent atomic.Int64
+	overdueAt   atomic.Int64
 	// reopenCap: the client on this session understands AttachFlagReopen.
 	reopenCap atomic.Bool
 	capEst    atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none

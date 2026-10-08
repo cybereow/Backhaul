@@ -16,25 +16,31 @@ import (
 // stalling into nothing getting through at all: a stalled connection's streams
 // end as their users give up, so by load it looked like the best one to pick.
 //
-// Three signs are read, any of which marks the connection as stalled:
+// Four signs are read, any of which marks the connection as stalled:
 //
 //   - the kernel's retransmission backoff on its socket (stallBackoff timeouts in
 //     a row without an acknowledgement): the leg from here to the CDN is silent;
 //   - an RTT probe still unanswered while not one frame of any kind has arrived
-//     on the connection for probeSilent: the far leg, or the peer, is. (The CDN acknowledges what is sent to it whatever becomes of it
-//     beyond, so the socket shows nothing then.)
-//   - an RTT probe that timed out, on a connection that does still deliver
-//     something.
+//     on the connection for probeSilent: the far leg, or the peer, is. (The CDN
+//     acknowledges what is sent to it whatever becomes of it beyond, so the
+//     socket shows nothing then.)
+//   - an RTT probe unanswered for several times what the connection's echoes
+//     have been taking (echoOverdue), while frames do still arrive: the way to
+//     the peer has stopped and the way back has not, or is still emptying what
+//     the CDN held. An echo that late on a connection whose echoes were prompt
+//     is not one held up behind the connection's own traffic - that shows in
+//     the echoes before it;
+//   - an RTT probe that failed some other way.
 //
 // A stalled connection is charged stallPenalty at placement, so nothing new is
 // put on it while any other will do. And the flows on it that keep replay state
 // are taken off it the way they would be had it been cut: suspended here, and
 // resumed by driveResume on a connection that is getting through, replaying what
-// was in flight. How soon depends on the sign. The first two leave no doubt -
-// each is already a second or so of nothing at all - and every further moment
-// is one a user waits, so the flows go at once (stallMoveAfterSure). The third
-// can be an echo held up behind a busy connection's own data, and moving flows
-// off a connection that works costs their replay: it has to last stallMoveAfter.
+// was in flight. How soon depends on the sign. The first three leave no doubt -
+// each is already a second or so of something that should have happened and did
+// not - and every further moment is one a user waits, so the flows go at once
+// (stallMoveAfterSure). The last says little by itself, and moving flows off a
+// connection that works costs their replay: it has to last stallMoveAfter.
 //
 // ponytail: flows without replay state (a promoted flow's striped group, a flow
 // opened while the budget was spent) stay and wait the stall out; moving them
@@ -46,6 +52,12 @@ const (
 	stallMoveAfterSure = 0
 	probeSilent        = time.Second
 	stallEvery         = 250 * time.Millisecond
+	// echoLateFactor: an echo this many times later than the connection's echoes
+	// have been (its RTT estimate) is not coming.
+	echoLateFactor = 4
+	// overdueQuiet: how long after a connection's echo was taken for overdue the
+	// next late echo on it is not (see echoIsOverdue).
+	overdueQuiet = time.Minute
 )
 
 // echoSilent reports the second sign: a probe sent at sent (unix nanos, 0 = none
@@ -57,12 +69,47 @@ func echoSilent(sent, lastRecv int64, now time.Time) bool {
 	return sent != 0 && now.UnixNano()-max(sent, lastRecv) >= int64(probeSilent)
 }
 
+// echoOverdue reports the third sign: a probe sent at sent is still unanswered
+// after echoLateFactor times rtt, the connection's RTT estimate in nanoseconds,
+// and never sooner than probeSilent. It is no sign at all on a connection whose
+// echoes have been slow (or never timed): there a late echo is what a full
+// connection looks like, and taking its flows off it only moves the queue. A
+// probe that times out counts into the estimate (see probeSessionRTT), so a
+// connection that has become slow stops qualifying after a probe or two.
+func echoOverdue(sent, rtt int64, now time.Time) bool {
+	if sent == 0 || rtt == 0 || echoLateFactor*rtt > int64(rttProbeTimeout) {
+		return false
+	}
+	return now.UnixNano()-sent >= max(echoLateFactor*rtt, int64(probeSilent))
+}
+
+// echoIsOverdue applies the third sign to the session, with a memory. A late
+// echo is also what a connection that has just filled up shows, before its RTT
+// estimate has caught up - and taking its flows off it fills the next one, whose
+// echo is then late in turn. So a connection is believed once: the sign stands
+// for as long as that same probe stays unanswered, and after it a late echo on
+// this connection says nothing for overdueQuiet.
+func (ps *pooledSession) echoIsOverdue(sent int64, now time.Time) bool {
+	if sent == ps.overdueSent.Load() {
+		return true
+	}
+	if !echoOverdue(sent, ps.rtt.Load(), now) {
+		return false
+	}
+	if at := ps.overdueAt.Load(); at != 0 && now.UnixNano()-at < int64(overdueQuiet) {
+		return false
+	}
+	ps.overdueSent.Store(sent)
+	ps.overdueAt.Store(now.UnixNano())
+	return true
+}
+
 // noteHealth records what the latest look at the session showed: socketStalled
 // from its TCP state, together with its RTT probes.
 func (ps *pooledSession) noteHealth(now time.Time, socketStalled bool) {
 	sure := socketStalled
 	if sent := ps.probeSent.Load(); !sure && sent != 0 {
-		sure = echoSilent(sent, ps.session.LastRecv(), now)
+		sure = echoSilent(sent, ps.session.LastRecv(), now) || ps.echoIsOverdue(sent, now)
 	}
 	if sure {
 		ps.sureSince.CompareAndSwap(0, now.UnixNano())

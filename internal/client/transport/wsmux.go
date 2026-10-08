@@ -1136,6 +1136,14 @@ func (c *WsMuxTransport) setupStream(stream *smux.Stream, remote string, run fun
 	}
 
 	kind, err := utils.ReadFlowKind(stream)
+	if err == io.EOF {
+		// Opened and closed with nothing in it: what the server leaves behind
+		// when it gave up opening a stream on a connection that was not getting
+		// through, and closed it behind itself. Nothing went wrong here.
+		c.logger.Debugf("a stream from %s was closed before its header", remote)
+		stream.Close()
+		return
+	}
 	if err != nil {
 		bad("unable to read flow kind", err)
 		return

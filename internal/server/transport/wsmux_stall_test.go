@@ -66,6 +66,17 @@ func TestStalledSessionIsChargedUntilItGetsThrough(t *testing.T) {
 	}
 }
 
+// markStalled leaves a session the way a probe that failed at since leaves it,
+// and keeps it so. The sessions of these tests are real ones: their own probes
+// keep being answered and the health loop keeps looking, and a mark that was
+// only set would be gone again within a moment.
+func markStalled(ps *pooledSession, since time.Time) {
+	ps.healthPinned.Store(true)
+	ps.probeFails.Store(1)
+	ps.sureSince.Store(0)
+	ps.stalledSince.Store(since.UnixNano())
+}
+
 // A flow on a connection that stops getting through is not left to wait it out:
 // new flows are placed elsewhere at once, and after stallMoveAfter the flow is
 // resumed on another connection from its replay state, with every byte intact.
@@ -109,9 +120,8 @@ func TestWSMuxFlowLeavesAStalledSession(t *testing.T) {
 
 	// The connection has just gone silent: nothing new is placed on it.
 	now := time.Now()
-	ps.probeFails.Store(1)
-	ps.noteHealth(now, false)
 	for i := 0; i < 12; i++ {
+		markStalled(ps, now)
 		st, on, err := h.s.openPlainLegPS()
 		if err != nil {
 			t.Fatal(err)
@@ -122,11 +132,13 @@ func TestWSMuxFlowLeavesAStalledSession(t *testing.T) {
 		defer st.Close()
 	}
 	// Too early to move anything: it may be a blip.
+	markStalled(ps, now)
 	h.s.moveOffStalled(h.s.gen, sessions, now.Add(stallMoveAfter/2))
 	if f.sw.Resumes() != 0 || f.session() != stalled {
 		t.Fatal("the flow was moved before the stall had lasted")
 	}
 
+	markStalled(ps, now)
 	h.s.moveOffStalled(h.s.gen, sessions, now.Add(stallMoveAfter))
 	lcWaitFor(t, "the flow to resume on another connection", func() bool {
 		return f.sw.Resumes() >= 1 && f.session() != stalled
@@ -210,8 +222,7 @@ func TestWSMuxStalledFlowsStayWithoutADestination(t *testing.T) {
 	h.s.sessionsMu.Unlock()
 	now := time.Now()
 	for _, ps := range sessions { // every connection is stalled
-		ps.probeFails.Store(1)
-		ps.noteHealth(now, false)
+		markStalled(ps, now)
 	}
 	h.s.moveOffStalled(h.s.gen, sessions, now.Add(2*stallMoveAfter))
 	select {
@@ -221,15 +232,19 @@ func TestWSMuxStalledFlowsStayWithoutADestination(t *testing.T) {
 	}
 
 	// One of them gets through again: the flow on the other is moved, once.
-	var other *pooledSession
+	var other, stuck *pooledSession
 	for _, ps := range sessions {
 		if ps.session != f.session() {
 			other = ps
+		} else {
+			stuck = ps
 		}
 	}
+	other.healthPinned.Store(false)
 	other.probeFails.Store(0)
 	other.noteHealth(now, false)
 	for i := 0; i < 5; i++ {
+		markStalled(stuck, now)
 		h.s.moveOffStalled(h.s.gen, sessions, now.Add(2*stallMoveAfter))
 	}
 	lcWaitFor(t, "the flow to resume on the connection that gets through", func() bool { return f.sw.Resumes() >= 1 })

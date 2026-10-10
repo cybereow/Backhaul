@@ -639,10 +639,25 @@ func TestRotationPlan(t *testing.T) {
 	if cdn-worst < cdn/10 {
 		t.Fatalf("worst-case rotation at %v leaves only %v before the CDN cut", worst, cdn-worst)
 	}
-	for i := 0; i < 1000; i++ {
-		if got := rotateAge(age); got > worst || got < time.Duration(float64(age)*(1-rotateJitter)) {
-			t.Fatalf("rotateAge %v outside +/-%.0f%% of %v", got, rotateJitter*100, age)
+	// Never later than the worst case the plan allows for; and spread over the
+	// whole range below it, not gathered round one age - which is what would give
+	// the pool's replacements a beat.
+	earliest := time.Duration(float64(age) * (1 - rotateSpread))
+	var early, late int
+	for i := 0; i < 2000; i++ {
+		got := rotateAge(age)
+		if got > worst || got < earliest {
+			t.Fatalf("rotateAge %v outside %v..%v", got, earliest, worst)
 		}
+		if got < earliest+(worst-earliest)/4 {
+			early++
+		}
+		if got > worst-(worst-earliest)/4 {
+			late++
+		}
+	}
+	if early < 300 || late < 300 {
+		t.Fatalf("retirement ages are not spread over the range: %d in the first quarter, %d in the last, of 2000", early, late)
 	}
 }
 

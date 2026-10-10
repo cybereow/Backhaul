@@ -48,6 +48,9 @@ type pooledSession struct {
 	// overdue, overdueAt when: see echoIsOverdue.
 	overdueSent atomic.Int64
 	overdueAt   atomic.Int64
+	// healthPinned: noteHealth leaves the session as it is. Only tests set it:
+	// their sessions are real ones, whose probes go on being answered.
+	healthPinned atomic.Bool
 	// reopenCap: the client on this session understands AttachFlagReopen.
 	reopenCap atomic.Bool
 	capEst    atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none
@@ -78,6 +81,7 @@ type pooledSession struct {
 const (
 	unprobedRTTms   = 40.0
 	rttProbeEvery   = time.Second
+	rttProbeJitter  = 0.5 // each gap is rttProbeEvery, this fraction more or less
 	rttProbeTimeout = 2 * time.Second
 )
 

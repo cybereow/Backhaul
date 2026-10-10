@@ -267,6 +267,12 @@ func (s *WsMuxTransport) driveResume(ctx context.Context, f *resumableFlow) {
 		// connections stop getting through several at a time, and one that has not
 		// been marked yet is as likely a pick as any.
 		avoid := make(map[*pooledSession]bool)
+		// Nor is the flow put back on the session it has just been taken off: a
+		// connection that stopped getting through can look well again for a
+		// moment (a frame that was on its way arrives) while it is not.
+		if ps := s.pooledFor(sess); ps != nil {
+			avoid[ps] = true
+		}
 		for attempt := 1; ; attempt++ {
 			err := s.resumeOnce(ctx, f, avoid)
 			if err == nil {
@@ -487,6 +493,18 @@ func (s *WsMuxTransport) moveOffRetired(f *resumableFlow, sessions []*smux.Sessi
 			})
 		}
 	}
+}
+
+// pooledFor is session's entry in the pool's registry (nil once it has left it).
+func (s *WsMuxTransport) pooledFor(session *smux.Session) *pooledSession {
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
+	for _, ps := range s.sessions {
+		if ps.session == session {
+			return ps
+		}
+	}
+	return nil
 }
 
 // registered reports whether session is in the pool's registry: taking new

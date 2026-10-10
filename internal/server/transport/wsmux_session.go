@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"math/rand"
 	"time"
 
 	"github.com/musix/backhaul/internal/smux"
@@ -12,15 +13,23 @@ import (
 // front of the server (cdn_max_age), so nobody has to work jitter and dial slack
 // out by hand.
 //
-//   - A pool connection is retired at rotateFraction of that age, +/- rotateJitter.
-//     The worst case, rotateFraction*(1+rotateJitter) of the age, still leaves
-//     the replacement ~20% of the age to be dialled before the CDN would cut it.
+//   - A pool connection is retired at rotateFraction of that age, somewhere
+//     between rotateSpread earlier and rotateJitter later. The worst case,
+//     rotateFraction*(1+rotateJitter) of the age, still leaves the replacement
+//     ~20% of the age to be dialled before the CDN would cut it. The range is
+//     wide on the early side on purpose: connections that all live about as
+//     long, replaced one after the other, put a new connection on the wire at
+//     an even beat around the clock - a rhythm anyone watching the path can
+//     read off without seeing inside. With lifetimes spread over a third of the
+//     age there is no beat, at the price of connections living a sixth shorter
+//     on average.
 //   - A retired connection is drained for the rest of the age, measured from its
 //     retirement: past that the CDN closes it anyway, so waiting longer buys
 //     nothing and only keeps surplus connections open.
 const (
 	rotateFraction = 0.7
 	rotateJitter   = 0.1
+	rotateSpread   = 0.4
 )
 
 // RotationPlan turns the CDN's max connection age into the age a pool connection
@@ -33,10 +42,11 @@ func RotationPlan(cdnMaxAge time.Duration) (maxConnAge, maxDrain time.Duration) 
 	return maxConnAge, cdnMaxAge - maxConnAge
 }
 
-// rotateAge is one connection's jittered retirement age; the connections of the
-// initial pool are dialled together, so a fixed age would rotate them in lockstep.
+// rotateAge is one connection's retirement age: anywhere, evenly, between
+// rotateSpread under base and rotateJitter over it.
 func rotateAge(base time.Duration) time.Duration {
-	return utils.JitterFraction(base, rotateJitter)
+	lo, hi := float64(base)*(1-rotateSpread), float64(base)*(1+rotateJitter)
+	return time.Duration(lo + rand.Float64()*(hi-lo))
 }
 
 // rotateRetryInterval is how long rotation waits before re-checking for the

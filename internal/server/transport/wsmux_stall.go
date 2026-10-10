@@ -107,6 +107,9 @@ func (ps *pooledSession) echoIsOverdue(sent int64, now time.Time) bool {
 // noteHealth records what the latest look at the session showed: socketStalled
 // from its TCP state, together with its RTT probes.
 func (ps *pooledSession) noteHealth(now time.Time, socketStalled bool) {
+	if ps.healthPinned.Load() {
+		return
+	}
 	sure := socketStalled
 	if sent := ps.probeSent.Load(); !sure && sent != 0 {
 		sure = echoSilent(sent, ps.session.LastRecv(), now) || ps.echoIsOverdue(sent, now)

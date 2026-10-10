@@ -16,22 +16,22 @@ import (
 // deployment pays nothing. It exits when the session closes or the transport
 // shuts down.
 func (s *WsMuxTransport) probeSessionRTT(g *wsGeneration, ps *pooledSession) {
-	ticker := time.NewTicker(rttProbeEvery)
-	defer ticker.Stop()
 	// The first probe goes out at once: until one has been answered nothing says
 	// that a new connection gets through at all, and a new one is the cheapest
-	// to place flows on.
-	first := make(chan struct{}, 1)
-	first <- struct{}{}
+	// to place flows on. After it they go out rttProbeEvery apart on average but
+	// never evenly: on an idle connection the probes are all there is to see,
+	// and the same few packets on the second, every second, are a clock.
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	for {
 		select {
 		case <-g.ctx.Done():
 			return
 		case <-ps.session.CloseChan():
 			return
-		case <-first:
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		timer.Reset(utils.JitterFraction(rttProbeEvery, rttProbeJitter))
 		// The oldest probe still unanswered is what the stall check times: it is
 		// only cleared by an echo.
 		ps.probeSent.CompareAndSwap(0, time.Now().UnixNano())

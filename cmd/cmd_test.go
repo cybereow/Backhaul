@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/musix/backhaul/config"
-	"github.com/musix/backhaul/internal/client"
 )
 
 func TestDetectConfigType(t *testing.T) {
@@ -33,7 +32,7 @@ func TestDetectConfigType(t *testing.T) {
 		},
 		{
 			name: "client by servers only",
-			cfg:  config.Config{Client: config.ClientConfig{Servers: []config.ClientServer{{RemoteAddr: "a:443"}}}},
+			cfg:  config.Config{Client: config.ClientConfig{Tunnels: []config.ClientConfig{{RemoteAddr: "a:443"}}}},
 			want: "client",
 		},
 		{
@@ -224,15 +223,38 @@ func TestValidateDNSMuxRejectsUnknownRecordTypes(t *testing.T) {
 	}
 }
 
-// TestLoadConfigClientServers parses a multi-server client the way Run does
-// (load, defaults, validation) and checks each tunnel's resolved settings,
-// including the per-entry tls_verify: omitted inherits [client], explicit wins.
+// loadClientServers runs a config through the same steps as Run: load (which
+// expands [[client.servers]]), defaults, validation.
+func loadClientServers(t *testing.T, doc string) (*config.Config, error) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		return cfg, err
+	}
+	applyDefaults(cfg)
+	if got := detectConfigType(cfg); got != "client" {
+		t.Fatalf("detectConfigType = %q, want client", got)
+	}
+	return cfg, validateClientServers(cfg, "client")
+}
+
+// TestLoadConfigClientServers: an entry may override any [client] key, and
+// everything it leaves out is inherited. Defaults are worked out per tunnel.
 func TestLoadConfigClientServers(t *testing.T) {
-	const doc = `
+	cfg, err := loadClientServers(t, `
 [client]
 transport = "wssmux"
 token = "shared"
 connection_pool = 4
+mux_version = 2
+keepalive_period = 30
+mux_recievebuffer = 8388608
+edge_ips = []
+web_port = 2060
 
 [[client.servers]]
 name = "de"
@@ -241,40 +263,180 @@ remote_addr = "de.example:443"
 [[client.servers]]
 name = "nl"
 remote_addrs = ["nl1.example:443", "nl2.example:443"]
+edge_ips = ["1.1.1.1", "2.2.2.2"]
 token = "nl-token"
 tls_verify = false
-`
-	path := filepath.Join(t.TempDir(), "config.toml")
-	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := loadConfig(path)
+transport = "wsmux"
+mux_version = 1
+keepalive_period = 90
+mux_recievebuffer = 2097152
+mux_ws_framing = false
+log_level = "debug"
+
+[[client.servers]]
+name = "fr"
+remote_addr = "fr.example:443"
+web_port = 2062
+`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	applyDefaults(cfg)
-	if got := detectConfigType(cfg); got != "client" {
-		t.Fatalf("detectConfigType = %q, want client", got)
+	if len(cfg.Client.Tunnels) != 3 {
+		t.Fatalf("got %d tunnels, want 3", len(cfg.Client.Tunnels))
 	}
-	if err := validateClientServers(cfg, "client"); err != nil {
-		t.Fatalf("validateClientServers: %v", err)
+	de, nl, fr := cfg.Client.Tunnels[0], cfg.Client.Tunnels[1], cfg.Client.Tunnels[2]
+
+	// de sets nothing but its address: everything else comes from [client].
+	if de.Token != "shared" || !de.TLSVerify || de.Transport != "wssmux" || de.MuxVersion != 2 || de.Keepalive != 30 || de.ConnectionPool != 4 {
+		t.Errorf("de did not inherit: %+v", de)
 	}
-	tunnels, err := client.ResolveServers(&cfg.Client)
-	if err != nil {
-		t.Fatal(err)
+	if de.MaxStreamBuffer != deriveStreamBuffer(8388608, defaultMuxCon) {
+		t.Errorf("de mux_streambuffer = %d, want it derived from the inherited receive buffer", de.MaxStreamBuffer)
 	}
-	if len(tunnels) != 2 {
-		t.Fatalf("got %d tunnels, want 2", len(tunnels))
-	}
-	de, nl := tunnels[0].Config, tunnels[1].Config
-	if de.Token != "shared" || !de.TLSVerify || de.ConnectionPool != 4 || de.RemoteAddr != "de.example:443" {
-		t.Errorf("de resolved wrong: token=%q tls_verify=%v pool=%d addr=%q", de.Token, de.TLSVerify, de.ConnectionPool, de.RemoteAddr)
-	}
-	if nl.Token != "nl-token" || nl.TLSVerify || len(nl.RemoteAddrs) != 2 {
-		t.Errorf("nl resolved wrong: token=%q tls_verify=%v addrs=%v", nl.Token, nl.TLSVerify, nl.RemoteAddrs)
-	}
-	if !nl.MuxWSFraming || !nl.MuxStealthHandshake {
+	if !de.MuxWSFraming || !de.MuxStealthHandshake {
 		t.Error("loader defaults (framing, stealth handshake) must reach every tunnel")
+	}
+	if de.WebPort != 2060 {
+		t.Errorf("first tunnel web_port = %d, want [client]'s 2060", de.WebPort)
+	}
+
+	// nl overrides keys of every kind.
+	if nl.Token != "nl-token" || nl.TLSVerify || nl.Transport != "wsmux" || nl.MuxVersion != 1 || nl.Keepalive != 90 || nl.MuxWSFraming || nl.LogLevel != "debug" {
+		t.Errorf("nl overrides lost: %+v", nl)
+	}
+	if nl.MaxStreamBuffer != deriveStreamBuffer(2097152, defaultMuxCon) {
+		t.Errorf("nl mux_streambuffer = %d, want it derived from nl's own receive buffer", nl.MaxStreamBuffer)
+	}
+	if nl.ConnectionPool != 4 || len(nl.RemoteAddrs) != 2 || len(nl.EdgeIPs) != 2 {
+		t.Errorf("nl inherited/list values wrong: pool=%d addrs=%v edges=%v", nl.ConnectionPool, nl.RemoteAddrs, nl.EdgeIPs)
+	}
+	if nl.WebPort != 0 {
+		t.Errorf("later tunnels never inherit [client].web_port, nl has %d", nl.WebPort)
+	}
+	if fr.WebPort != 2062 {
+		t.Errorf("fr web_port = %d, want its own 2062", fr.WebPort)
+	}
+	for _, tun := range cfg.Client.Tunnels {
+		if tun.Name == "" || tun.Servers != nil || tun.Tunnels != nil {
+			t.Errorf("tunnel %q must be a single-server config", tun.Name)
+		}
+	}
+}
+
+// TestLoadConfigClientServersListsAreIndependent: the TOML decoder writes a
+// decoded array into the existing backing array, so an entry's list must never
+// overwrite [client]'s (and so every other tunnel's inherited) list.
+func TestLoadConfigClientServersListsAreIndependent(t *testing.T) {
+	cfg, err := loadClientServers(t, `
+[client]
+transport = "wsmux"
+token = "t"
+stripe_ports = ["80", "443", "8080"]
+
+[[client.servers]]
+remote_addr = "a:443"
+stripe_ports = ["22"]
+
+[[client.servers]]
+remote_addr = "b:443"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := cfg.Client.Tunnels[0], cfg.Client.Tunnels[1]
+	if strings.Join(a.StripePorts, ",") != "22" {
+		t.Errorf("a stripe_ports = %v, want [22]", a.StripePorts)
+	}
+	if strings.Join(b.StripePorts, ",") != "80,443,8080" || strings.Join(cfg.Client.StripePorts, ",") != "80,443,8080" {
+		t.Errorf("an entry's list leaked: b=%v [client]=%v", b.StripePorts, cfg.Client.StripePorts)
+	}
+}
+
+func TestLoadConfigClientServersTokenOnlyPerEntry(t *testing.T) {
+	cfg, err := loadClientServers(t, `
+[client]
+transport = "wssmux"
+
+[[client.servers]]
+remote_addr = "a:443"
+token = "ta"
+
+[[client.servers]]
+remote_addr = "b:443"
+token = "tb"
+`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Client.Tunnels[0].Token != "ta" || cfg.Client.Tunnels[1].Token != "tb" {
+		t.Errorf("tokens = %q, %q", cfg.Client.Tunnels[0].Token, cfg.Client.Tunnels[1].Token)
+	}
+}
+
+func TestLoadConfigClientServersRejects(t *testing.T) {
+	cases := []struct {
+		name, doc, want string
+	}{
+		{"unknown key in an entry", `
+[client]
+transport = "wsmux"
+token = "t"
+[[client.servers]]
+remote_addr = "a:443"
+mux_verison = 2
+`, "unknown key(s) mux_verison"},
+		{"process-wide key in an entry", `
+[client]
+transport = "wsmux"
+token = "t"
+[[client.servers]]
+remote_addr = "a:443"
+pprof = true
+`, `"pprof" applies to the whole process`},
+		{"wrong type in an entry", `
+[client]
+transport = "wsmux"
+token = "t"
+[[client.servers]]
+remote_addr = "a:443"
+connection_pool = "lots"
+`, "entry 1"},
+		{"bad stripe settings in an entry", `
+[client]
+transport = "wsmux"
+token = "t"
+[[client.servers]]
+remote_addr = "a:443"
+mux_stripe = 1
+mux_stripe_parity = 2
+`, "entry 1"},
+		{"token missing everywhere", `
+[client]
+transport = "wsmux"
+[[client.servers]]
+remote_addr = "a:443"
+token = "ta"
+[[client.servers]]
+remote_addr = "b:443"
+`, "token is required"},
+		{"name in [client] is not inherited into duplicates", `
+[client]
+transport = "wsmux"
+token = "t"
+name = "x"
+[[client.servers]]
+remote_addr = "a:443"
+[[client.servers]]
+remote_addr = "a:443"
+`, `name "a:443" is already used by entry 1`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := loadClientServers(t, tc.doc)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want it to contain %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -283,7 +445,7 @@ func TestValidateClientServersRejectsMixedTopLevelAddr(t *testing.T) {
 		Transport:  config.WSMUX,
 		Token:      "t",
 		RemoteAddr: "x:443",
-		Servers:    []config.ClientServer{{RemoteAddr: "a:443"}},
+		Tunnels:    []config.ClientConfig{{RemoteAddr: "a:443", Transport: config.WSMUX, Token: "t", StripeFactor: 1}},
 	}}
 	if err := validateClientServers(cfg, "client"); err == nil {
 		t.Fatal("expected an error for remote_addr set alongside servers")

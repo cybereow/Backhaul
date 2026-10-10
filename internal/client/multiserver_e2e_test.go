@@ -158,7 +158,7 @@ func TestMultiServerClientE2E(t *testing.T) {
 	srvA := startServer(t, tunA, pubA, "token-a", backendA)
 	srvB := startServer(t, tunB, pubB, "token-b", backendB)
 
-	cfg := &config.ClientConfig{
+	tunnel := config.ClientConfig{
 		Transport:           config.WSMUX,
 		LogLevel:            "fatal",
 		ConnectionPool:      2,
@@ -174,11 +174,11 @@ func TestMultiServerClientE2E(t *testing.T) {
 		MuxWSFraming:        true,
 		MuxStealthHandshake: true,
 		ResumeWindow:        30,
-		Servers: []config.ClientServer{
-			{Name: "a", RemoteAddr: srvA.tunnelAddr, Token: "token-a"},
-			{Name: "b", RemoteAddr: srvB.tunnelAddr, Token: "token-b"},
-		},
 	}
+	a, b := tunnel, tunnel
+	a.Name, a.RemoteAddr, a.Token = "a", srvA.tunnelAddr, "token-a"
+	b.Name, b.RemoteAddr, b.Token = "b", srvB.tunnelAddr, "token-b"
+	cfg := &config.ClientConfig{LogLevel: "fatal", Tunnels: []config.ClientConfig{a, b}}
 	if _, err := ResolveServers(cfg); err != nil {
 		t.Fatal(err)
 	}

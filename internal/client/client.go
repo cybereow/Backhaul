@@ -54,12 +54,33 @@ func (c *Client) Start() {
 	if remoteDisplay == "" && len(c.config.RemoteAddrs) > 0 {
 		remoteDisplay = strings.Join(c.config.RemoteAddrs, ", ")
 	}
-	if len(c.config.Servers) > 0 {
-		c.logger.Infof("client with %d servers started successfully", len(c.config.Servers))
+	if len(c.config.Tunnels) > 0 {
+		c.logger.Infof("client with %d servers started successfully", len(c.config.Tunnels))
 	} else {
 		c.logger.Infof("client with remote address %s started successfully", remoteDisplay)
 	}
 
+	// A multi-server client runs one tunnel per entry, each with its own
+	// transport setting (wsmux or wssmux), whatever [client] says.
+	if len(c.config.Tunnels) > 0 {
+		c.startServers()
+	} else {
+		c.startTransport()
+	}
+
+	<-c.ctx.Done()
+
+	c.logger.Info("all workers stopped successfully")
+
+	// suppress other logs
+	c.logger.SetLevel(logrus.FatalLevel)
+	for _, l := range c.tunnelLoggers {
+		l.SetLevel(logrus.FatalLevel)
+	}
+}
+
+// startTransport starts the single tunnel of a one-server client.
+func (c *Client) startTransport() {
 	switch c.config.Transport {
 	case config.TCP:
 		tcpConfig := &transport.TcpConfig{
@@ -168,10 +189,6 @@ func (c *Client) Start() {
 		go WsClient.Start()
 
 	case config.WSMUX, config.WSSMUX:
-		if len(c.config.Servers) > 0 {
-			c.startServers()
-			break
-		}
 		c.startWSMux(c.config, c.logger)
 
 	case config.UDP:
@@ -192,16 +209,6 @@ func (c *Client) Start() {
 
 	default:
 		c.logger.Fatal("invalid transport type: ", c.config.Transport)
-	}
-
-	<-c.ctx.Done()
-
-	c.logger.Info("all workers stopped successfully")
-
-	// suppress other logs
-	c.logger.SetLevel(logrus.FatalLevel)
-	for _, l := range c.tunnelLoggers {
-		l.SetLevel(logrus.FatalLevel)
 	}
 }
 

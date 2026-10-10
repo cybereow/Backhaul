@@ -26,7 +26,7 @@ func detectConfigType(cfg *config.Config) string {
 	switch {
 	case cfg.Server.BindAddr != "":
 		return "server"
-	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0 || len(cfg.Client.Servers) > 0:
+	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0 || len(cfg.Client.Tunnels) > 0:
 		return "client"
 	// dnsmux has no bind_addr/remote_addr: the server is identified by the
 	// domain it is authoritative for, the client by the domain it tunnels through
@@ -116,8 +116,16 @@ func validateClientServers(cfg *config.Config, configType string) error {
 	if configType != "client" {
 		return nil
 	}
-	_, err := client.ResolveServers(&cfg.Client)
-	return err
+	if _, err := client.ResolveServers(&cfg.Client); err != nil {
+		return err
+	}
+	// The stripe bounds hold for every tunnel; an entry may set its own.
+	for i, t := range cfg.Client.Tunnels {
+		if err := validateStripeConfig(fmt.Sprintf("client 'servers' entry %d", i+1), t.StripeFactor, t.StripeParity); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func Run(configPath string, ctx context.Context) {
@@ -144,7 +152,7 @@ func Run(configPath string, ctx context.Context) {
 	}
 	// A multi-server client may set its tokens per server instead; those are
 	// checked by validateClientServers.
-	if configType == "client" && cfg.Client.Token == "" && len(cfg.Client.Servers) == 0 {
+	if configType == "client" && cfg.Client.Token == "" && len(cfg.Client.Tunnels) == 0 {
 		logger.Fatalf("client 'token' is required: set it in the [client] config (it must match the server's token)")
 	}
 
@@ -241,6 +249,12 @@ func loadConfig(configPath string) (*config.Config, error) {
 	// Token-derived handshake names are on unless turned off, like framing.
 	if !meta.IsDefined("client", "mux_stealth_handshake") {
 		cfg.Client.MuxStealthHandshake = true
+	}
+
+	// Last, so every [[client.servers]] entry inherits the loader defaults
+	// above unless it sets the key itself.
+	if err := expandClientServers(&cfg, meta); err != nil {
+		return &cfg, err
 	}
 
 	return &cfg, nil

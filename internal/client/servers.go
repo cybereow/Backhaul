@@ -8,82 +8,46 @@ import (
 	"github.com/musix/backhaul/internal/utils/network"
 )
 
-// ServerTunnel is one resolved [[client.servers]] entry: the full client
-// configuration of one independent tunnel, with the entry's overrides applied
-// on top of [client].
+// ServerTunnel is one [[client.servers]] entry ready to run: the full client
+// configuration of one independent tunnel and the name its logs carry.
 type ServerTunnel struct {
 	Name   string
 	Config config.ClientConfig
 }
 
-// ResolveServers turns cfg.Servers into one complete configuration per server
-// and checks that the tunnels can run side by side in one process. It returns
-// nil, nil when no servers are configured (the single-server path). Call it
-// after the defaults are applied, so inherited values are already final.
+// ResolveServers checks that the tunnels of a multi-server client
+// (cfg.Tunnels, which the loader decoded from [[client.servers]] over [client])
+// can run side by side in one process, and names them. It returns nil, nil when
+// no servers are configured (the single-server path). Call it after the
+// defaults are applied, so every value is final.
 //
 // Everything that could make one tunnel disturb another is refused here, at
 // startup, rather than left to misbehave later: two entries reaching the same
 // server would each open a control channel to it and keep displacing the
 // other, and two web panels on one port (or one usage file) would collide.
 func ResolveServers(cfg *config.ClientConfig) ([]ServerTunnel, error) {
-	if len(cfg.Servers) == 0 {
+	if len(cfg.Tunnels) == 0 {
 		return nil, nil
-	}
-	if cfg.Transport != config.WSMUX && cfg.Transport != config.WSSMUX {
-		return nil, fmt.Errorf("client 'servers' is only supported on the wsmux/wssmux transports (transport is %q)", cfg.Transport)
 	}
 	if cfg.RemoteAddr != "" || len(cfg.RemoteAddrs) > 0 || cfg.EdgeIP != "" || len(cfg.EdgeIPs) > 0 {
 		return nil, fmt.Errorf("client 'servers' is set: move remote_addr/remote_addrs/edge_ip/edge_ips into the [[client.servers]] entries instead of [client]")
 	}
 
-	tunnels := make([]ServerTunnel, 0, len(cfg.Servers))
+	tunnels := make([]ServerTunnel, 0, len(cfg.Tunnels))
 	names := make(map[string]int)
 	endpoints := make(map[string]int)
 	webPorts := make(map[int]int)
 	snifferLogs := make(map[string]int)
 
-	for i, s := range cfg.Servers {
+	for i, c := range cfg.Tunnels {
 		label := fmt.Sprintf("client 'servers' entry %d", i+1)
-		if s.RemoteAddr == "" && len(s.RemoteAddrs) == 0 {
+		if c.RemoteAddr == "" && len(c.RemoteAddrs) == 0 {
 			return nil, fmt.Errorf("%s: remote_addr or remote_addrs is required", label)
 		}
 
-		c := *cfg
-		c.Servers = nil
-		c.RemoteAddr = s.RemoteAddr
-		c.RemoteAddrs = append([]string(nil), s.RemoteAddrs...)
-		c.EdgeIP = s.EdgeIP
-		c.EdgeIPs = append([]string(nil), s.EdgeIPs...)
-		if s.Token != "" {
-			c.Token = s.Token
-		}
-		if s.Path != "" {
-			c.Path = s.Path
-		}
-		if s.TLSVerify != nil {
-			c.TLSVerify = *s.TLSVerify
-		}
-		if s.ConnectionPool > 0 {
-			c.ConnectionPool = s.ConnectionPool
-		}
-		// [client].web_port belongs to the first tunnel only: the others would
-		// otherwise all try to bind the same port.
-		if i > 0 {
-			c.WebPort = 0
-		}
-		if s.WebPort > 0 {
-			c.WebPort = s.WebPort
-		}
-		if s.SnifferLog != "" {
-			c.SnifferLog = s.SnifferLog
-		}
-
-		name := s.Name
+		name := c.Name
 		if name == "" {
-			name = c.RemoteAddr
-			if name == "" {
-				name = c.RemoteAddrs[0]
-			}
+			name = tunnelAddrs(c)[0]
 		}
 		if prev, ok := names[name]; ok {
 			return nil, fmt.Errorf("%s: name %q is already used by entry %d; give each server a distinct name", label, name, prev)
@@ -91,6 +55,9 @@ func ResolveServers(cfg *config.ClientConfig) ([]ServerTunnel, error) {
 		names[name] = i + 1
 		label = fmt.Sprintf("%s (%s)", label, name)
 
+		if c.Transport != config.WSMUX && c.Transport != config.WSSMUX {
+			return nil, fmt.Errorf("%s: client 'servers' is only supported on the wsmux/wssmux transports (transport is %q)", label, c.Transport)
+		}
 		if c.Token == "" {
 			return nil, fmt.Errorf("%s: token is required (set it on the entry or in [client]; it must match that server's token)", label)
 		}

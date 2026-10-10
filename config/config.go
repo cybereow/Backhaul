@@ -1,5 +1,7 @@
 package config
 
+import "github.com/BurntSushi/toml"
+
 // TransportType defines the type of transport.
 type TransportType string
 
@@ -110,29 +112,20 @@ type ClientConfig struct {
 	DNSNoHedge           bool          `toml:"dns_no_hedge"`       // dnsmux: disable hedging (extra exchange when one stalls)
 	DNSWorkers           int           `toml:"dns_workers"`        // dnsmux: DNS queries in flight per tunnel connection (default 16)
 	TLSVerify            bool          `toml:"tls_verify"`         // wss/wssmux: verify the server's TLS certificate. Enabled by default; set to false for self-signed setups.
+	// Name labels this tunnel in log lines. Only meaningful inside a
+	// [[client.servers]] entry (default: the entry's remote address).
+	Name string `toml:"name"`
 	// Servers connects this one client to several independent backhaul servers
 	// at once (wsmux/wssmux only). Each entry is a separate tunnel with its own
 	// control channel, pool, token and restart cycle; a server going down never
-	// affects the others. Every key not set on an entry is inherited from
-	// [client]. When set, the top-level remote_addr/remote_addrs/edge_ip/edge_ips
-	// must be left empty.
-	Servers []ClientServer `toml:"servers"`
-}
-
-// ClientServer is one [[client.servers]] entry: an independent tunnel to one
-// backhaul server. Empty / unset fields fall back to the [client] value.
-type ClientServer struct {
-	Name           string   `toml:"name"`            // label used in this tunnel's log lines (default: its remote address)
-	RemoteAddr     string   `toml:"remote_addr"`     // this server's tunnel address
-	RemoteAddrs    []string `toml:"remote_addrs"`    // several entry points (CDNs/domains) of THIS same server, as [client].remote_addrs
-	EdgeIP         string   `toml:"edge_ip"`         // as [client].edge_ip, for remote_addr
-	EdgeIPs        []string `toml:"edge_ips"`        // as [client].edge_ips, aligned with remote_addrs
-	Token          string   `toml:"token"`           // this server's token (default: [client].token)
-	Path           string   `toml:"path"`            // this server's WebSocket path (default: [client].path)
-	TLSVerify      *bool    `toml:"tls_verify"`      // default: [client].tls_verify
-	ConnectionPool int      `toml:"connection_pool"` // default: [client].connection_pool
-	WebPort        int      `toml:"web_port"`        // this tunnel's web panel; [client].web_port is used by the first entry only, so two tunnels never fight over one port
-	SnifferLog     string   `toml:"sniffer_log"`     // this tunnel's usage file; required to differ between entries that run a web panel with sniffer on
+	// affects the others. An entry may set any [client] key; every key it does
+	// not set is inherited from [client]. When set, the top-level
+	// remote_addr/remote_addrs/edge_ip/edge_ips must be left empty.
+	//
+	// The loader decodes each entry over a copy of [client] into Tunnels, which
+	// is what the rest of the program reads.
+	Servers []toml.Primitive `toml:"servers"`
+	Tunnels []ClientConfig   `toml:"-"`
 }
 
 // ProbeConfig configures the DNS reachability/capacity prober (Phase 1 of the

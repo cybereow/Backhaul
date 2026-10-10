@@ -19,6 +19,7 @@ Welcome to the **`Backhaul`** project! This project provides a high-performance 
       - [Secure WebSocket Configuration](#secure-websocket-configuration)
       - [WS Multiplexing Configuration](#ws-multiplexing-configuration)
       - [WSS Multiplexing Configuration](#wss-multiplexing-configuration)
+      - [One Client, Several Servers (wsmux/wssmux)](#one-client-several-servers-wsmuxwssmux)
 5. [Generating a Self-Signed TLS Certificate with OpenSSL](#generating-a-self-signed-tls-certificate-with-openssl)
 6. [Running backhaul as a service](#running-backhaul-as-a-service)
 7. [FAQ](#faq)
@@ -504,6 +505,41 @@ To start using the solution, you'll need to configure both server and client com
    sniffer_log = "/root/backhaul.json"
    log_level = "info"
    ```
+
+#### One Client, Several Servers (wsmux/wssmux)
+One client process can connect to several **independent** backhaul servers at once. Each `[[client.servers]]` entry is a completely separate tunnel - its own control channel, connection pool, token, reconnects and restarts - so a server that is down, slow or restarting never affects the others. Each server keeps its own `ports` and forwards them through its own tunnel.
+
+An entry can set **any** `[client]` key; every key it leaves out is inherited from `[client]`. So you can either write the common settings once in `[client]` and override only what differs, or leave a key out of `[client]` and set it per entry. Defaults are worked out per tunnel (e.g. a derived `mux_streambuffer` follows that entry's own `mux_recievebuffer`). Entries also take `name`, used to prefix that tunnel's log lines.
+
+```toml
+[client]
+transport = "wssmux"
+token = "shared_token"        # default token for entries that do not set their own
+connection_pool = 8
+mux_version = 2
+keepalive_period = 75
+log_level = "info"
+web_port = 2060               # only the FIRST entry inherits [client].web_port
+
+[[client.servers]]
+name = "germany"
+remote_addr = "de.example.com:443"
+
+[[client.servers]]
+name = "netherlands"
+remote_addrs = ["nl-cdn1.example.com:443", "nl-cdn2.example.com:443"]   # several CDNs in front of THIS one server
+token = "nl_token"
+path = "/nl"
+mux_version = 1               # this server runs mux_version 1
+connection_pool = 16
+web_port = 2061
+```
+
+Notes:
+* Only wsmux/wssmux support `servers` (an entry may pick either). When it is set, leave `remote_addr`/`remote_addrs`/`edge_ip`/`edge_ips` out of `[client]`.
+* `remote_addrs` inside an entry still means "several entry points of the same server". Different servers go in different entries.
+* `pprof` and `skip_optz` apply to the whole process, so they can only be set in `[client]`.
+* These are refused at startup: an unknown key in an entry (a typo would otherwise silently fall back to the `[client]` value), two entries that reach the same server (the same address and path), two tunnels on one `web_port`, or two tunnels with a web panel and `sniffer = true` writing the same `sniffer_log`.
 
 ## Generating a Self-Signed TLS Certificate with OpenSSL
 

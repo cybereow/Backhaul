@@ -55,32 +55,13 @@ func applyDefaults(cfg *config.Config) {
 	}
 
 	// Loglevel
-	if _, err := logrus.ParseLevel(cfg.Client.LogLevel); err != nil {
-		cfg.Client.LogLevel = defaultLogLevel
-	}
-
 	if _, err := logrus.ParseLevel(cfg.Server.LogLevel); err != nil {
 		cfg.Server.LogLevel = defaultLogLevel
-	}
-
-	// Retry interval
-	if cfg.Client.RetryInterval <= 0 {
-		cfg.Client.RetryInterval = defaultRetryInterval
-	}
-
-	// Connection pool
-	// dnsmux keeps its own default of one tunnel: DNS capacity is scarce and each
-	// tunnel probes and polls the resolvers on its own.
-	if cfg.Client.ConnectionPool <= 0 && cfg.Client.Transport != config.DNSMUX {
-		cfg.Client.ConnectionPool = defaultConnectionPool
 	}
 
 	// Mux Session
 	if cfg.Server.MuxSession <= 0 {
 		cfg.Server.MuxSession = defaultMuxSession
-	}
-	if cfg.Client.MuxSession <= 0 {
-		cfg.Client.MuxSession = defaultMuxSession
 	}
 
 	// PPROF default is false if not valid value found
@@ -89,40 +70,23 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Server.Keepalive <= 0 {
 		cfg.Server.Keepalive = defaultKeepAlive
 	}
-	if cfg.Client.Keepalive <= 0 {
-		cfg.Client.Keepalive = defaultKeepAlive
-	}
 
 	// Mux version
 	if cfg.Server.MuxVersion <= 0 || cfg.Server.MuxVersion > 2 {
 		cfg.Server.MuxVersion = defaultMuxVersion
 	}
-	if cfg.Client.MuxVersion <= 0 || cfg.Client.MuxVersion > 2 {
-		cfg.Client.MuxVersion = defaultMuxVersion
-	}
 	// MaxFrameSize
 	if cfg.Server.MaxFrameSize <= 0 {
 		cfg.Server.MaxFrameSize = defaultMaxFrameSize
-	}
-	if cfg.Client.MaxFrameSize <= 0 {
-		cfg.Client.MaxFrameSize = defaultMaxFrameSize
 	}
 	// MaxReceiveBuffer
 	if cfg.Server.MaxReceiveBuffer <= 0 {
 		cfg.Server.MaxReceiveBuffer = defaultMaxReceiveBuffer
 	}
-	if cfg.Client.MaxReceiveBuffer <= 0 {
-		cfg.Client.MaxReceiveBuffer = defaultMaxReceiveBuffer
-	}
 	// MaxStreamBuffer - derived from the session budget instead of pinned at
 	// 64KB; see deriveStreamBuffer. An explicit mux_streambuffer still wins.
-	// The client has no mux_con of its own (stream concurrency per session is
-	// the server's setting), so it derives from the default.
 	if cfg.Server.MaxStreamBuffer <= 0 {
 		cfg.Server.MaxStreamBuffer = deriveStreamBuffer(cfg.Server.MaxReceiveBuffer, cfg.Server.MuxCon)
-	}
-	if cfg.Client.MaxStreamBuffer <= 0 {
-		cfg.Client.MaxStreamBuffer = deriveStreamBuffer(cfg.Client.MaxReceiveBuffer, defaultMuxCon)
 	}
 	// WebPort returns 0 if not exists
 
@@ -130,17 +94,9 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Server.SnifferLog == "" {
 		cfg.Server.SnifferLog = defaultSnifferLog
 	}
-	if cfg.Client.SnifferLog == "" {
-		cfg.Client.SnifferLog = defaultSnifferLog
-	}
 	// Heartbeat
 	if cfg.Server.Heartbeat < 1 { // Minimum accepted interval is 1 second
 		cfg.Server.Heartbeat = deafultHeartbeat
-	}
-
-	// Timeout
-	if cfg.Client.DialTimeout < 1 { // Minimum accepted value is 1 second
-		cfg.Client.DialTimeout = defaultDialTimeout
 	}
 
 	// Mux concurrancy
@@ -173,18 +129,12 @@ func applyDefaults(cfg *config.Config) {
 	case cfg.Server.ResumeWindow == 0:
 		cfg.Server.ResumeWindow = defaultResumeWindow
 	}
-	if cfg.Client.ResumeWindow <= 0 {
-		cfg.Client.ResumeWindow = defaultResumeWindow
-	}
 
 	// Stripe factor - how many pooled connections a single flow is split
 	// across. 1 (the default) leaves the original one-flow-one-connection
 	// behavior untouched.
 	if cfg.Server.StripeFactor < 1 {
 		cfg.Server.StripeFactor = defaultMuxStripe
-	}
-	if cfg.Client.StripeFactor < 1 {
-		cfg.Client.StripeFactor = defaultMuxStripe
 	}
 
 	// Stripe parity - Reed-Solomon parity legs added on top of the stripe
@@ -193,8 +143,63 @@ func applyDefaults(cfg *config.Config) {
 	if cfg.Server.StripeParity < 0 {
 		cfg.Server.StripeParity = 0
 	}
-	if cfg.Client.StripeParity < 0 {
-		cfg.Client.StripeParity = 0
+
+	applyClientDefaults(&cfg.Client)
+	// Each tunnel of a multi-server client gets its defaults from its own
+	// values, not from [client]'s already-defaulted ones.
+	for i := range cfg.Client.Tunnels {
+		applyClientDefaults(&cfg.Client.Tunnels[i])
+	}
+}
+
+// applyClientDefaults fills in the client defaults; see applyDefaults for the
+// reasoning behind each, which the client and server share.
+func applyClientDefaults(c *config.ClientConfig) {
+	if _, err := logrus.ParseLevel(c.LogLevel); err != nil {
+		c.LogLevel = defaultLogLevel
+	}
+	if c.RetryInterval <= 0 {
+		c.RetryInterval = defaultRetryInterval
+	}
+	// dnsmux keeps its own default of one tunnel: DNS capacity is scarce and each
+	// tunnel probes and polls the resolvers on its own.
+	if c.ConnectionPool <= 0 && c.Transport != config.DNSMUX {
+		c.ConnectionPool = defaultConnectionPool
+	}
+	if c.MuxSession <= 0 {
+		c.MuxSession = defaultMuxSession
+	}
+	if c.Keepalive <= 0 {
+		c.Keepalive = defaultKeepAlive
+	}
+	if c.MuxVersion <= 0 || c.MuxVersion > 2 {
+		c.MuxVersion = defaultMuxVersion
+	}
+	if c.MaxFrameSize <= 0 {
+		c.MaxFrameSize = defaultMaxFrameSize
+	}
+	if c.MaxReceiveBuffer <= 0 {
+		c.MaxReceiveBuffer = defaultMaxReceiveBuffer
+	}
+	// The client has no mux_con of its own (stream concurrency per session is
+	// the server's setting), so it derives from the default.
+	if c.MaxStreamBuffer <= 0 {
+		c.MaxStreamBuffer = deriveStreamBuffer(c.MaxReceiveBuffer, defaultMuxCon)
+	}
+	if c.SnifferLog == "" {
+		c.SnifferLog = defaultSnifferLog
+	}
+	if c.DialTimeout < 1 { // Minimum accepted value is 1 second
+		c.DialTimeout = defaultDialTimeout
+	}
+	if c.ResumeWindow <= 0 {
+		c.ResumeWindow = defaultResumeWindow
+	}
+	if c.StripeFactor < 1 {
+		c.StripeFactor = defaultMuxStripe
+	}
+	if c.StripeParity < 0 {
+		c.StripeParity = 0
 	}
 }
 

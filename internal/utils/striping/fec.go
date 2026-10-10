@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -123,6 +124,7 @@ type FECConn struct {
 	readCost  int64
 	gap       gapState
 	readTimer *time.Timer
+	rd        *readDeadline
 
 	errMu   sync.Mutex
 	permErr error
@@ -181,6 +183,7 @@ func NewFEC(legs []net.Conn, chunkSize int, dataShards, parityShards int) (*FECC
 		errCh:        make(chan error, n),
 		totalKnown:   make(chan struct{}),
 		closed:       make(chan struct{}),
+		rd:           newReadDeadline(),
 	}
 	c.rowCh = make(chan fecRow, c.budget.depth(fecRowChanDepth, c.decodedCost(c.rowFullSize)))
 	for i := range legs {
@@ -560,6 +563,17 @@ func (c *FECConn) flushRow() error {
 	// keeps throughput at the fast legs' rate during a stall instead of collapsing
 	// to the slowest leg - the bug that made FEC ~3x slower than plain striping
 	// with one stalling leg.
+	//
+	// With two or more parity legs one shard of that redundancy is not spent on
+	// congestion: a row goes out on dataShards+1 legs, so it still decodes if a
+	// leg is then lost without warning (its pool session cut) while the row is on
+	// its way. With a single parity leg there is nothing to keep back - skipping
+	// the congested leg is all the parity is for - and a cut under load can still
+	// cost a row.
+	need := c.dataShards
+	if c.parityShards >= 2 {
+		need++
+	}
 	pending := make([]int, 0, len(shards))
 	sent := 0
 	for i := range shards {
@@ -578,7 +592,7 @@ func (c *FECConn) flushRow() error {
 	for _, i := range pending {
 		// Enough shards already queued and we still have skip budget: drop this
 		// congested leg's shard for this row - parity will cover it on decode.
-		if sent >= c.dataShards {
+		if sent >= need {
 			continue
 		}
 		select {
@@ -680,7 +694,7 @@ func (c *FECConn) Read(p []byte) (n int, err error) {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 	defer func() {
-		if err != nil {
+		if err != nil && err != os.ErrDeadlineExceeded {
 			c.dropReassembly()
 		}
 	}()
@@ -710,6 +724,9 @@ func (c *FECConn) Read(p []byte) (n int, err error) {
 			c.nextSeq++
 			continue
 		}
+		if c.rd.expired() {
+			return 0, os.ErrDeadlineExceeded
+		}
 
 		var totalKnown <-chan struct{}
 		if atomic.LoadInt32(&c.haveTotal) == 0 {
@@ -733,6 +750,10 @@ func (c *FECConn) Read(p []byte) (n int, err error) {
 		select {
 		case row := <-c.rowCh:
 			c.stash(row)
+
+		case <-c.rd.change:
+		case <-c.rd.timer():
+			// The read deadline was set or has passed: look again.
 
 		case <-totalKnown:
 			c.drainAvailable()
@@ -858,12 +879,18 @@ func (c *FECConn) teardown() error {
 func (c *FECConn) LocalAddr() net.Addr  { return c.legs[0].LocalAddr() }
 func (c *FECConn) RemoteAddr() net.Addr { return c.legs[0].RemoteAddr() }
 
+// PeerClosed: see legsPeerClosed.
+func (c *FECConn) PeerClosed() <-chan struct{} { return legsPeerClosed(c.legs) }
+
 func (c *FECConn) SetDeadline(t time.Time) error {
-	return c.forEachLeg(func(l net.Conn) error { return l.SetDeadline(t) })
+	c.rd.set(t)
+	return c.SetWriteDeadline(t)
 }
 
+// SetReadDeadline is Conn.SetReadDeadline: it interrupts a Read, not the legs.
 func (c *FECConn) SetReadDeadline(t time.Time) error {
-	return c.forEachLeg(func(l net.Conn) error { return l.SetReadDeadline(t) })
+	c.rd.set(t)
+	return nil
 }
 
 func (c *FECConn) SetWriteDeadline(t time.Time) error {

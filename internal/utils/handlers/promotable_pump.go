@@ -15,7 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// errTunnelNoAcks: a flow with replay can only move onto tunnels that carry ACK
+// errTunnelNoAcks: a flow can only be resumed onto a tunnel that carries ACK
 // records (the half-close envelope); anything else would stall once its ring fills.
 var errTunnelNoAcks = errors.New("promotable pump: replay needs a tunnel that carries ACK records")
 
@@ -23,6 +23,12 @@ var errTunnelNoAcks = errors.New("promotable pump: replay needs a tunnel that ca
 // exchange, wrapper construction, install). See PumpSwapper.Promote. A variable
 // only so tests can shorten it; production never changes it.
 var PromoteHandshakeTimeout = 10 * time.Second
+
+// LegAssemblyTimeout is how long the side that accepts the legs of a striped
+// group waits, from the first leg, for the rest before it gives the group up.
+// The opening side counts it into how long a peer may take to answer (see
+// PromoteOpened). A variable only so tests can shorten it.
+var LegAssemblyTimeout = 10 * time.Second
 
 // ErrPromoteUnavailable means the flow can no longer (or not right now) be
 // promoted: a direction already ended, it was aborted, or a freeze is pending.
@@ -69,11 +75,14 @@ type PumpSwapper struct {
 	done    chan struct{}
 
 	// Replay (level B): nil unless EnableReplay was called before Start.
-	replay      *replayState
-	replayGrow  func(cur int) int // nil: the ring keeps its size
-	freezeWake  chan struct{}     // FreezeUp nudges an upload pump parked on a full replay ring
-	upDst       net.Conn          // the tunnel the upload pump writes to (guarded by mu); acks go there too
-	proxyHeader []byte            // the PROXY protocol header written before Start: payload that replay must retain
+	replay     *replayState
+	replayGrow func(cur int) int // nil: the ring keeps its size
+	replayEnd  func()            // nil, or called once when replay is given up (OnReplayEnd)
+
+	holdReleased bool          // HoldReleasedTunnels
+	freezeWake   chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
+	upDst        net.Conn      // the tunnel the upload pump writes to (guarded by mu); acks go there too
+	proxyHeader  []byte        // the PROXY protocol header written before Start: payload that replay must retain
 
 	// What Start needs.
 	ctx        context.Context
@@ -116,6 +125,7 @@ type PumpSwapper struct {
 
 	upAck     chan struct{} // closed when the upload pump acks the freeze
 	installCh chan struct{} // closed by Install
+	thawCh    chan struct{} // closed by Thaw; replaced each time
 	abortCh   chan struct{} // closed by Abort
 }
 
@@ -160,8 +170,8 @@ func (p *PumpSwapper) switched(up bool) {
 	p.installCh = make(chan struct{})
 	p.swaps++
 	p.mu.Unlock()
-	go old.Close()
-	if p.replay != nil {
+	go p.release(old)
+	if p.replaying() != nil {
 		// An ACK sent on the old tunnel after the peer stopped reading it never
 		// arrived, and with no more data nothing would trigger another: say again,
 		// on the new tunnel, how much has been delivered (ACKs are cumulative, so
@@ -171,6 +181,40 @@ func (p *PumpSwapper) switched(up bool) {
 		p.replay.resetAcked()
 		p.kickAck()
 	}
+}
+
+// ReleaseLinger is how long a tunnel the flow was moved off is kept for the peer
+// to finish with it. A variable only so tests can shorten it.
+var ReleaseLinger = 30 * time.Second
+
+// HoldReleasedTunnels makes the flow keep a tunnel it was moved off until the
+// peer has closed it (see release). It is for the end that decides when the
+// sessions under the tunnels are closed - the server, which retires them - and
+// only that end: the peer must close at once, or each would wait for the other.
+// Call before Start.
+func (p *PumpSwapper) HoldReleasedTunnels() { p.holdReleased = true }
+
+// release lets go of a tunnel the flow has been moved off. This side has taken
+// everything it was promised from it, but what it sent last may still be on its
+// way: megabytes, on a slow path. Closing the tunnel takes its streams off their
+// pool sessions, and a session being retired is closed as soon as it carries
+// none - cutting those bytes off and, with them, the flow. So the end that
+// closes sessions (HoldReleasedTunnels) keeps the tunnel until the peer has
+// closed its side, which it does once it has read everything it was promised.
+// Nothing is read from or written to the tunnel meanwhile.
+func (p *PumpSwapper) release(old net.Conn) {
+	if pc, ok := old.(interface{ PeerClosed() <-chan struct{} }); ok && p.holdReleased {
+		if gone := pc.PeerClosed(); gone != nil {
+			linger := time.NewTimer(ReleaseLinger)
+			select {
+			case <-gone:
+			case <-linger.C:
+			case <-p.abortCh:
+			}
+			linger.Stop()
+		}
+	}
+	old.Close()
 }
 
 // Abort tears the whole flow down: every conn is closed (destinations that can
@@ -228,6 +272,7 @@ func NewPromotablePump(
 		done:       make(chan struct{}),
 		upAck:      make(chan struct{}),
 		installCh:  make(chan struct{}),
+		thawCh:     make(chan struct{}),
 		abortCh:    make(chan struct{}),
 		suspendCh:  make(chan struct{}),
 		resumeCh:   make(chan struct{}),
@@ -317,6 +362,19 @@ func (p *PumpSwapper) Swappable() bool {
 	return !p.aborted && !p.suspended && !p.freezeReq && !(p.upEnded && p.dlEnded)
 }
 
+// unswappableLocked is the error for a swap that cannot be started, saying why.
+func (p *PumpSwapper) unswappableLocked() error {
+	return fmt.Errorf("%w (aborted=%v suspended=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.suspended, p.upEnded && p.dlEnded, p.freezeReq)
+}
+
+// Unswappable is the error a swap started right now would be refused with (see
+// Swappable), for a caller that reports why it left a flow where it was.
+func (p *PumpSwapper) Unswappable() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.unswappableLocked()
+}
+
 // FreezeUp stops the upload direction at a write boundary and returns the final
 // number of bytes committed to the current tunnel (counted from the start of the
 // flow). It blocks until the upload pump has completed any in-flight write,
@@ -326,7 +384,7 @@ func (p *PumpSwapper) Swappable() bool {
 func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	p.mu.Lock()
 	if p.aborted || p.suspended || p.freezeReq || (p.upEnded && p.dlEnded) {
-		err := fmt.Errorf("%w (aborted=%v suspended=%v finished=%v swap pending=%v)", ErrPromoteUnavailable, p.aborted, p.suspended, p.upEnded && p.dlEnded, p.freezeReq)
+		err := p.unswappableLocked()
 		p.mu.Unlock()
 		return 0, err
 	}
@@ -385,15 +443,39 @@ func (p *PumpSwapper) FreezeUp(ctx context.Context) (uint64, error) {
 	return 0, cause
 }
 
+// Thaw calls off a swap after FreezeUp and before Install: the upload carries on
+// on the tunnel the flow is on, as if it had never been stopped. It reports
+// whether it did; false means there was nothing to call off (not frozen, already
+// installed, suspended or aborted). Only safe while the peer cannot have
+// switched: before this side's count reached it, or before its own arrived here.
+func (p *PumpSwapper) Thaw() bool {
+	p.mu.Lock()
+	if p.aborted || p.suspended || !p.frozen || p.installed {
+		p.mu.Unlock()
+		return false
+	}
+	p.freezeReq, p.frozen = false, false
+	called := p.thawCh
+	p.thawCh = make(chan struct{})
+	p.upAck = make(chan struct{})
+	p.installCh = make(chan struct{})
+	p.mu.Unlock()
+	close(called)
+	return true
+}
+
 // Install hands over the new tunnel after a successful freeze. dlLimit is the
 // peer's committed byte count, from the start of the flow: exactly that many
 // bytes in total are delivered before the download switches. An error means the
 // flow ended or was aborted meanwhile; the caller must then Abort (post-freeze).
 func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
-	if p.replay != nil {
-		if _, ok := newTunnel.(ackConn); !ok {
-			return errTunnelNoAcks
-		}
+	// A tunnel that carries no ACK records (a striped group) ends the flow's
+	// replay: from here on it is a flow that a cut ends, like any other on such a
+	// tunnel. Both ends install the same kind of tunnel, so both drop it here.
+	endReplay := false
+	if p.replaying() != nil {
+		_, acks := newTunnel.(ackConn)
+		endReplay = !acks
 	}
 	p.mu.Lock()
 	if p.aborted || !p.frozen || p.installed || (p.upEnded && p.dlEnded) {
@@ -403,7 +485,9 @@ func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 	p.next = newTunnel
 	p.dlLimit = dlLimit
 	p.installed = true
-	if p.replay != nil {
+	if endReplay {
+		p.replay.off.Store(true)
+	} else if p.replaying() != nil {
 		// The new tunnel's ACKs are parsed by whoever reads it: the download pump
 		// once it switches, or nobody if the download already ended.
 		p.attachAcks(newTunnel)
@@ -427,6 +511,14 @@ func (p *PumpSwapper) Install(newTunnel net.Conn, dlLimit uint64) error {
 	}
 	ic := p.installCh
 	p.mu.Unlock()
+	if endReplay {
+		// Nothing will be replayed any more: give the retained bytes and the
+		// flow's share of the replay budget back now, not when the flow ends.
+		p.replay.ring.discard()
+		if p.replayEnd != nil {
+			p.replayEnd()
+		}
+	}
 	close(ic)
 	if resendEnd {
 		closeWrite(newTunnel) // the upload's EOF goes to the new tunnel too
@@ -451,24 +543,91 @@ func (p *PumpSwapper) Promote(ctx context.Context, legs []net.Conn, build func()
 	return p.PromoteFrozen(ctx, own, legs, build)
 }
 
+// PromoteOpened is Promote for the side that opened the legs. The other side
+// answers on leg 0 only once every leg has reached it, and a leg that is slow to
+// get there (its tunnel connection is stalling) would hold a flow frozen first
+// for as long as that takes - or, past the timeout, end it. So this side waits
+// for the peer's count before it freezes anything, the flow still running: if
+// the count does not come, the legs are closed and the flow goes on plain as if
+// nothing had been tried.
+//
+// The wait covers everything a live peer may take before its count is here: its
+// wait for the legs (LegAssemblyTimeout), then its own freeze
+// (PromoteHandshakeTimeout), then the way back. Giving up sooner would close the
+// legs under a peer that has just frozen its side, and a peer whose swap fails
+// after its freeze ends the flow. A peer that gives up itself closes leg 0, so
+// it is seen to rather than timed out on.
+func (p *PumpSwapper) PromoteOpened(ctx context.Context, legs []net.Conn, build func() (net.Conn, error)) error {
+	var peer uint64
+	wctx, cancel := context.WithTimeout(ctx, LegAssemblyTimeout+PromoteHandshakeTimeout+PromoteHandshakeTimeout/2)
+	err := onLeg(wctx, legs[0], func() (err error) {
+		peer, err = utils.ReadCount(legs[0])
+		return err
+	})
+	cancel()
+	if err != nil {
+		closeAll(legs)
+		return err
+	}
+	fctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	own, err := p.FreezeUp(fctx)
+	cancel()
+	if err != nil {
+		closeAll(legs)
+		return err
+	}
+	return p.finishFrozen(ctx, PromoteHandshakeTimeout, legs, build, func(ctx context.Context) (uint64, error) {
+		return peer, onLeg(ctx, legs[0], func() error { return utils.WriteCount(legs[0], own) })
+	})
+}
+
 // PromoteFrozen finishes a swap whose upload FreezeUp already stopped (own is its
 // result). A side that must decide whether to accept a swap uses this to reserve
 // the flow first: once FreezeUp succeeded the flow cannot be refused any more, so
 // a failure from here on aborts it.
+//
+// The peer's count is waited for longer than one PromoteHandshakeTimeout: a peer
+// that opened the legs (PromoteOpened) starts its own freeze only when this
+// side's count reaches it, and that freeze may take the whole timeout before
+// its count is sent back.
 func (p *PumpSwapper) PromoteFrozen(ctx context.Context, own uint64, legs []net.Conn, build func() (net.Conn, error)) error {
-	ctx, cancel := context.WithTimeout(ctx, PromoteHandshakeTimeout)
+	return p.finishFrozen(ctx, PromoteHandshakeTimeout+PromoteHandshakeTimeout/2, legs, build, func(ctx context.Context) (uint64, error) {
+		return exchangeCounts(ctx, legs[0], own)
+	})
+}
+
+// finishFrozen completes a swap on a frozen flow: counts settles the two
+// committed counts with the peer, within wait, and returns the peer's.
+func (p *PumpSwapper) finishFrozen(ctx context.Context, wait time.Duration, legs []net.Conn, build func() (net.Conn, error), counts func(context.Context) (uint64, error)) error {
+	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 
-	peer, err := exchangeCounts(ctx, legs[0], own)
-	if err == nil {
-		var striped net.Conn
-		if striped, err = build(); err == nil {
-			if err = p.Install(striped, peer); err != nil {
-				if aw, ok := striped.(interface{ AbortWrite() }); ok {
-					aw.AbortWrite()
-				}
-				striped.Close()
+	peer, err := counts(ctx)
+	if err != nil {
+		// The counts were not settled, so neither end has been told to switch:
+		// nothing has moved, and the flow carries on where it is instead of
+		// ending. This is what lets the side that opened the legs give a swap up
+		// after its peer has frozen (its own freeze failed, or the peer's count
+		// came too late): it closes the legs, and the frozen peer ends up here.
+		// Should the peer have got this side's count after all and gone ahead,
+		// it finds the legs closed and ends the flow on the old tunnel, where
+		// this side sees it.
+		closeAll(legs)
+		if p.Thaw() {
+			return err
+		}
+		if !p.Suspend() {
+			p.Abort()
+		}
+		return err
+	}
+	var striped net.Conn
+	if striped, err = build(); err == nil {
+		if err = p.Install(striped, peer); err != nil {
+			if aw, ok := striped.(interface{ AbortWrite() }); ok {
+				aw.AbortWrite()
 			}
+			striped.Close()
 		}
 	}
 	if err != nil {
@@ -490,25 +649,36 @@ func closeAll(conns []net.Conn) {
 // exchangeCounts swaps the two 8-byte committed counts on a raw leg, under a
 // deadline derived from ctx that is cleared before the leg carries data.
 func exchangeCounts(ctx context.Context, leg net.Conn, own uint64) (uint64, error) {
+	var peer uint64
+	err := onLeg(ctx, leg, func() (err error) {
+		if err = utils.WriteCount(leg, own); err == nil {
+			peer, err = utils.ReadCount(leg)
+		}
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return peer, nil
+}
+
+// onLeg runs one step of the handshake on a raw leg, bounded by ctx's deadline
+// and cancellation. The leg's deadline is cleared again if the step succeeded.
+func onLeg(ctx context.Context, leg net.Conn, step func() error) error {
 	if dl, ok := ctx.Deadline(); ok {
 		_ = leg.SetDeadline(dl)
 	}
 	stop := context.AfterFunc(ctx, func() { _ = leg.SetDeadline(time.Unix(1, 0)) })
-
-	var peer uint64
-	err := utils.WriteCount(leg, own)
-	if err == nil {
-		peer, err = utils.ReadCount(leg)
-	}
+	err := step()
 	stop()
 	if err == nil {
 		err = ctx.Err()
 	}
 	if err != nil {
-		return 0, err
+		return err
 	}
 	_ = leg.SetDeadline(time.Time{})
-	return peer, nil
+	return nil
 }
 
 // writeFull writes all of b, returning how many bytes were accepted.
@@ -551,7 +721,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	pend := 0        // bytes of buf read from the app but not yet retained or sent
 
 	for { // one pass per tunnel the flow is carried on
-		var installCh, suspendCh chan struct{}
+		var installCh, suspendCh, thawCh chan struct{}
 
 		// app -> dst, until the app ends or a freeze is requested.
 	run:
@@ -573,7 +743,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				}
 				if n > 0 {
 					interrupted := false
-					if p.replay != nil {
+					if p.replaying() != nil {
 						// Keep what is being sent until the peer acknowledges it, and
 						// wait here (not in the app's socket) while a full window of it
 						// is unacknowledged.
@@ -628,6 +798,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				ack := p.upAck
 				installCh = p.installCh
 				suspendCh = p.suspendCh
+				thawCh = p.thawCh
 				p.mu.Unlock()
 				close(ack)
 				if isTimeout(srcErr) {
@@ -676,6 +847,10 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 		select {
 		case <-installCh:
 		case <-suspendCh:
+		case <-thawCh:
+			// The swap was called off: carry on where the flow is. Anything read
+			// from the app before the freeze goes out first (pend, srcErr).
+			continue
 		case <-p.abortCh:
 			return
 		}
@@ -740,6 +915,20 @@ dl:
 					usage.AddOrUpdatePort(remotePort, uint64(n))
 				}
 				if werr != nil {
+					// A suspension interrupts a write the app is not taking (see
+					// Suspend). What the app did take is counted, and the peer
+					// replays from that count: the rest of buf is simply dropped.
+					p.mu.Lock()
+					suspended := p.suspended
+					p.mu.Unlock()
+					if suspended && isTimeout(werr) {
+						nsrc, ok := p.parkDl()
+						if !ok {
+							return
+						}
+						src = nsrc
+						continue dl
+					}
 					p.Abort()
 					return
 				}
@@ -763,12 +952,13 @@ dl:
 			// this direction is over.
 			p.mu.Lock()
 			waitInstall := !p.installed && p.frozen
-			installCh, suspendCh := p.installCh, p.suspendCh
+			installCh, suspendCh, thawCh := p.installCh, p.suspendCh, p.thawCh
 			p.mu.Unlock()
 			if waitInstall {
 				select {
 				case <-installCh:
 				case <-suspendCh: // the swap died with the tunnel
+				case <-thawCh: // the swap was called off: this was the tunnel's own end
 				case <-p.abortCh:
 					return
 				}
@@ -786,7 +976,7 @@ dl:
 				p.dlEnded = true
 				p.checkParkedLocked()
 				p.mu.Unlock()
-				if p.replay != nil {
+				if p.replaying() != nil {
 					p.kickAck() // the peer is still waiting to learn how much arrived
 				}
 				closeWrite(app) // clean end of the download
@@ -849,7 +1039,24 @@ type replayState struct {
 	endAckSent atomic.Bool
 	endAcked   atomic.Bool
 	timerSet   atomic.Bool // a delayed ack is armed
+
+	// off: the flow moved onto a tunnel without ACK records and no longer replays
+	// (see Install). Set once, never cleared.
+	off atomic.Bool
 }
+
+// replaying is the flow's replay state while it has one in use: nil for a flow
+// without replay and for one that gave it up.
+func (p *PumpSwapper) replaying() *replayState {
+	if r := p.replay; r != nil && !r.off.Load() {
+		return r
+	}
+	return nil
+}
+
+// OnReplayEnd registers what to do when the flow gives up its replay state before
+// it ends (release its share of the replay budget). Call before Start.
+func (p *PumpSwapper) OnReplayEnd(fn func()) { p.replayEnd = fn }
 
 // resetAcked forgets what was acknowledged: the new tunnel has not heard any of it.
 func (r *replayState) resetAcked() {
@@ -934,6 +1141,10 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 	return nil
 }
 
+// Replaying reports whether the flow keeps replay state: it was given some and has
+// not given it up at a promotion.
+func (p *PumpSwapper) Replaying() bool { return p.replaying() != nil }
+
 // ReplayLen is the number of sent bytes not yet acknowledged (0 without replay).
 func (p *PumpSwapper) ReplayLen() int {
 	if p.replay == nil {
@@ -960,7 +1171,7 @@ func (p *PumpSwapper) attachAcks(c net.Conn) {
 // soon, in batches, from a goroutine of their own so that a tunnel that cannot
 // take the ACK right now never stalls the download that produced it.
 func (p *PumpSwapper) noteDelivered() {
-	r := p.replay
+	r := p.replaying()
 	if r == nil {
 		return
 	}
@@ -985,6 +1196,9 @@ func (p *PumpSwapper) armAckTimer() {
 
 func (p *PumpSwapper) kickAck() {
 	r := p.replay
+	if r.off.Load() {
+		return
+	}
 	if r.ackBusy.CompareAndSwap(false, true) {
 		go p.flushAck()
 	}

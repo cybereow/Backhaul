@@ -2,12 +2,15 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/musix/backhaul/config"
+	client_transport "github.com/musix/backhaul/internal/client/transport"
 	"github.com/musix/backhaul/internal/smux"
 	"github.com/sirupsen/logrus"
 )
@@ -640,5 +643,51 @@ func TestRotationPlan(t *testing.T) {
 		if got := rotateAge(age); got > worst || got < time.Duration(float64(age)*(1-rotateJitter)) {
 			t.Fatalf("rotateAge %v outside +/-%.0f%% of %v", got, rotateJitter*100, age)
 		}
+	}
+}
+
+// Every connection the server asks for arrives although one of the client's two
+// entry points is down. A dial that fell to the dead one used to be given up, so
+// every other request was lost - and a rotation waiting for that replacement only
+// asked again half a minute later, with all the others queued behind it.
+func TestWSMuxRequestedConnectionSkipsADeadEntryPoint(t *testing.T) {
+	// An entry point that answers every upgrade like a CDN whose origin is down.
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dead.Close() })
+	go func() {
+		for {
+			c, err := dead.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+				_, _ = c.Read(make([]byte, 4096))
+				_, _ = c.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+			}()
+		}
+	}()
+
+	h := newLCHarness(t)
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client := client_transport.NewWSMuxClient(ctx, &client_transport.WsMuxConfig{
+		RemoteAddrs: []string{h.addr, dead.Addr().String()}, Token: lcToken, Mode: config.WSMUX, Path: "/", MuxVersion: 2,
+		ConnPoolSize: 2, DialTimeOut: 5 * time.Second, RetryInterval: 20 * time.Millisecond,
+		KeepAlive: 30 * time.Second, MaxFrameSize: 32768, MaxReceiveBuffer: 4194304, MaxStreamBuffer: 65536,
+	}, logger)
+	go client.Start()
+	lcWaitFor(t, "the client's pool sessions", func() bool { return h.sessions() >= 2 })
+
+	for i := 1; i <= 6; i++ {
+		before := h.sessions()
+		h.s.requestReplacement()
+		lcWaitFor(t, fmt.Sprintf("requested connection %d", i), func() bool { return h.sessions() > before })
 	}
 }

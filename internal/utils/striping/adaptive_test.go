@@ -9,155 +9,6 @@ import (
 	"time"
 )
 
-// backloggedQueue returns a writeQueue filled past the half-full mark, so
-// reevaluateLocked treats the flow as a bulk transfer and the rate-quarantine
-// path engages (it is deliberately inert on a near-empty queue).
-func backloggedQueue() chan writeJob {
-	q := make(chan writeJob, 4)
-	q <- writeJob{}
-	q <- writeJob{}
-	q <- writeJob{}
-	return q
-}
-
-// TestReevaluateQuarantinesSlowLegWhenBacklogged checks the leg-scheduling core
-// for a bulk transfer: with the write queue backlogged, a leg whose throughput
-// has fallen below quarantineFraction of the fastest is quarantined (kept off
-// the sequential path), faster legs stay active, and an unmeasured leg is left
-// active so it can be measured.
-func TestReevaluateQuarantinesSlowLegWhenBacklogged(t *testing.T) {
-	c := &Conn{sched: make([]legSched, 4), writeQueue: backloggedQueue()}
-	c.sched[0].rate = 1000 // fast
-	c.sched[1].rate = 900  // fast
-	c.sched[2].rate = 100  // < 0.25*1000 -> quarantine
-	c.sched[3].rate = 0    // unmeasured -> stay active
-
-	c.schedMu.Lock()
-	c.reevaluateLocked()
-	c.schedMu.Unlock()
-
-	want := []bool{false, false, true, false}
-	for i, w := range want {
-		if c.sched[i].slowQuar != w {
-			t.Errorf("leg %d slowQuar=%v, want %v (rate=%.0f)", i, c.sched[i].slowQuar, w, c.sched[i].rate)
-		}
-	}
-}
-
-// TestReevaluateSkipsRateQuarantineWhenNotBacklogged is the guard for the
-// mid-session-disconnect fix: a low-rate, bursty flow (a game, an SSH session)
-// keeps the write queue near-empty, and its per-write rate samples are noise. In
-// that regime NO leg may be rate-quarantined however lopsided the samples look,
-// so the flow behaves as plain work-stealing and can't be reordered into a
-// reassembly stall. A leg previously quarantined is also released once the
-// backlog clears.
-func TestReevaluateSkipsRateQuarantineWhenNotBacklogged(t *testing.T) {
-	c := &Conn{sched: make([]legSched, 3), writeQueue: make(chan writeJob, 8)} // empty
-	c.sched[0].rate = 1000
-	c.sched[1].rate = 5        // would be quarantined if backlogged
-	c.sched[2].slowQuar = true // stale mark from an earlier backlog
-	c.sched[2].rate = 3
-
-	c.schedMu.Lock()
-	c.reevaluateLocked()
-	c.schedMu.Unlock()
-
-	for i := range c.sched {
-		if c.sched[i].slowQuar {
-			t.Errorf("leg %d rate-quarantined on a near-empty queue; interactive flows must stay work-stealing", i)
-		}
-	}
-}
-
-// TestReevaluateNeverQuarantinesEveryLeg guards the deadlock-safety invariant:
-// even if every leg looks slow relative to some peak while backlogged, at least
-// one leg must stay active so the flow always has a writer.
-func TestReevaluateNeverQuarantinesEveryLeg(t *testing.T) {
-	c := &Conn{sched: make([]legSched, 3), writeQueue: backloggedQueue()}
-	// Contrived: all three measured very low, but one is the (relative) best.
-	c.sched[0].rate = 10
-	c.sched[1].rate = 5
-	c.sched[2].rate = 1
-
-	c.schedMu.Lock()
-	c.reevaluateLocked()
-	c.schedMu.Unlock()
-
-	active := 0
-	for i := range c.sched {
-		if !c.sched[i].slowQuar && !c.sched[i].frozen {
-			active++
-		}
-	}
-	if active == 0 {
-		t.Fatal("every leg quarantined: the flow would have no writer")
-	}
-	if c.sched[0].slowQuar {
-		t.Error("the fastest leg must never be quarantined")
-	}
-}
-
-// TestRecordRateClearsFrozen verifies the liveness-based recovery: a leg
-// scanStuck marked frozen rejoins as soon as it completes a write again, even
-// for a flow whose queue is not backlogged (so the rate path never runs).
-func TestRecordRateClearsFrozen(t *testing.T) {
-	c := &Conn{sched: make([]legSched, 2), writeQueue: make(chan writeJob, 8)}
-	c.sched[0].frozen = true
-
-	c.recordRate(0, DefaultChunkSize, time.Millisecond)
-
-	c.schedMu.Lock()
-	defer c.schedMu.Unlock()
-	if c.sched[0].frozen {
-		t.Error("a successful write must clear the frozen mark (leg proved alive)")
-	}
-}
-
-// TestEnsureActivePrefersNonFrozenLeg guards the reactivation rule: when a stall
-// leaves every leg quarantined, the leg brought back must not be one frozen
-// mid-write (it couldn't service work), even if it has the higher historical
-// rate - otherwise the reroute would have no live carrier.
-func TestEnsureActivePrefersNonFrozenLeg(t *testing.T) {
-	c := &Conn{sched: make([]legSched, 2)}
-	// Leg 0: faster, but frozen mid-write (the one scanStuck just quarantined).
-	c.sched[0] = legSched{rate: 1000, frozen: true, inFly: true}
-	// Leg 1: slower, quarantined, but idle and able to carry the reroute.
-	c.sched[1] = legSched{rate: 200, frozen: true, inFly: false}
-
-	c.schedMu.Lock()
-	c.ensureActiveLocked()
-	c.schedMu.Unlock()
-
-	if !c.sched[0].frozen {
-		t.Error("the frozen (in-flight) leg must not be the one reactivated")
-	}
-	if c.sched[1].frozen {
-		t.Error("the idle leg should be reactivated so it can carry the reroute")
-	}
-}
-
-// TestEnsureActiveFallsBackWhenAllFrozen checks the fallback: if every leg is in
-// flight, one is still reactivated so the flow never ends up with zero writers.
-func TestEnsureActiveFallsBackWhenAllFrozen(t *testing.T) {
-	c := &Conn{sched: make([]legSched, 2)}
-	c.sched[0] = legSched{rate: 1000, frozen: true, inFly: true}
-	c.sched[1] = legSched{rate: 200, frozen: true, inFly: true}
-
-	c.schedMu.Lock()
-	c.ensureActiveLocked()
-	c.schedMu.Unlock()
-
-	active := 0
-	for i := range c.sched {
-		if !c.sched[i].slowQuar && !c.sched[i].frozen {
-			active++
-		}
-	}
-	if active == 0 {
-		t.Fatal("no active leg after reactivation: the flow would stall")
-	}
-}
-
 // TestStashDropsDuplicates verifies the receiver dedups a re-sent sequence
 // number, so the reroute path can safely deliver the same chunk on two legs.
 func TestStashDropsDuplicates(t *testing.T) {
@@ -199,10 +50,10 @@ func (c *throttleConn) Write(p []byte) (int, error) {
 
 // TestAdaptiveRoutesAroundThrottledLeg is the end-to-end analogue of the
 // production report: several fast legs and one persistently throttled leg (the
-// ~5x asymmetry seen in the per-CDN speedtest). Under a sustained bulk payload
-// the write queue stays backlogged, so the adaptive scheduler quarantines the
-// slow leg and the aggregate tracks the fast legs' summed rate rather than
-// collapsing toward the slow one, and the payload must arrive intact.
+// ~5x asymmetry seen in the per-CDN speedtest). Each leg takes a chunk when it
+// can send one, so the throttled leg carries only its share and the aggregate
+// tracks the legs' summed rate rather than collapsing toward the slow one, and
+// the payload must arrive intact.
 func TestAdaptiveRoutesAroundThrottledLeg(t *testing.T) {
 	const (
 		nLegs       = 5

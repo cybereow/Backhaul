@@ -6,7 +6,6 @@ import (
 	"io"
 	"math/rand"
 	"net"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -211,6 +210,7 @@ type WsMuxTransport struct {
 
 	promotableFlowsMu sync.Mutex
 	promotableFlows   map[uint64]*handlers.PumpSwapper
+	gone              goneFlows // under promotableFlowsMu
 }
 
 // wsEndpoint is a single tunnel entry point: the domain dialed (which also
@@ -250,6 +250,24 @@ func (c *WsMuxTransport) nextEndpoint() wsEndpoint {
 	return c.endpoints[int(uint32(i))%len(c.endpoints)]
 }
 
+// endpointRound is every entry point once, starting with the one next in turn:
+// what one dial works through until an entry point answers. The turn is taken
+// once and the round walked from there, not one turn per attempt: dials overlap,
+// and with a shared turn another dial could take the live entry point in between
+// and leave this one trying the dead one twice.
+func (c *WsMuxTransport) endpointRound() []wsEndpoint {
+	n := len(c.endpoints)
+	if n <= 1 {
+		return c.endpoints
+	}
+	start := int(uint32(atomic.AddInt32(&c.dialSeq, 1))) % n
+	round := make([]wsEndpoint, 0, n)
+	for i := 0; i < n; i++ {
+		round = append(round, c.endpoints[(start+i)%n])
+	}
+	return round
+}
+
 // stripeGroup accumulates the legs the server opened for one logical
 // connection (one per stripe.Factor) until all of them have shown up.
 type stripeGroup struct {
@@ -279,6 +297,12 @@ func (c *WsMuxTransport) addStripeLeg(stream *smux.Stream, kind byte, promoFlowI
 		stream.Close()
 		return nil, false
 	}
+	if parity == 0 && total > 1 {
+		// Reading the header opened this leg's full window; close it down again
+		// before the server fills it while the other legs are still on their way.
+		// (A group of one has no other legs, and nothing would widen it again.)
+		striping.HoldLeg(stream)
+	}
 
 	c.stripeGroupsMu.Lock()
 	g, ok := c.stripeGroups[groupID]
@@ -293,7 +317,7 @@ func (c *WsMuxTransport) addStripeLeg(stream *smux.Stream, kind byte, promoFlowI
 		}
 		// The timer is bound to this group instance, not just its numeric ID, so
 		// it can never abort a later group that reuses the ID.
-		g.timer = time.AfterFunc(10*time.Second, func() {
+		g.timer = time.AfterFunc(handlers.LegAssemblyTimeout, func() {
 			c.abortStripeGroup(groupID, g)
 		})
 		c.stripeGroups[groupID] = g
@@ -511,6 +535,7 @@ func (c *WsMuxTransport) Restart() {
 	c.closeStripeGroups()
 	c.promotableFlowsMu.Lock()
 	c.promotableFlows = make(map[uint64]*handlers.PumpSwapper)
+	c.gone = goneFlows{}
 	c.promotableFlowsMu.Unlock()
 
 	c.Start()
@@ -927,15 +952,33 @@ func (c *WsMuxTransport) tunnelDialer() {
 	// still handshaking. It is handed off to poolConnections once established.
 	atomic.AddInt32(&c.pendingDials, 1)
 
-	ep := c.nextEndpoint()
-	c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
-
-	// Dial to the tunnel server
-	tunnelWSConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify, c.dialOptions()...)
+	// One pool connection was asked for, not one attempt on whichever entry point
+	// is next in turn. With several of them a failure moves on to the next, once
+	// round, instead of retrying the one that just failed: an entry point that is
+	// down (a CDN answering 502) would otherwise swallow every dial that falls to
+	// it - and when that dial is the replacement a rotation on the server is
+	// waiting for, the server only asks again half a minute later, with every
+	// other rotation queued behind it.
+	round := c.endpointRound()
+	retries := 1
+	if len(round) == 1 {
+		retries = 3
+	}
+	var tunnelWSConn *network.WebSocketConn
+	var err error
+	for _, ep := range round {
+		c.logger.Debugf("initiating new %s tunnel connection to address %s", c.config.Mode, ep.addr)
+		tunnelWSConn, err = network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, retries, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify, c.dialOptions()...)
+		if err == nil {
+			break
+		}
+		c.logger.Errorf("tunnel server dialer: %v (endpoint %s)", err, ep.addr)
+		if ctx.Err() != nil {
+			break
+		}
+	}
 	if err != nil {
 		atomic.AddInt32(&c.pendingDials, -1)
-		c.logger.Errorf("tunnel server dialer: %v (endpoint %s)", err, ep.addr)
-
 		return
 	}
 
@@ -995,6 +1038,11 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 			stream.Close()
 		}
 	}
+	// How many streams of this session may be waiting for their header at once.
+	// With that many silent ones the accept loop waits for a slot, as it used to
+	// for every single one: a peer that opens streams and sends no headers costs
+	// a bounded number of workers, not one per stream.
+	headers := make(chan struct{}, headerReaders)
 
 	for {
 		select {
@@ -1006,10 +1054,33 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 				c.logger.Debug("session is closed: ", err)
 				return
 			}
-			c.setupStream(stream, tunnelConn.RemoteAddr().String(), run)
+			// Each stream reads its own header: one whose header is late (it waits
+			// behind queued data, or its opener is still opening the other legs of
+			// a group) must not hold up the streams accepted after it for the
+			// whole header timeout - they are other flows.
+			select {
+			case headers <- struct{}{}:
+			case <-ctx.Done():
+				stream.Close()
+				return
+			}
+			remote := tunnelConn.RemoteAddr().String()
+			if !g.start(func() {
+				defer func() { <-headers }()
+				c.setupStream(stream, remote, run)
+			}) {
+				<-headers
+				stream.Close()
+			}
 		}
 	}
 }
+
+// headerReaders is how many accepted streams of one session read their header
+// at the same time (see handleSession). Reading a header takes one round trip
+// at most on a healthy connection, so this is far above what ordinary traffic
+// needs and only ever fills with streams whose header is not coming.
+const headerReaders = 64
 
 // setupHeaderTimeout bounds how long a peer may take to send a new stream's
 // initial header: the configured dial timeout (cmd normalizes it to at least one
@@ -1065,6 +1136,14 @@ func (c *WsMuxTransport) setupStream(stream *smux.Stream, remote string, run fun
 	}
 
 	kind, err := utils.ReadFlowKind(stream)
+	if err == io.EOF {
+		// Opened and closed with nothing in it: what the server leaves behind
+		// when it gave up opening a stream on a connection that was not getting
+		// through, and closed it behind itself. Nothing went wrong here.
+		c.logger.Debugf("a stream from %s was closed before its header", remote)
+		stream.Close()
+		return
+	}
 	if err != nil {
 		bad("unable to read flow kind", err)
 		return
@@ -1235,17 +1314,12 @@ func (c *WsMuxTransport) localDialer(stream net.Conn, remoteAddr string) {
 		return
 	}
 
-	var sendBuf, recvBuf int
-
-	if strings.Contains(resolvedAddr, "127.0.0.1") {
-		// Use 32 KB for localhost
-		sendBuf = 32 * 1024
-		recvBuf = 32 * 1024
-	} else {
-		// Use your custom buffer sizes
-		sendBuf = 0
-		recvBuf = 0
-	}
+	// The socket to the local destination is left to kernel autotuning. It used
+	// to be pinned at 32 KiB, which Linux doubles to 64 KiB: a tunnel frame larger
+	// than that (mux_framesize up to 65535) then goes out one segment at a time,
+	// each waiting for the destination's delayed ACK - an upload ceiling of a few
+	// MB/s per flow whatever the tunnel can carry.
+	const sendBuf, recvBuf = 0, 0
 
 	localConnection, err := network.TcpDialer(ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
 	if err != nil {
@@ -1385,13 +1459,7 @@ func (c *WsMuxTransport) localDialerPlain(stream *smux.Stream, flowID uint64, re
 		return
 	}
 
-	var sendBuf, recvBuf int
-	if strings.Contains(resolvedAddr, "127.0.0.1") {
-		sendBuf, recvBuf = 32*1024, 32*1024 // localhost
-	} else if c.config.AggressivePool {
-		sendBuf = 32 * 1024
-		recvBuf = 32 * 1024
-	}
+	const sendBuf, recvBuf = 0, 0 // kernel autotuning: see localDialer
 
 	localConnection, err := network.TcpDialer(ctx, resolvedAddr, "", c.config.DialTimeOut, c.config.KeepAlive, true, 1, recvBuf, sendBuf, 0)
 	if err != nil {
@@ -1429,24 +1497,32 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 		return
 	}
 
-	var sendBuf, recvBuf int
-	if strings.Contains(resolvedAddr, "127.0.0.1") {
-		sendBuf, recvBuf = 32*1024, 32*1024 // localhost
-	} else if c.config.AggressivePool {
-		sendBuf = 32 * 1024
-		recvBuf = 32 * 1024
-	}
+	const sendBuf, recvBuf = 0, 0 // kernel autotuning: see localDialer
 
 	if replay {
 		// Known but not running yet: a resume attach that arrives while the target
 		// is still being dialed must be told to retry, not that the flow is gone.
+		// And an opening for a flow that is running, or that ran, is not a new
+		// flow (see goneFlows): it is dropped.
 		c.promotableFlowsMu.Lock()
-		c.promotableFlows[flowID] = nil
+		_, running := c.promotableFlows[flowID]
+		admit := !running && c.gone.admit(flowID, time.Now())
+		if admit {
+			c.promotableFlows[flowID] = nil
+		}
 		c.promotableFlowsMu.Unlock()
+		if !admit {
+			c.logger.Debugf("a second opening of flow %d was dropped", flowID)
+			stream.Close()
+			return
+		}
 	}
 	forget := func() {
 		c.promotableFlowsMu.Lock()
 		delete(c.promotableFlows, flowID)
+		if replay {
+			c.gone.finished(flowID, time.Now())
+		}
 		c.promotableFlowsMu.Unlock()
 	}
 
@@ -1480,6 +1556,7 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 		}
 		defer grant.Release()
 		swapper.SetReplayGrower(grant.Grow)
+		swapper.OnReplayEnd(grant.Release)
 		if err := swapper.EnableReplay(grant.Limit()); err != nil {
 			c.logger.Errorf("resumable flow %d: %v", flowID, err)
 			forget()
@@ -1496,10 +1573,7 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 	swapper.Start()
 
 	<-swapper.DoneWait()
-
-	c.promotableFlowsMu.Lock()
-	delete(c.promotableFlows, flowID)
-	c.promotableFlowsMu.Unlock()
+	forget()
 }
 
 // handleAttachStream answers the server's request to move flow flowID onto this
@@ -1521,8 +1595,23 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 		_ = utils.WriteAttachVerdict(stream, false, reason)
 		stream.Close()
 	}
-	if mode == utils.AttachResume && flags == 0 {
+	if mode == utils.AttachResume && flags&^utils.AttachFlagReopen == 0 {
+		if !known && flags&utils.AttachFlagReopen != 0 {
+			c.promotableFlowsMu.Lock()
+			never := c.gone.neverSeen(flowID, time.Now())
+			c.promotableFlowsMu.Unlock()
+			if never {
+				reject(utils.AttachRejectNeverSeen, "never seen: to be opened again")
+				return
+			}
+		}
 		c.handleResumeAttach(ctx, stream, flowID, swapper, pending, reject)
+		return
+	}
+	if mode == utils.AttachProbe && flags == 0 {
+		_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
+		_ = utils.WriteAttachCaps(stream, utils.AttachCapReopen)
+		stream.Close()
 		return
 	}
 	switch {
@@ -1550,7 +1639,9 @@ func (c *WsMuxTransport) handleAttachStream(stream *smux.Stream, flowID uint64, 
 	_ = stream.SetWriteDeadline(time.Now().Add(c.setupHeaderTimeout()))
 	if err := utils.WriteAttachVerdict(stream, true, 0); err != nil {
 		stream.Close()
-		swapper.Abort() // frozen and no way to thaw: the peer never saw an accept
+		if !swapper.Thaw() { // the peer never saw an accept: nothing has moved
+			swapper.Abort()
+		}
 		return
 	}
 	_ = stream.SetWriteDeadline(time.Time{})

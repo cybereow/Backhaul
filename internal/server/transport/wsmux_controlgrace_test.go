@@ -12,6 +12,7 @@ import (
 	"github.com/gobwas/ws"
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/smux"
+	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/sirupsen/logrus"
 )
@@ -551,5 +552,45 @@ func TestControlGraceReattachKeepsFlow(t *testing.T) {
 	}
 	if n := h.sessions(); n != 1 {
 		t.Fatalf("session counter is %d, want 1", n)
+	}
+}
+
+// A request for a new pool connection made after the control channel was replaced
+// reaches the client on the new channel. The handler of the lost channel shares
+// the request queue with its successor; it used to keep taking requests, write
+// them to its dead connection and lose them, which held a rotation back until
+// its next re-ask.
+func TestControlReattachDeliversRequests(t *testing.T) {
+	h := newLCHarness(t)
+	ctl := h.control()
+	h.pool()
+	lcWaitFor(t, "an admitted session", func() bool { return h.sessions() == 1 })
+
+	// A lost request is a coin toss between the two handlers, so go round a few times.
+	for round := 1; round <= 8; round++ {
+		ctl.Close()
+		lcWaitFor(t, "the server to notice the lost control channel", func() bool {
+			h.s.controlMu.Lock()
+			defer h.s.controlMu.Unlock()
+			return h.s.controlChannel == nil
+		})
+		ctl = h.control()
+		lcWaitFor(t, "the control channel to be reattached", func() bool {
+			h.s.controlMu.Lock()
+			defer h.s.controlMu.Unlock()
+			return h.s.controlChannel != nil
+		})
+
+		h.s.requestReplacement()
+		_ = ctl.SetReadDeadline(time.Now().Add(lcDeadline))
+		for {
+			_, msg, err := ctl.ReadMessage()
+			if err != nil {
+				t.Fatalf("round %d: the request never reached the new control channel: %v", round, err)
+			}
+			if len(msg) > 0 && msg[0] == utils.SG_Chan {
+				break
+			}
+		}
 	}
 }

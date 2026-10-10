@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -207,6 +208,8 @@ func (g *wsGeneration) join(timeout time.Duration) bool {
 type tunnelSession struct {
 	session   *smux.Session
 	halfClose bool
+	conn      net.Conn // the socket the session runs on, for capacity sampling; may be nil
+	host      string   // domain the client dialed, from the upgrade request
 }
 
 type WsMuxTransport struct {
@@ -274,6 +277,8 @@ type WsMuxTransport struct {
 	plainSelectMu sync.Mutex
 
 	fallbackProxy http.Handler
+	// reopenSeen: the client has announced utils.AttachCapReopen on some session.
+	reopenSeen atomic.Bool
 
 	// controlMu guards controlChannel, handlersStarted, graceTimer, graceEpoch
 	// and restartClaim. The HTTP handler goroutine may be adopting a reattached
@@ -579,6 +584,10 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 
 	// Channel to receive the message or error
 	messageChan := make(chan byte, 10)
+	// Closed by the reader once the connection is gone. Until this handler is
+	// replaced it shares reqNewConn with its successor, and a request it took
+	// after that would be written to a dead connection and lost.
+	lost := make(chan struct{})
 
 	// Separate goroutine to continuously listen for messages. A worker of the
 	// generation, so Restart waits for it; the generation closing the socket is
@@ -604,6 +613,7 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 					// must not take the pool, and every flow running on it,
 					// down as well. Hold everything and wait for a reattach.
 					go s.onControlLost(g, conn)
+					close(lost)
 					return
 				}
 				// A zero-length binary frame (or padding-only payload) would
@@ -628,10 +638,21 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 			_ = conn.SetWriteDeadline(time.Now().Add(controlCloseWriteTimeout))
 			_ = utils.WriteControlSignal(conn, utils.SG_Closed)
 			return
+		case <-lost:
+			return
 		case <-reqNewConn:
+			// Both this and lost may have been ready, and a write to a connection
+			// whose peer has gone can still succeed here: look again before using it.
+			select {
+			case <-lost:
+				requeue(reqNewConn)
+				return
+			default:
+			}
 			err := utils.WriteControlSignal(conn, utils.SG_Chan)
 			if err != nil {
 				s.logger.Warn("failed to send request new connection signal. ", err)
+				requeue(reqNewConn) // not delivered: for the channel that replaces this one
 				go s.onControlLost(g, conn)
 				return
 			}
@@ -670,6 +691,15 @@ func (s *WsMuxTransport) channelHandler(g *wsGeneration, conn *network.WebSocket
 			}
 
 		}
+	}
+}
+
+// requeue puts back a request for a new pool connection that its taker could not
+// deliver (dropped if the queue is full, as a request is when it is made).
+func requeue(reqNewConn chan struct{}) {
+	select {
+	case reqNewConn <- struct{}{}:
+	default:
 	}
 }
 
@@ -891,6 +921,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 				}
 
 				g.start(func() { s.dispatchLoop(g) })
+				g.start(func() { s.capacityLoop(g) })
 
 			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
 				// Track the raw socket before smux wraps it, so a constructor
@@ -926,7 +957,7 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 				}
 				g.release(netConn)
 				select {
-				case s.tunnelChannel <- tunnelSession{session: session, halfClose: s.config.HalfClose}: // ok
+				case s.tunnelChannel <- tunnelSession{session: session, halfClose: s.config.HalfClose, conn: netConn, host: hostKey(r.Host)}: // ok
 				default:
 					s.logger.Warnf("tunnel listener channel is full, discarding TCP connection from %s", conn.LocalAddr().String())
 					// Close the smux session, not just the raw conn: a bare
@@ -1163,7 +1194,7 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 			atomic.AddInt32(&s.sessionCounter, 1)
 			atomic.AddInt32(&s.admittedSessions, 1)
 
-			ps := s.registerSession(session, ts.halfClose)
+			ps := s.registerCarriedSession(ts)
 			// The close watcher settles the session's counter and registry entry
 			// exactly once, however the session ends (peer, rotation, or the
 			// generation closing it). It is a worker of the generation, so Restart
@@ -1173,6 +1204,11 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 				s.unregisterSession(session)
 				atomic.AddInt32(&s.sessionCounter, -1)
 				g.release(session)
+				if s.resumable() {
+					// Nothing to do for a session rotation retired (its flows were
+					// moved first) or once the generation is stopping.
+					s.regroupFlowsOn(g.ctx, session)
+				}
 			}) {
 				// Stopped between dequeue and admission: undo, and close the
 				// session (the generation would have, had it seen it).
@@ -1193,6 +1229,9 @@ func (s *WsMuxTransport) handleLoop(g *wsGeneration) {
 			}
 			if s.config.MaxConnAge > 0 {
 				g.start(func() { s.rotateStripedSession(g, session) })
+			}
+			if s.resumable() && s.config.ResumeWindow > 0 {
+				g.start(func() { s.probeReplayPromote(g, ps) })
 			}
 		}
 	}

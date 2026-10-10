@@ -854,8 +854,10 @@ func TestStripedGapDeadline(t *testing.T) {
 	})
 }
 
-// TestStripedReassemblyBudget: retained reassembly memory is bounded; overflow
-// fails the flow loudly and promptly, and every charge is released exactly.
+// TestStripedReassemblyBudget: retained reassembly memory is bounded. A leg that
+// runs ahead of the sequence Read is waiting for is made to wait; the flow fails
+// only when that sequence can no longer arrive, and every charge is released
+// exactly.
 func TestStripedReassemblyBudget(t *testing.T) {
 	const chunk = 16
 	payload := strings.Repeat("p", chunk)
@@ -870,16 +872,80 @@ func TestStripedReassemblyBudget(t *testing.T) {
 	}
 	cost := int64(retainedEntryOverhead + chunk)
 
-	t.Run("gapPlusSustainedLaterChunksOverflows", func(t *testing.T) {
+	t.Run("legAheadWaitsForTheGap", func(t *testing.T) {
+		const last = 200
 		s, peers := newServer(t, 5*cost)
 		ev := readEvents(s)
 		go func() {
-			for seq := uint32(1); seq < 200; seq++ { // 0 never arrives
+			for seq := uint32(1); seq < last; seq++ { // 0 comes later, on the other leg
 				if _, err := peers[0].Write(stripeFrame(seq, payload)); err != nil {
 					return
 				}
 			}
 		}()
+		expectQuiet(t, ev, 300*time.Millisecond, "a leg running ahead of a gap must wait, not fail the flow")
+		if peak := atomic.LoadInt64(&s.budget.peak); peak > 5*cost {
+			t.Fatalf("peak retained %d exceeded the %d budget", peak, 5*cost)
+		}
+		go peers[1].Write(stripeFrame(0, payload))
+		got := 0
+		for got < last*chunk {
+			select {
+			case e := <-ev:
+				if e.err != nil {
+					t.Fatalf("read after the gap filled: %v (%d/%d bytes)", e.err, got, last*chunk)
+				}
+				got += len(e.data)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("only %d/%d bytes after the gap filled", got, last*chunk)
+			}
+		}
+		// the chunk that fills the gap is admitted over the limit, and nothing else
+		if peak := atomic.LoadInt64(&s.budget.peak); peak > 6*cost {
+			t.Fatalf("peak retained %d, want at most the %d budget plus the awaited chunk", peak, 5*cost)
+		}
+	})
+
+	// The awaited chunk is on two legs (a reroute). The first copy stalls after
+	// its header; the whole copy on the other leg must still get in.
+	t.Run("stalledCopyOfTheAwaitedChunkDoesNotShutOutAHealthyOne", func(t *testing.T) {
+		s, peers := newServer(t, 5*cost)
+		ev := readEvents(s)
+		for seq := uint32(1); seq <= 5; seq++ { // fills the budget behind the gap at 0
+			if _, err := peers[0].Write(stripeFrame(seq, payload)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		half := stripeFrame(0, payload)[:headerSize+chunk/2]
+		go peers[0].Write(half) // header and half the payload, then nothing
+		time.Sleep(100 * time.Millisecond)
+		go peers[1].Write(stripeFrame(0, payload))
+		got := 0
+		for got < 6*chunk {
+			select {
+			case e := <-ev:
+				if e.err != nil {
+					t.Fatalf("read: %v (%d/%d bytes)", e.err, got, 6*chunk)
+				}
+				got += len(e.data)
+			case <-time.After(5 * time.Second):
+				t.Fatalf("only %d/%d bytes: the healthy copy of the awaited chunk was shut out", got, 6*chunk)
+			}
+		}
+	})
+
+	t.Run("everyLegAheadOfTheGapFailsPromptly", func(t *testing.T) {
+		s, peers := newServer(t, 5*cost)
+		ev := readEvents(s)
+		for i, p := range peers {
+			go func(first uint32, p net.Conn) {
+				for seq := first; seq < 200; seq += 2 { // 0 never arrives
+					if _, err := p.Write(stripeFrame(seq, payload)); err != nil {
+						return
+					}
+				}
+			}(uint32(i)+1, p)
+		}
 		expectErr(t, ev, "reassembly budget", 2*time.Second) // default stall is 20s: this is the budget
 		if peak := atomic.LoadInt64(&s.budget.peak); peak > 5*cost {
 			t.Fatalf("peak retained %d exceeded the %d budget", peak, 5*cost)

@@ -21,12 +21,12 @@ var (
 // detectConfigType decides whether a config is a server or a client (or
 // neither). A client is recognized by either the single remote_addr or the
 // multi-endpoint remote_addrs list, so a config that only sets remote_addrs is
-// still valid.
+// still valid, and so is one that only lists [[client.servers]].
 func detectConfigType(cfg *config.Config) string {
 	switch {
 	case cfg.Server.BindAddr != "":
 		return "server"
-	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0:
+	case cfg.Client.RemoteAddr != "" || len(cfg.Client.RemoteAddrs) > 0 || len(cfg.Client.Servers) > 0:
 		return "client"
 	// dnsmux has no bind_addr/remote_addr: the server is identified by the
 	// domain it is authoritative for, the client by the domain it tunnels through
@@ -110,6 +110,16 @@ func validateHalfClose(cfg *config.Config, configType string) error {
 	return nil
 }
 
+// validateClientServers checks the [[client.servers]] entries of a multi-server
+// client (see client.ResolveServers). Call after applyDefaults.
+func validateClientServers(cfg *config.Config, configType string) error {
+	if configType != "client" {
+		return nil
+	}
+	_, err := client.ResolveServers(&cfg.Client)
+	return err
+}
+
 func Run(configPath string, ctx context.Context) {
 	// Load and parse the configuration file
 	cfg, err := loadConfig(configPath)
@@ -132,7 +142,9 @@ func Run(configPath string, ctx context.Context) {
 	if configType == "server" && cfg.Server.Token == "" {
 		logger.Fatalf("server 'token' is required: set it in the [server] config (it must match the client's token)")
 	}
-	if configType == "client" && cfg.Client.Token == "" {
+	// A multi-server client may set its tokens per server instead; those are
+	// checked by validateClientServers.
+	if configType == "client" && cfg.Client.Token == "" && len(cfg.Client.Servers) == 0 {
 		logger.Fatalf("client 'token' is required: set it in the [client] config (it must match the server's token)")
 	}
 
@@ -154,6 +166,9 @@ func Run(configPath string, ctx context.Context) {
 		logger.Fatalf("%v", err)
 	}
 	if err := validateDNSMux(cfg, configType); err != nil {
+		logger.Fatalf("%v", err)
+	}
+	if err := validateClientServers(cfg, configType); err != nil {
 		logger.Fatalf("%v", err)
 	}
 

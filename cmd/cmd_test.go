@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/musix/backhaul/config"
+	"github.com/musix/backhaul/internal/client"
 )
 
 func TestDetectConfigType(t *testing.T) {
@@ -28,6 +29,11 @@ func TestDetectConfigType(t *testing.T) {
 		{
 			name: "client by remote_addrs only",
 			cfg:  config.Config{Client: config.ClientConfig{RemoteAddrs: []string{"a:443", "b:443"}}},
+			want: "client",
+		},
+		{
+			name: "client by servers only",
+			cfg:  config.Config{Client: config.ClientConfig{Servers: []config.ClientServer{{RemoteAddr: "a:443"}}}},
 			want: "client",
 		},
 		{
@@ -215,5 +221,74 @@ func TestValidateDNSMuxRejectsUnknownRecordTypes(t *testing.T) {
 	cli.Client.DNSRecordTypes = []string{"txt", "MX"}
 	if err := validateDNSMux(cli, "client"); err != nil {
 		t.Errorf("valid (case-insensitive) record types rejected: %v", err)
+	}
+}
+
+// TestLoadConfigClientServers parses a multi-server client the way Run does
+// (load, defaults, validation) and checks each tunnel's resolved settings,
+// including the per-entry tls_verify: omitted inherits [client], explicit wins.
+func TestLoadConfigClientServers(t *testing.T) {
+	const doc = `
+[client]
+transport = "wssmux"
+token = "shared"
+connection_pool = 4
+
+[[client.servers]]
+name = "de"
+remote_addr = "de.example:443"
+
+[[client.servers]]
+name = "nl"
+remote_addrs = ["nl1.example:443", "nl2.example:443"]
+token = "nl-token"
+tls_verify = false
+`
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(doc), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyDefaults(cfg)
+	if got := detectConfigType(cfg); got != "client" {
+		t.Fatalf("detectConfigType = %q, want client", got)
+	}
+	if err := validateClientServers(cfg, "client"); err != nil {
+		t.Fatalf("validateClientServers: %v", err)
+	}
+	tunnels, err := client.ResolveServers(&cfg.Client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tunnels) != 2 {
+		t.Fatalf("got %d tunnels, want 2", len(tunnels))
+	}
+	de, nl := tunnels[0].Config, tunnels[1].Config
+	if de.Token != "shared" || !de.TLSVerify || de.ConnectionPool != 4 || de.RemoteAddr != "de.example:443" {
+		t.Errorf("de resolved wrong: token=%q tls_verify=%v pool=%d addr=%q", de.Token, de.TLSVerify, de.ConnectionPool, de.RemoteAddr)
+	}
+	if nl.Token != "nl-token" || nl.TLSVerify || len(nl.RemoteAddrs) != 2 {
+		t.Errorf("nl resolved wrong: token=%q tls_verify=%v addrs=%v", nl.Token, nl.TLSVerify, nl.RemoteAddrs)
+	}
+	if !nl.MuxWSFraming || !nl.MuxStealthHandshake {
+		t.Error("loader defaults (framing, stealth handshake) must reach every tunnel")
+	}
+}
+
+func TestValidateClientServersRejectsMixedTopLevelAddr(t *testing.T) {
+	cfg := &config.Config{Client: config.ClientConfig{
+		Transport:  config.WSMUX,
+		Token:      "t",
+		RemoteAddr: "x:443",
+		Servers:    []config.ClientServer{{RemoteAddr: "a:443"}},
+	}}
+	if err := validateClientServers(cfg, "client"); err == nil {
+		t.Fatal("expected an error for remote_addr set alongside servers")
+	}
+	if err := validateClientServers(cfg, "server"); err != nil {
+		t.Fatalf("a server config is never checked: %v", err)
 	}
 }

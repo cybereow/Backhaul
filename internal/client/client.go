@@ -23,6 +23,9 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	logger *logrus.Logger
+	// tunnelLoggers are the per-server loggers of a multi-server client, one per
+	// tunnel (see startServers).
+	tunnelLoggers []*logrus.Logger
 }
 
 func NewClient(cfg *config.ClientConfig, parentCtx context.Context) *Client {
@@ -51,7 +54,11 @@ func (c *Client) Start() {
 	if remoteDisplay == "" && len(c.config.RemoteAddrs) > 0 {
 		remoteDisplay = strings.Join(c.config.RemoteAddrs, ", ")
 	}
-	c.logger.Infof("client with remote address %s started successfully", remoteDisplay)
+	if len(c.config.Servers) > 0 {
+		c.logger.Infof("client with %d servers started successfully", len(c.config.Servers))
+	} else {
+		c.logger.Infof("client with remote address %s started successfully", remoteDisplay)
+	}
 
 	switch c.config.Transport {
 	case config.TCP:
@@ -161,43 +168,11 @@ func (c *Client) Start() {
 		go WsClient.Start()
 
 	case config.WSMUX, config.WSSMUX:
-		wsMuxConfig := &transport.WsMuxConfig{
-			RemoteAddr:           c.config.RemoteAddr,
-			RemoteAddrs:          c.config.RemoteAddrs,
-			EdgeIPs:              c.config.EdgeIPs,
-			Nodelay:              c.config.Nodelay,
-			KeepAlive:            time.Duration(c.config.Keepalive) * time.Second,
-			RetryInterval:        time.Duration(c.config.RetryInterval) * time.Second,
-			DialTimeOut:          time.Duration(c.config.DialTimeout) * time.Second,
-			ConnPoolSize:         c.config.ConnectionPool,
-			Token:                c.config.Token,
-			MuxVersion:           c.config.MuxVersion,
-			MaxFrameSize:         c.config.MaxFrameSize,
-			MaxReceiveBuffer:     c.config.MaxReceiveBuffer,
-			MaxStreamBuffer:      c.config.MaxStreamBuffer,
-			MuxKeepaliveDisabled: c.config.MuxKeepaliveDisabled,
-			StripeFactor:         c.config.StripeFactor,
-			StripeParity:         c.config.StripeParity,
-			SO_RCVBUF:            c.config.SO_RCVBUF,
-			SO_SNDBUF:            c.config.SO_SNDBUF,
-			MSS:                  c.config.MSS,
-			Sniffer:              c.config.Sniffer,
-			WebPort:              c.config.WebPort,
-			SnifferLog:           c.config.SnifferLog,
-			Mode:                 c.config.Transport,
-			AggressivePool:       c.config.AggressivePool,
-			EdgeIP:               c.config.EdgeIP,
-			Path:                 c.config.Path,
-			TLSVerify:            c.config.TLSVerify,
-			WSFraming:            c.config.MuxWSFraming,
-			StealthHandshake:     c.config.MuxStealthHandshake,
-			ResumeWindow:         time.Duration(c.config.ResumeWindow) * time.Second,
+		if len(c.config.Servers) > 0 {
+			c.startServers()
+			break
 		}
-		if c.config.Transport == config.WSSMUX && !c.config.TLSVerify {
-			c.logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
-		}
-		wsMuxClient := transport.NewWSMuxClient(c.ctx, wsMuxConfig, c.logger)
-		go wsMuxClient.Start()
+		c.startWSMux(c.config, c.logger)
 
 	case config.UDP:
 		udpConfig := &transport.UdpConfig{
@@ -225,6 +200,70 @@ func (c *Client) Start() {
 
 	// suppress other logs
 	c.logger.SetLevel(logrus.FatalLevel)
+	for _, l := range c.tunnelLoggers {
+		l.SetLevel(logrus.FatalLevel)
+	}
+}
+
+// startServers runs one independent wsmux/wssmux tunnel per [[client.servers]]
+// entry. Nothing is shared between them but the process context: each has its
+// own control channel, pool, token, restart cycle and logger (a transport mutes
+// its logger while it restarts, so a shared one would silence the others), so a
+// server that is down, slow or restarting never disturbs the rest.
+func (c *Client) startServers() {
+	tunnels, err := ResolveServers(c.config)
+	if err != nil {
+		// cmd.Run validates this before starting; reaching here is a bug.
+		c.logger.Fatalf("%v", err)
+	}
+	for _, t := range tunnels {
+		cfg := t.Config
+		logger := utils.NewPrefixedLogger(cfg.LogLevel, "["+t.Name+"] ")
+		c.tunnelLoggers = append(c.tunnelLoggers, logger)
+		c.logger.Infof("starting tunnel %q to %s", t.Name, strings.Join(tunnelAddrs(cfg), ", "))
+		c.startWSMux(&cfg, logger)
+	}
+}
+
+// startWSMux starts one wsmux/wssmux tunnel described by cfg.
+func (c *Client) startWSMux(cfg *config.ClientConfig, logger *logrus.Logger) {
+	wsMuxConfig := &transport.WsMuxConfig{
+		RemoteAddr:           cfg.RemoteAddr,
+		RemoteAddrs:          cfg.RemoteAddrs,
+		EdgeIPs:              cfg.EdgeIPs,
+		Nodelay:              cfg.Nodelay,
+		KeepAlive:            time.Duration(cfg.Keepalive) * time.Second,
+		RetryInterval:        time.Duration(cfg.RetryInterval) * time.Second,
+		DialTimeOut:          time.Duration(cfg.DialTimeout) * time.Second,
+		ConnPoolSize:         cfg.ConnectionPool,
+		Token:                cfg.Token,
+		MuxVersion:           cfg.MuxVersion,
+		MaxFrameSize:         cfg.MaxFrameSize,
+		MaxReceiveBuffer:     cfg.MaxReceiveBuffer,
+		MaxStreamBuffer:      cfg.MaxStreamBuffer,
+		MuxKeepaliveDisabled: cfg.MuxKeepaliveDisabled,
+		StripeFactor:         cfg.StripeFactor,
+		StripeParity:         cfg.StripeParity,
+		SO_RCVBUF:            cfg.SO_RCVBUF,
+		SO_SNDBUF:            cfg.SO_SNDBUF,
+		MSS:                  cfg.MSS,
+		Sniffer:              cfg.Sniffer,
+		WebPort:              cfg.WebPort,
+		SnifferLog:           cfg.SnifferLog,
+		Mode:                 cfg.Transport,
+		AggressivePool:       cfg.AggressivePool,
+		EdgeIP:               cfg.EdgeIP,
+		Path:                 cfg.Path,
+		TLSVerify:            cfg.TLSVerify,
+		WSFraming:            cfg.MuxWSFraming,
+		StealthHandshake:     cfg.MuxStealthHandshake,
+		ResumeWindow:         time.Duration(cfg.ResumeWindow) * time.Second,
+	}
+	if cfg.Transport == config.WSSMUX && !cfg.TLSVerify {
+		logger.Warn("SECURITY: wssmux server certificate verification is OFF (tls_verify=false); the auth token can be harvested by an on-path party via TLS MITM. Set tls_verify=true once the server presents a verifiable certificate.")
+	}
+	wsMuxClient := transport.NewWSMuxClient(c.ctx, wsMuxConfig, logger)
+	go wsMuxClient.Start()
 }
 func (c *Client) Stop() {
 	if c.cancel != nil {

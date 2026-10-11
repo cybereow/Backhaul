@@ -58,6 +58,9 @@ func RunProbe(configPath string, ctx context.Context) {
 			logger.Fatalf("dns_probe 'responder_listen' is required for the responder role (e.g. \"0.0.0.0:53\")")
 		}
 		resp := dnsx.NewResponder(p.Domain, p.Key, log)
+		if err := resp.SetDecoys(p.Decoys); err != nil {
+			logger.Fatalf("dns_probe 'decoys': %v", err)
+		}
 		if err := resp.Serve(ctx, p.ResponderListen); err != nil {
 			logger.Fatalf("responder failed: %v", err)
 		}
@@ -79,6 +82,7 @@ func runProber(ctx context.Context, p *config.ProbeConfig, log *logrus.Logger) {
 
 	params := dnsx.ProberParams{
 		Domain:      p.Domain,
+		Decoys:      p.Decoys,
 		Key:         p.Key,
 		Resolvers:   resolvers,
 		RRTypes:     rrTypes,
@@ -289,11 +293,11 @@ func printReport(results []dnsx.ProfileResult) {
 		return results[i].SuccessRate > results[j].SuccessRate
 	})
 	fmt.Println()
-	fmt.Printf("%-18s %-5s %-4s %-5s %-6s %8s %8s %5s %6s %6s  %s\n",
-		"RESOLVER", "TYPE", "NET", "EDNS", "OK/N", "Q-THRU", "R-REQ", "R-THRU", "IN", "RTTp50", "NOTE")
+	fmt.Printf("%-18s %-16s %-5s %-4s %-5s %-6s %8s %8s %5s %6s %6s  %s\n",
+		"RESOLVER", "DECOY", "TYPE", "NET", "EDNS", "OK/N", "Q-THRU", "R-REQ", "R-THRU", "IN", "RTTp50", "NOTE")
 	for _, r := range results {
-		fmt.Printf("%-18s %-5s %-4s %-5t %d/%-4d %8d %8d %5d %6s %6d  %s\n",
-			r.Resolver, r.RRType, r.Transport, r.EDNS,
+		fmt.Printf("%-18s %-16s %-5s %-4s %-5t %d/%-4d %8d %8d %5d %6s %6d  %s\n",
+			r.Resolver, orDash(r.Decoy), r.RRType, r.Transport, r.EDNS,
 			r.Successes, r.Attempts,
 			r.QBytesThrough, r.RespBudget, r.RespBytesThrough,
 			orDash(r.InsideTransport), r.RTTp50Ms, r.Err)

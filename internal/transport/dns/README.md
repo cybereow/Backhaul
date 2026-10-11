@@ -83,3 +83,25 @@ smux exactly like `tcpmux`. See `config.dnsmux.example.toml`.
 - **SACK**: `rel.Packet` carries the first out-of-order block (offset+length, 4 bytes) so the peer does not resend bytes that arrived behind a gap; simulated retransmit overhead 11.2% -> 8.5%.
 - **Hedging**: an exchange still unanswered after ~3x the typical round trip (250ms..1.2s) starts one extra exchange (up to `workers` extra in flight), so a resolver that sometimes holds a query ~2s does not idle the workers. Disable with `dns_no_hedge = true`. Real-box A/B (8 workers, 20 KB echo): hedged 602/352 B/s vs plain 503/506 B/s - inconclusive, path noise dominates; the stream is also limited by in-order delivery behind a stalled segment.
 - **Discovery** (`DiscoverResolvers`): candidates (built-in list, configured extras, `dns_resolver_cidrs`) go through a rate-limited reachability sweep (UDP then TCP), then the survivors get a few repeated probes; resolvers are ranked by success^2/(mean RTT) - stalls raise the mean, so flaky ones lose - and the best 8 become the profile set. `dns_resolver_cache` keeps the result for 30 minutes.
+
+## Allow-listed resolvers and hijacking
+
+A recursive resolver routes a query by delegation, so the name must stay under
+your zone; nothing can make it route to you while naming someone else's zone.
+What can differ is what the resolver's allow-list *checks*, so the name can carry
+a decoy while the delegation is unchanged:
+
+- **Decoy label** (`dns_decoys` on the server, `dns_decoy` on the client): queries
+  read `<payload>.<decoy>.<dns_domain>`. The NS delegation is still for
+  `dns_domain`, so the query reaches the responder; a resolver that matches the
+  allow-list loosely (substring, wrong suffix handling) sees the decoy. Every
+  decoy costs QNAME room (less upstream payload per query) and works only if the
+  resolver's check is that loose; it is a per-resolver experiment, not a given.
+- **Finding out what passes**: put `decoys = ["allowed.ir", ...]` in the prober
+  and responder `[dns_probe]` configs. The report gets a `DECOY` column (`-` is the
+  plain domain); rows that reach `ok` are name shapes that resolver lets through.
+- **Hijacked answers**: a reply is accepted only when its MAC and nonce validate.
+  Over UDP the client keeps listening for up to 800 ms after a reply that does not
+  validate (an injected answer wins the race, the real one follows) instead of
+  failing the exchange; REFUSED/SERVFAIL end it at once. TCP profiles are not
+  raced, and `sel` already prefers them.

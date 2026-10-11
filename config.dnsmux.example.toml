@@ -15,6 +15,7 @@ transport = "dnsmux"
 token = "change-me"            # shared token, same on both sides
 dns_domain = "ttt.example.com" # sub-zone delegated to this host
 dns_listen = "0.0.0.0:53"      # authoritative responder (UDP+TCP)
+# dns_decoys = ["allowed.ir"]  # also answer <payload>.allowed.ir.ttt.example.com (see client dns_decoy)
 # dns_key = ""                 # per-query MAC secret; defaults to token (set a different one)
 ports = ["8080=127.0.0.1:80"]  # local listener = target the CLIENT dials
 log_level = "info"
@@ -24,6 +25,7 @@ log_level = "info"
 # transport = "dnsmux"
 # token = "change-me"
 # dns_domain = "ttt.example.com"
+# dns_decoy = "allowed.ir"     # query <payload>.allowed.ir.ttt.example.com: for a resolver whose allow-list matches the name loosely; must be in the server dns_decoys. Find what passes with the prober (decoys = [...])
 # dns_resolvers = []           # empty (or containing "auto") = test a built-in list of Iranian public
 #                              # resolvers at startup and keep the ones that work from here;
 #                              # add your own: ["auto", "1.2.3.4"]; an explicit list disables auto

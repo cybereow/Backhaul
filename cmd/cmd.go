@@ -83,11 +83,20 @@ func validateDNSMux(cfg *config.Config, configType string) error {
 		if cfg.Server.DNSDomain == "" {
 			return fmt.Errorf("server 'dns_domain' is required for the dnsmux transport")
 		}
+		for _, d := range cfg.Server.DNSDecoys {
+			if _, err := dnsx.WithDecoy(cfg.Server.DNSDomain, d); err != nil {
+				return fmt.Errorf("server 'dns_decoys': %w", err)
+			}
+		}
 	case configType == "client" && cfg.Client.Transport == config.DNSMUX:
 		if cfg.Client.DNSDomain == "" {
 			return fmt.Errorf("client 'dns_domain' is required for the dnsmux transport")
 		}
-		if err := dnsx.ValidateRecordTypes(cfg.Client.DNSDomain, cfg.Client.DNSRecordTypes); err != nil {
+		domain, err := dnsx.WithDecoy(cfg.Client.DNSDomain, cfg.Client.DNSDecoy)
+		if err != nil {
+			return fmt.Errorf("client 'dns_decoy': %w", err)
+		}
+		if err := dnsx.ValidateRecordTypes(domain, cfg.Client.DNSRecordTypes); err != nil {
 			return fmt.Errorf("client 'dns_record_types': %w", err)
 		}
 	}

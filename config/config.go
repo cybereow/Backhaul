@@ -58,6 +58,7 @@ type ServerConfig struct {
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`
 	DNSDomain            string        `toml:"dns_domain"`    // dnsmux: tunnel domain this server is authoritative for (NS delegated to this host)
+	DNSDecoys            []string      `toml:"dns_decoys"`    // dnsmux: decoy domains the server also answers as "<payload>.<decoy>.<dns_domain>"; clients pick one with dns_decoy (see the dnsmux README)
 	DNSKey               string        `toml:"dns_key"`       // dnsmux: shared secret for the per-query MAC; falls back to token
 	DNSListen            string        `toml:"dns_listen"`    // dnsmux: UDP+TCP listen address of the authoritative responder (default 0.0.0.0:53)
 	ResumeWindow         int           `toml:"resume_window"` // seconds. wsmux/wssmux with cdn_max_age: how long a flow whose pool connection was cut WITHOUT warning waits to be resumed on another connection before it is dropped. Flows keep their unacknowledged data for this: a ring growing from 256 KiB to 16 MiB for flows that need it, within a 256 MiB process-wide budget. 0 (default) = 30 s; -1 = off (flows only survive the planned moves of cdn_max_age). Needs mux_version >= 2.
@@ -101,6 +102,7 @@ type ClientConfig struct {
 	MuxStealthHandshake  bool          `toml:"mux_stealth_handshake"` // wsmux/wssmux: derive the framing subprotocol and the half-close capability from the auth token instead of the project-named backhaul-mux-v1 / X-Backhaul-Cap, so no handshake string names the project. Enabled by default; servers accept both forms, so upgrade servers before clients, or set false to keep the legacy names. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	DNSDomain            string        `toml:"dns_domain"`
+	DNSDecoy             string        `toml:"dns_decoy"` // dnsmux: put this (e.g. an allow-listed domain) between the payload and dns_domain: "<payload>.<dns_decoy>.<dns_domain>". The server must list it in dns_decoys
 	DNSKey               string        `toml:"dns_key"`
 	DNSResolvers         []string      `toml:"dns_resolvers"`      // dnsmux: recursive resolvers to query (never the authoritative server directly); empty or "auto" = built-in list, tested at startup
 	DNSRecordTypes       []string      `toml:"dns_record_types"`   // dnsmux: limit the RR types tried (default all); the best one is auto-selected
@@ -126,6 +128,12 @@ type ProbeConfig struct {
 	// responder is authoritative for it; the prober encodes payload into QNAMEs
 	// under it. Required.
 	Domain string `toml:"domain"`
+
+	// Decoys are decoy domains placed between the payload and Domain
+	// ("<payload>.<decoy>.<domain>"). Responder: also answer those names.
+	// Prober: additionally try each one (the plain Domain is always tried), to
+	// learn which name shapes a resolver's allow-list lets through.
+	Decoys []string `toml:"decoys"`
 
 	// Key is a shared secret used only to derive a per-query MAC (HMAC-SHA256)
 	// over the nonce+payload, so the token itself never appears on the wire and

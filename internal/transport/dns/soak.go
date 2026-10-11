@@ -145,7 +145,7 @@ func runStream(ctx context.Context, pr *Prober, params SoakParams, s SoakStream,
 		go func() {
 			defer wg.Done()
 			for ctx.Err() == nil {
-				a := pr.probe(ctx, s.Resolver, s.RRType, s.Transport, params.EDNS, s.RespSize)
+				a := pr.probe(ctx, "", s.Resolver, s.RRType, s.Transport, params.EDNS, s.RespSize)
 				// The conn read deadline derives from ctx's and can fire a hair before
 				// ctx.Err() turns non-nil, so also compare against the deadline itself.
 				if dl, ok := ctx.Deadline(); a.stage != StageOK && (ctx.Err() != nil || (ok && !time.Now().Before(dl))) {
@@ -154,7 +154,7 @@ func runStream(ctx context.Context, pr *Prober, params SoakParams, s SoakStream,
 				// A reply shorter than requested (the responder caps at the codec's
 				// capacity) did not carry the requested size: not a success, and the
 				// truncation/capacity failure the integrity counter documents.
-				short := a.stage == StageOK && a.err == "" && (a.qBytes < pr.effectiveQLen() || a.respBytes < s.RespSize)
+				short := a.stage == StageOK && a.err == "" && (a.qBytes < pr.effectiveQLen(pr.domain) || a.respBytes < s.RespSize)
 				if short {
 					a.err = "short payload"
 				}

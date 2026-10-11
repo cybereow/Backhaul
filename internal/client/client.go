@@ -10,6 +10,7 @@ import (
 	"github.com/musix/backhaul/config"
 
 	"github.com/musix/backhaul/internal/client/transport"
+	dnsx "github.com/musix/backhaul/internal/transport/dns"
 
 	"net/http"
 	_ "net/http/pprof"
@@ -103,8 +104,12 @@ func (c *Client) Start() {
 		if dnsKey == "" {
 			dnsKey = c.config.Token
 		}
+		dnsDomain, err := dnsx.WithDecoy(c.config.DNSDomain, c.config.DNSDecoy)
+		if err != nil {
+			c.logger.Fatalf("dnsmux: dns_decoy: %v", err)
+		}
 		dnsMuxClient := transport.NewDnsMuxClient(c.ctx, &transport.DnsMuxConfig{
-			Domain:           c.config.DNSDomain,
+			Domain:           dnsDomain,
 			Key:              dnsKey,
 			Resolvers:        c.config.DNSResolvers,
 			RecordTypes:      c.config.DNSRecordTypes,

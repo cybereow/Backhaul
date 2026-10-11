@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 
@@ -38,6 +39,10 @@ type Responder struct {
 	domain string
 	key    []byte
 	logger *logrus.Logger
+	// decoyZones are "<decoy>.<domain>." suffixes (longest first). A query under
+	// one of them is served exactly like one under domain, with that longer
+	// suffix as its effective domain; see SetDecoys.
+	decoyZones []string
 
 	// Handler is an optional hook for the tunnel session.
 	// If nil, the responder echoes patternBytes (diagnostic mode).
@@ -46,6 +51,47 @@ type Responder struct {
 
 func NewResponder(domain, key string, logger *logrus.Logger) *Responder {
 	return &Responder{domain: dns.Fqdn(domain), key: []byte(key), logger: logger}
+}
+
+// SetDecoys makes the responder also serve "<payload>.<decoy>.<domain>". The
+// decoy is only ever a label sequence in the middle of the name (for example a
+// well-known allowed domain), for resolvers whose allow-list matches loosely:
+// the NS delegation still points at domain, so the query reaches us, while the
+// name carries the decoy. Call it before Serve.
+func (r *Responder) SetDecoys(decoys []string) error {
+	var zones []string
+	seen := map[string]bool{}
+	for _, d := range decoys {
+		d = strings.Trim(strings.TrimSpace(d), ".")
+		if d == "" {
+			continue
+		}
+		z := dns.Fqdn(strings.ToLower(d) + "." + strings.TrimSuffix(r.domain, "."))
+		if _, ok := dns.IsDomainName(z); !ok || len(z) > 253 {
+			return fmt.Errorf("dnsx: decoy %q does not form a valid name under %q", d, r.domain)
+		}
+		if !seen[z] {
+			seen[z] = true
+			zones = append(zones, z)
+		}
+	}
+	sort.SliceStable(zones, func(i, j int) bool { return len(zones[i]) > len(zones[j]) })
+	r.decoyZones = zones
+	return nil
+}
+
+// effectiveDomain is the domain a query name is served under: the longest decoy
+// zone the name falls in, else the plain tunnel domain. Payload decoding and the
+// name-based answer codecs both use it, so the client sees targets under the
+// same suffix it asked about.
+func (r *Responder) effectiveDomain(qname string) string {
+	n := strings.ToLower(dns.Fqdn(qname))
+	for _, z := range r.decoyZones {
+		if n == z || strings.HasSuffix(n, "."+z) {
+			return z
+		}
+	}
+	return r.domain
 }
 
 // Serve listens on addr for both UDP and TCP until ctx is cancelled.
@@ -154,7 +200,8 @@ func (r *Responder) handle(w dns.ResponseWriter, req *dns.Msg) {
 // inTCP is the transport the query arrived on, echoed back so the prober can
 // see the resolver->inside hop.
 func (r *Responder) answer(q dns.Question, inTCP bool, udpSz int) ([]dns.RR, error) {
-	raw, err := decodeName(q.Name, r.domain)
+	domain := r.effectiveDomain(q.Name)
+	raw, err := decodeName(q.Name, domain)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +213,7 @@ func (r *Responder) answer(q dns.Question, inTCP bool, udpSz int) ([]dns.RR, err
 		return nil, err
 	}
 
-	c := codecByType(r.domain, q.Qtype)
+	c := codecByType(domain, q.Qtype)
 	if c == nil {
 		return nil, fmt.Errorf("dnsx: unsupported qtype %s", dns.TypeToString[q.Qtype])
 	}

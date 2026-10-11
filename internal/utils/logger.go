@@ -8,7 +8,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type CustomFormatter struct{}
+type CustomFormatter struct {
+	// Prefix is written in front of every message, e.g. "[server-a] ", so the
+	// lines of several tunnels running in one process can be told apart.
+	Prefix string
+}
 
 func (f *CustomFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	timestamp := entry.Time.Format("02-Jan 15:04:05")
@@ -16,7 +20,7 @@ func (f *CustomFormatter) Format(entry *logrus.Entry) ([]byte, error) {
 	level := strings.ToUpper(entry.Level.String())
 	coloredLevel := f.colorize(entry.Level, level)
 
-	logMessage := fmt.Sprintf("%s [%s] %s\n", timestamp, coloredLevel, entry.Message)
+	logMessage := fmt.Sprintf("%s [%s] %s%s\n", timestamp, coloredLevel, f.Prefix, entry.Message)
 
 	return []byte(logMessage), nil
 }
@@ -56,5 +60,14 @@ func NewLogger(logLevel string) *logrus.Logger {
 
 	log.SetFormatter(&CustomFormatter{})
 
+	return log
+}
+
+// NewPrefixedLogger is NewLogger with prefix in front of every message. Each
+// tunnel of a multi-server client gets its own: a transport changes its
+// logger's level while it restarts, so tunnels must never share one.
+func NewPrefixedLogger(logLevel, prefix string) *logrus.Logger {
+	log := NewLogger(logLevel)
+	log.SetFormatter(&CustomFormatter{Prefix: prefix})
 	return log
 }

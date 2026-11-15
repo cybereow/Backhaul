@@ -131,6 +131,29 @@ func (s *WsMuxTransport) acceptLocalConn(g *wsGeneration, listener net.Listener,
 
 }
 
+// enqueueLocalConn queues conn as a local connection bound for remoteAddr on the
+// client, the same way a user socket accepted on a mapped port is. It reports
+// false (leaving conn to the caller) when the generation has stopped or the
+// queue is full.
+func (s *WsMuxTransport) enqueueLocalConn(g *wsGeneration, localCh chan LocalTCPConn, conn net.Conn, remoteAddr string) bool {
+	if g.ctx.Err() != nil {
+		return false
+	}
+	select {
+	case localCh <- LocalTCPConn{conn: conn, remoteAddr: remoteAddr, timeCreated: acceptStamp(time.Now())}:
+		atomic.AddInt32(&s.streamCounter, 1)
+		if atomic.LoadInt32(&s.streamCounter) >= atomic.LoadInt32(&s.sessionCounter)*int32(s.config.MuxCon) {
+			select {
+			case s.reqNewConnChan <- struct{}{}:
+			default:
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *WsMuxTransport) shouldStripe(incomingConn LocalTCPConn) bool {
 	if len(s.config.StripePorts) > 0 {
 		remotePort := ""

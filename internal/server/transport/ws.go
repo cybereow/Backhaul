@@ -403,6 +403,32 @@ func (s *WsTransport) tunnelListener() {
 	// every probe that reached the listener.
 	expectedAuth := "Bearer " + s.config.Token
 
+	// Non-tunnel requests go to the decoy `fallback` when one is configured. With
+	// neither `ports` nor `fallback`, they are carried through the tunnel to the
+	// same port on the client instead (see bindForwardPort).
+	fallback := s.fallbackProxy
+	if fallback == nil {
+		if port, ok := bindForwardPort(s.config.BindAddr, s.config.Ports, s.config.Fallback); ok {
+			localCh, reqCh := s.localChannel, s.reqNewConnChan
+			fallback = newBindForwardProxy(port, func(conn net.Conn, remoteAddr string) bool {
+				if g.ctx.Err() != nil {
+					return false
+				}
+				select {
+				case localCh <- LocalTCPConn{conn: conn, remoteAddr: remoteAddr, timeCreated: time.Now().UnixMilli()}:
+					select {
+					case reqCh <- struct{}{}:
+					default:
+					}
+					return true
+				default:
+					return false
+				}
+			})
+			s.logger.Infof("ports is empty: non-tunnel requests on %s are forwarded to port %d on the client", addr, port)
+		}
+	}
+
 	// Create an HTTP server
 	server := &http.Server{
 		Addr: addr,
@@ -424,9 +450,9 @@ func (s *WsTransport) tunnelListener() {
 			// rejected as before.
 			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
 			if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) || !isTunnelPath {
-				if s.fallbackProxy != nil {
+				if fallback != nil {
 					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-					s.fallbackProxy.ServeHTTP(w, r)
+					fallback.ServeHTTP(w, r)
 					return
 				}
 				s.logger.Warnf("unauthorized request from %s, closing connection", r.RemoteAddr)

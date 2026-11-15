@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -48,38 +49,83 @@ func (c *pipeLocalConn) LocalAddr() net.Addr  { return c.local }
 func (c *pipeLocalConn) RemoteAddr() net.Addr { return c.remote }
 
 // newBindForwardProxy builds the handler for non-tunnel requests on the bind
-// port. Each upstream connection of the reverse proxy is an in-memory pipe whose
-// far end is handed to enqueue as a local connection destined for the same port
-// on the client, so every existing tunnel feature (pool, striping, resume) is
-// reused as is. enqueue returns false when the connection could not be queued.
+// port. The first request of a connection is replayed into an in-memory pipe
+// whose far end is handed to enqueue as a local connection destined for the same
+// port on the client; from then on the user's socket is spliced to that pipe as
+// raw bytes. So the connection costs one tunnel stream, exactly like a mapped
+// port, and keep-alive, pipelining and WebSocket upgrades all just flow through
+// without a per-request HTTP hop. Every existing tunnel feature (pool, striping,
+// resume) is reused as is. enqueue returns false when the connection could not be
+// queued.
 //
-// The tunnel carries the request as plain HTTP: with wss/wssmux the server has
-// already terminated TLS, so the service behind the client sees decrypted HTTP
-// (WebSocket upgrades are proxied too).
+// The tunnel carries plain HTTP: with wss/wssmux the server has already
+// terminated TLS, so the service behind the client sees decrypted traffic.
 func newBindForwardProxy(port int, enqueue func(conn net.Conn, remoteAddr string) bool) http.Handler {
-	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
 	remoteAddr := strconv.Itoa(port)
+
+	dial := func() (net.Conn, error) {
+		near, far := net.Pipe()
+		lc := &pipeLocalConn{
+			Conn:   far,
+			local:  &net.TCPAddr{IP: net.IPv4zero, Port: port},
+			remote: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0},
+		}
+		if !enqueue(lc, remoteAddr) {
+			near.Close()
+			far.Close()
+			return nil, errors.New("tunnel is busy or not connected")
+		}
+		return near, nil
+	}
+
+	// Used only when the connection cannot be hijacked (HTTP/2): one request per
+	// upstream pipe.
+	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", remoteAddr)}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.Transport = &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			near, far := net.Pipe()
-			lc := &pipeLocalConn{
-				Conn:   far,
-				local:  &net.TCPAddr{IP: net.IPv4zero, Port: port},
-				remote: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0},
-			}
-			if !enqueue(lc, remoteAddr) {
-				near.Close()
-				far.Close()
-				return nil, errors.New("tunnel is busy or not connected")
-			}
-			return near, nil
-		},
+		DialContext:         func(context.Context, string, string) (net.Conn, error) { return dial() },
 		MaxIdleConnsPerHost: 4,
 		IdleConnTimeout:     30 * time.Second,
 	}
 	proxy.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
 		http.Error(w, "bad gateway", http.StatusBadGateway)
 	}
-	return proxy
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			proxy.ServeHTTP(w, r)
+			return
+		}
+		near, err := dial()
+		if err != nil {
+			http.Error(w, "bad gateway", http.StatusBadGateway)
+			return
+		}
+		conn, brw, err := hj.Hijack()
+		if err != nil {
+			near.Close()
+			return
+		}
+		// Request.Write adds a default User-Agent when none is set; an empty value
+		// keeps the request as the user sent it.
+		if _, has := r.Header["User-Agent"]; !has {
+			r.Header["User-Agent"] = []string{""}
+		}
+		_ = near.SetWriteDeadline(time.Now().Add(30 * time.Second))
+		if err := r.Write(near); err != nil {
+			near.Close()
+			conn.Close()
+			return
+		}
+		_ = near.SetWriteDeadline(time.Time{})
+
+		done := make(chan struct{}, 2)
+		go func() { _, _ = io.Copy(near, brw.Reader); done <- struct{}{} }()
+		go func() { _, _ = io.Copy(conn, near); done <- struct{}{} }()
+		<-done
+		near.Close()
+		conn.Close()
+		<-done
+	})
 }

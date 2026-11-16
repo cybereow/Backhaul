@@ -6,8 +6,6 @@ import (
 	"net"
 	"testing"
 	"time"
-
-	"github.com/musix/backhaul/internal/smux"
 )
 
 // A connection whose socket has timed out twice in a row without an
@@ -380,50 +378,5 @@ func TestOverdueEchoIsBelievedOncePerConnection(t *testing.T) {
 	third := now.Add(overdueQuiet + time.Second)
 	if !ps.echoIsOverdue(third.UnixNano(), third.Add(probeSilent)) {
 		t.Fatal("a late echo is still not believed after overdueQuiet")
-	}
-}
-
-// A late echo on a connection that is still delivering frames is what a busy
-// connection looks like, so it is a weak sign: it marks the session, but its flows
-// are only taken off after it has lasted stallMoveAfter.
-func TestLateEchoAloneIsAWeakSign(t *testing.T) {
-	a, b := net.Pipe()
-	defer a.Close()
-	defer b.Close()
-	sess, err := smux.Client(a, lcSmuxConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-	srv, err := smux.Server(b, lcSmuxConfig())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-	// A frame from the peer, so the connection is delivering.
-	if _, err := srv.OpenStream(); err != nil {
-		t.Fatal(err)
-	}
-	lcWaitFor(t, "a frame to arrive", func() bool { return sess.LastRecv() != 0 })
-
-	now := time.Now()
-	ps := &pooledSession{session: sess}
-	ps.rtt.Store(int64(100 * time.Millisecond))
-	// Frames keep arriving (the session was just created, so LastRecv is recent),
-	// and the probe has been out for two probeSilent.
-	ps.probeSent.Store(now.Add(-2 * probeSilent).UnixNano())
-	ps.noteHealth(now, false)
-
-	if ps.sureSince.Load() != 0 {
-		t.Fatal("a late echo alone was taken for a sure stall")
-	}
-	if ps.stalledSince.Load() == 0 {
-		t.Fatal("a late echo did not mark the session at all")
-	}
-	if ps.dueToMove(now.Add(stallMoveAfter / 2)) {
-		t.Fatal("flows are taken off a connection on a late echo alone")
-	}
-	if !ps.dueToMove(now.Add(stallMoveAfter)) {
-		t.Fatal("a late echo that lasted stallMoveAfter does not move the flows")
 	}
 }

@@ -29,9 +29,7 @@ import (
 //     the peer has stopped and the way back has not, or is still emptying what
 //     the CDN held. An echo that late on a connection whose echoes were prompt
 //     is not one held up behind the connection's own traffic - that shows in
-//     the echoes before it. It is also what a busy connection shows when the
-//     echo waits behind the data queued ahead of it, so this sign is not sure
-//     by itself: it has to last stallMoveAfter, like a probe that failed;
+//     the echoes before it;
 //   - an RTT probe that failed some other way.
 //
 // A stalled connection is charged stallPenalty at placement, so nothing new is
@@ -110,23 +108,15 @@ func (ps *pooledSession) echoIsOverdue(sent int64, now time.Time) bool {
 // from its TCP state, together with its RTT probes.
 func (ps *pooledSession) noteHealth(now time.Time, socketStalled bool) {
 	sure := socketStalled
-	late := false
 	if sent := ps.probeSent.Load(); !sure && sent != 0 {
-		sure = echoSilent(sent, ps.session.LastRecv(), now)
-		// A late echo on a connection that is still delivering frames is what a
-		// full connection looks like (the echo waits behind the data queued ahead
-		// of it), so it is not proof of a stall by itself: it has to last
-		// stallMoveAfter. Taking its flows off at once on this sign alone made a
-		// busy connection look stalled, suspended its flows and replayed them,
-		// which showed as the speed collapsing during a transfer.
-		late = !sure && ps.echoIsOverdue(sent, now)
+		sure = echoSilent(sent, ps.session.LastRecv(), now) || ps.echoIsOverdue(sent, now)
 	}
 	if sure {
 		ps.sureSince.CompareAndSwap(0, now.UnixNano())
 	} else {
 		ps.sureSince.Store(0)
 	}
-	if !sure && !late && ps.probeFails.Load() == 0 {
+	if !sure && ps.probeFails.Load() == 0 {
 		ps.stalledSince.Store(0)
 		return
 	}

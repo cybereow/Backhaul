@@ -89,6 +89,13 @@ type Session struct {
 
 	bucket       int32         // token bucket
 	bucketNotify chan struct{} // used for waiting for tokens
+	// The receive budget as shared among the streams (see grant.go): grantSum is
+	// what they have been granted in all (grantMu), activeStreams how many of
+	// them are carrying data.
+	grantMu       sync.Mutex
+	grantSum      int64
+	activeStreams atomic.Int32
+
 	// budgetHalts counts the times the read loop stopped because the bucket was
 	// empty, budgetHaltNs for how long in total (see BudgetHalts).
 	budgetHalts  atomic.Int64
@@ -152,6 +159,9 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	go s.shaperLoop()
 	go s.recvLoop()
 	go s.sendLoop()
+	if config.Version == 2 {
+		go s.grantLoop()
+	}
 	if !config.KeepAliveDisabled {
 		go s.keepalive()
 	}
@@ -374,6 +384,7 @@ func (s *Session) streamClosed(sid uint32) {
 			s.notifyBucket()
 		}
 	}
+	s.grantClose(s.streams[sid])
 	delete(s.streams, sid)
 	s.streamLock.Unlock()
 }

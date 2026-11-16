@@ -72,6 +72,19 @@ type Stream struct {
 	// rcvWindow, when not zero, is this stream's receive window in place of the
 	// session's MaxStreamBuffer (see SetReceiveWindow). Atomic.
 	rcvWindow uint32
+
+	// The stream's part of the session budget (see grant.go). announced is the
+	// window the peer was last told (atomic); the rest belongs to sess.grantMu:
+	// grant is the most the peer may have outstanding, limit the highest position
+	// it was ever allowed to send up to, consumed64 and updConsumed how far the
+	// reader had got at the last update.
+	announced   uint32
+	grant       int64
+	limit       uint64
+	consumed64  uint64
+	updConsumed uint32
+	// lastData is when data last arrived for this stream, in unix nanoseconds.
+	lastData atomic.Int64
 }
 
 // newStream initiates a Stream struct
@@ -85,6 +98,8 @@ func newStream(id uint32, frameSize int, sess *Session) *Stream {
 	s.die = make(chan struct{})
 	s.chFinEvent = make(chan struct{})
 	s.peerWindow = initialPeerWindow // set to initial window size
+	s.lastData.Store(time.Now().UnixNano())
+	sess.grantOpen(s)
 	return s
 }
 
@@ -188,7 +203,7 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 	s.incr += uint32(n)
 
 	// for initial reading, send window update
-	if s.incr >= s.receiveWindow()/windowUpdateDivisor || s.numRead == uint32(n) {
+	if s.incr >= s.updateQuantum() || s.numRead == uint32(n) {
 		notifyConsumed = s.numRead
 		s.incr = 0 // reset couting for next window update
 	}
@@ -265,7 +280,7 @@ func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
 		}
 		s.numRead += uint32(len(buf))
 		s.incr += uint32(len(buf))
-		if s.incr >= s.receiveWindow()/windowUpdateDivisor || s.numRead == uint32(len(buf)) {
+		if s.incr >= s.updateQuantum() || s.numRead == uint32(len(buf)) {
 			notifyConsumed = s.numRead
 			s.incr = 0
 		}
@@ -348,7 +363,7 @@ func (s *Stream) sendWindowUpdate() error {
 	frame := newFrame(byte(s.sess.config.Version), cmdUPD, s.id)
 	var hdr updHeader
 	binary.LittleEndian.PutUint32(hdr[:], consumed)
-	binary.LittleEndian.PutUint32(hdr[4:], s.receiveWindow())
+	binary.LittleEndian.PutUint32(hdr[4:], s.sess.grantWindow(s, consumed, s.receiveWindow()))
 	frame.data = hdr[:]
 	_, err := s.sess.writeFrameInternal(frame, deadline, CLSCTRL)
 	return err
@@ -615,6 +630,7 @@ func (s *Stream) RemoteAddr() net.Addr {
 
 // pushBytes append buf to buffers
 func (s *Stream) pushBytes(buf []byte) (written int, err error) {
+	s.lastData.Store(s.sess.lastRecv.Load()) // recvLoop stamped it for this frame
 	s.bufferLock.Lock()
 	s.buffers = append(s.buffers, buf)
 	s.heads = append(s.heads, buf)

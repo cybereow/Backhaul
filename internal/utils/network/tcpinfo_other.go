@@ -33,6 +33,7 @@ type TCPPath struct {
 	Busy          time.Duration
 	RwndLimited   time.Duration
 	SndbufLimited time.Duration
+	Unread        uint32
 }
 
 // TCPPathInfo needs Linux's TCP_INFO; elsewhere there is nothing to report.

@@ -17,6 +17,7 @@ import (
 
 	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 )
 
 // Member is one pool connection: its socket, the session on it, and how long its
@@ -39,6 +40,9 @@ type sample struct {
 type Reporter struct {
 	role string
 	prev map[*smux.Session]sample
+	// proc is the process's own use at the previous look, procAt when it was taken.
+	proc   proclimits.Usage
+	procAt time.Time
 }
 
 // New returns a Reporter whose lines are marked with role ("server", "client").
@@ -59,6 +63,7 @@ func (r *Reporter) Report(now time.Time, members []Member) (line string, ok bool
 		n, streams, probes  int
 		out, in             float64
 		rtts, unsent, drain []float64
+		unread              []float64
 		rwnd, sndbuf, busy  []float64
 		retrans             uint32
 		halts               int64
@@ -93,6 +98,7 @@ func (r *Reporter) Report(now time.Time, members []Member) (line string, ok bool
 		in += float64(p.BytesRecv-old.path.BytesRecv) / dt.Seconds()
 		rtts = append(rtts, float64(p.RTT.Milliseconds()))
 		unsent = append(unsent, float64(p.NotSent)/1024)
+		unread = append(unread, float64(p.Unread)/1024)
 		if p.DeliveryRate > 0 {
 			drain = append(drain, float64(p.NotSent)/float64(p.DeliveryRate)*1000)
 		}
@@ -105,10 +111,11 @@ func (r *Reporter) Report(now time.Time, members []Member) (line string, ok bool
 		haltMax = max(haltMax, hd-old.halted)
 	}
 	r.prev = next
+	process := r.process(now)
 	if n == 0 || out+in < minRate {
 		return "", false
 	}
-	return fmt.Sprintf("pool health (%s): %d conns, %d streams | out %.1f MB/s, in %.1f MB/s | rtt ms min/med/max %.0f/%.0f/%.0f | unsent KB med/max %.0f/%.0f | est. wait behind unsent ms med/max %.0f/%.0f | held by peer's window %% avg/max %.0f/%.0f | held by own send buffer %% avg/max %.0f/%.0f | busy %% avg %.0f | retrans %d | session budget halts %d (longest %v) | probes waiting %d (oldest %v)",
+	return fmt.Sprintf("pool health (%s): %d conns, %d streams | out %.1f MB/s, in %.1f MB/s | rtt ms min/med/max %.0f/%.0f/%.0f | unsent KB med/max %.0f/%.0f | est. wait behind unsent ms med/max %.0f/%.0f | held by peer's window %% avg/max %.0f/%.0f | held by own send buffer %% avg/max %.0f/%.0f | busy %% avg %.0f | retrans %d | session budget halts %d (longest %v) | probes waiting %d (oldest %v) | unread KB med/max %.0f/%.0f | %s",
 		r.role, n, streams, out/(1<<20), in/(1<<20),
 		minOf(rtts), median(rtts), maxOf(rtts),
 		median(unsent), maxOf(unsent),
@@ -117,7 +124,33 @@ func (r *Reporter) Report(now time.Time, members []Member) (line string, ok bool
 		mean(sndbuf), maxOf(sndbuf),
 		mean(busy), retrans,
 		halts, haltMax.Round(time.Millisecond),
-		probes, probeMax.Round(time.Millisecond)), true
+		probes, probeMax.Round(time.Millisecond),
+		median(unread), maxOf(unread), process), true
+}
+
+// process describes what this process used since the previous look, next to what
+// its container allows. A pool whose sockets are all idle and whose answers are
+// still late is a process that is not getting to run: held back by its CPU quota
+// (throttled), or busy collecting a heap that has reached its memory limit.
+func (r *Reporter) process(now time.Time) string {
+	u, l := proclimits.ReadUsage(), proclimits.Read()
+	old, oldAt := r.proc, r.procAt
+	r.proc, r.procAt = u, now
+	cores := 0.0
+	if dt := now.Sub(oldAt); !oldAt.IsZero() && dt > 0 {
+		cores = float64(u.CPU-old.CPU) / float64(dt)
+	}
+	limit := "no limit"
+	if l.CPUs > 0 {
+		limit = fmt.Sprintf("%.2f allowed", l.CPUs)
+	}
+	mem := "no limit"
+	if l.Memory > 0 {
+		mem = fmt.Sprintf("%d", l.Memory>>20)
+	}
+	return fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
+		cores, limit, u.Throttles-old.Throttles, (u.Throttled - old.Throttled).Round(time.Millisecond),
+		u.Memory>>20, mem, u.Heap>>20, u.Goroutines, u.Procs)
 }
 
 func median(v []float64) float64 {

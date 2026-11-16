@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"runtime"
 
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/client"
@@ -10,6 +11,7 @@ import (
 	"github.com/musix/backhaul/internal/server"
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 
 	"github.com/BurntSushi/toml"
 )
@@ -119,6 +121,19 @@ func Run(configPath string, ctx context.Context) {
 
 	// Apply default values to the configuration
 	applyDefaults(cfg)
+
+	// Size the Go runtime by the container, not by the machine under it.
+	limits := proclimits.Read()
+	procs, heap := proclimits.Apply(limits)
+	if limits.CPUs > 0 || limits.Memory > 0 {
+		logger.Infof("container limits: %.2f CPU core(s), %d MB memory (0 = none); the machine has %d core(s)", limits.CPUs, limits.Memory>>20, runtime.NumCPU())
+	}
+	if procs > 0 {
+		logger.Infof("running on %d thread(s) to stay within the CPU limit", procs)
+	}
+	if heap > 0 {
+		logger.Infof("keeping the heap under %d MB to stay within the memory limit", heap>>20)
+	}
 
 	configType := detectConfigType(cfg)
 	if configType == "" {

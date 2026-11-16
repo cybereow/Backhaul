@@ -96,6 +96,7 @@ type TCPPath struct {
 	Busy          time.Duration // time with data waiting to be sent or acknowledged
 	RwndLimited   time.Duration // of that, time held back by the peer's receive window
 	SndbufLimited time.Duration // of that, time held back by this end's send buffer
+	Unread        uint32        // bytes received and not yet read by this process
 }
 
 // TCPPathInfo reads TCPPath from the TCP connection under c (see TCPDeliveryInfo
@@ -127,6 +128,9 @@ func TCPPathInfo(c net.Conn) (p TCPPath, ok bool) {
 			Busy:          time.Duration(info.Busy_time) * time.Microsecond,
 			RwndLimited:   time.Duration(info.Rwnd_limited) * time.Microsecond,
 			SndbufLimited: time.Duration(info.Sndbuf_limited) * time.Microsecond,
+		}
+		if n, err := unix.IoctlGetInt(int(fd), unix.SIOCINQ); err == nil && n > 0 {
+			p.Unread = uint32(n)
 		}
 		ok = true
 	})

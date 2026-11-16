@@ -1,10 +1,10 @@
 module github.com/musix/backhaul
 
-go 1.24.0
+go 1.26
 
 require (
 	github.com/BurntSushi/toml v1.4.0
-	github.com/gobwas/ws v1.4.0
+	github.com/gobwas/ws v1.5.0
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/libp2p/go-openssl v0.1.0
 	github.com/miekg/dns v1.1.63
@@ -20,7 +20,6 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/go-ole/go-ole v1.2.6 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
-	github.com/gobwas/pool v0.2.1 // indirect
 	github.com/klauspost/compress v1.17.4 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20211012122336-39d0f177ccd0 // indirect

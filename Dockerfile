@@ -3,7 +3,7 @@
 # ---- build stage ----
 # Build on the native builder arch and cross-compile to the target, so
 # multi-arch builds don't run the Go compiler under slow QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /src
 

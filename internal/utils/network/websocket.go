@@ -32,6 +32,11 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
+// UnderlyingConn exposes the socket for read-only inspection (TCP_INFO): see
+// underlyingTCP. It is deliberately not NetConn, which other code takes as leave
+// to act on the socket directly.
+func (b *bufferedConn) UnderlyingConn() net.Conn { return b.Conn }
+
 type WebSocketConn struct {
 	net.Conn
 	state   ws.State

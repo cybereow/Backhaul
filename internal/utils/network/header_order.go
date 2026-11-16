@@ -102,6 +102,10 @@ type orderedUpgradeConn struct {
 	done bool
 }
 
+// UnderlyingConn exposes the socket for read-only inspection (TCP_INFO): see
+// underlyingTCP.
+func (c *orderedUpgradeConn) UnderlyingConn() net.Conn { return c.Conn }
+
 func (c *orderedUpgradeConn) Write(p []byte) (int, error) {
 	if c.done {
 		return c.Conn.Write(p)

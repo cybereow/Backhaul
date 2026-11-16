@@ -15,6 +15,7 @@ import (
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/poolhealth"
 	"github.com/musix/backhaul/internal/utils/striping"
 	"github.com/musix/backhaul/internal/web"
 
@@ -180,6 +181,10 @@ type WsMuxTransport struct {
 	usageMonitor    *web.Usage
 	restartMutex    sync.Mutex
 	poolConnections int32
+	// healthMembers are the live pool sessions with their sockets, for the pool
+	// health line (see healthLoop); healthMu guards it.
+	healthMu      sync.Mutex
+	healthMembers map[*smux.Session]net.Conn
 	// pendingDials counts pool dials that are in flight (dialing, not yet
 	// established). The proactive refill in poolMaintainer subtracts it from the
 	// deficit so a slow CDN handshake isn't dialed over and over each tick while
@@ -448,6 +453,7 @@ func (c *WsMuxTransport) dialOptions() []network.DialOption {
 
 func (c *WsMuxTransport) Start() {
 	g := c.gen
+	go c.healthLoop()
 	if c.config.WebPort > 0 {
 		// A worker, so that Restart waits for the web port to be released before
 		// the next generation's monitor tries to bind it.
@@ -1030,6 +1036,8 @@ func (c *WsMuxTransport) handleSession(tunnelConn *network.WebSocketConn) {
 		session.Close()
 		g.release(session)
 	}()
+	c.healthAdd(session, tunnelConn)
+	defer c.healthRemove(session)
 
 	// run starts a per-stream worker in this generation. Past the stop it runs
 	// nothing and the stream is closed instead.
@@ -1741,4 +1749,48 @@ func (c *WsMuxTransport) handlePromoteStream(stream *smux.Stream, flowID uint64,
 		return
 	}
 	c.logger.Debugf("flow %d promoted to %d striped legs", flowID, len(conns))
+}
+
+func (c *WsMuxTransport) healthAdd(session *smux.Session, conn net.Conn) {
+	c.healthMu.Lock()
+	if c.healthMembers == nil {
+		c.healthMembers = map[*smux.Session]net.Conn{}
+	}
+	c.healthMembers[session] = conn
+	c.healthMu.Unlock()
+}
+
+func (c *WsMuxTransport) healthRemove(session *smux.Session) {
+	c.healthMu.Lock()
+	delete(c.healthMembers, session)
+	c.healthMu.Unlock()
+}
+
+// healthLoop writes, at debug level and only while the pool carries traffic, where
+// the pool's data is waiting on this end (see package poolhealth). It outlives
+// restarts: the registry it reads is emptied and refilled by the sessions
+// themselves.
+func (c *WsMuxTransport) healthLoop() {
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	health := poolhealth.New("client")
+	for {
+		select {
+		case <-c.parentctx.Done():
+			return
+		case now := <-t.C:
+			if !c.logger.IsLevelEnabled(logrus.DebugLevel) {
+				continue
+			}
+			c.healthMu.Lock()
+			members := make([]poolhealth.Member, 0, len(c.healthMembers))
+			for s, conn := range c.healthMembers {
+				members = append(members, poolhealth.Member{Conn: conn, Session: s})
+			}
+			c.healthMu.Unlock()
+			if line, ok := health.Report(now, members); ok {
+				c.logger.Debug(line)
+			}
+		}
+	}
 }

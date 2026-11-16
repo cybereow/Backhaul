@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/poolhealth"
+	"github.com/sirupsen/logrus"
 )
 
 // Capacity-aware placement.
@@ -167,6 +169,9 @@ func capacityPenalty(est, best float64) float64 {
 	return math.Min(best/est, capMaxPenalty)
 }
 
+// healthEvery is how many capacity samples pass between two pool health lines.
+const healthEvery = 2
+
 // capacityLoop samples every pool session once a capSampleEvery and refreshes
 // the penalties. It is the only goroutine that touches the estimates.
 func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
@@ -177,6 +182,9 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 	st := time.NewTicker(stallEvery)
 	defer st.Stop()
 	hosts := make(map[string]*hostCapacity)
+	// Where the pool's data is waiting, once every healthEvery samples while it
+	// carries traffic (debug level only): see package poolhealth.
+	health, tick := poolhealth.New("server"), 0
 	snapshot := func() []*pooledSession {
 		s.sessionsMu.Lock()
 		defer s.sessionsMu.Unlock()
@@ -187,7 +195,21 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 		case <-g.ctx.Done():
 			return
 		case now := <-t.C:
-			sampleCapacity(snapshot(), hosts, now, network.TCPDeliveryInfo)
+			sessions := snapshot()
+			sampleCapacity(sessions, hosts, now, network.TCPDeliveryInfo)
+			if tick++; tick%healthEvery == 0 && s.logger.IsLevelEnabled(logrus.DebugLevel) {
+				members := make([]poolhealth.Member, 0, len(sessions))
+				for _, ps := range sessions {
+					m := poolhealth.Member{Conn: ps.conn, Session: ps.session}
+					if sent := ps.probeSent.Load(); sent != 0 {
+						m.ProbeOut = now.Sub(time.Unix(0, sent))
+					}
+					members = append(members, m)
+				}
+				if line, ok := health.Report(now, members); ok {
+					s.logger.Debug(line)
+				}
+			}
 		case now := <-st.C:
 			sessions := snapshot()
 			for _, ps := range sessions {

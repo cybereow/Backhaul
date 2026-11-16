@@ -197,6 +197,10 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 				}
 				ps.noteHealth(now, ok && d.Backoff >= stallBackoff)
 			}
+			if n := shedSharedLoad(sessions); n > 0 && now.Sub(s.lastShedLog) >= 5*time.Second {
+				s.lastShedLog = now
+				s.logger.Debugf("%d of %d pool connections show only a late echo: taken for load they share, not a stall; their flows stay", n, len(sessions))
+			}
 			s.moveOffStalled(g, sessions, now)
 		}
 	}

@@ -380,3 +380,44 @@ func TestOverdueEchoIsBelievedOncePerConnection(t *testing.T) {
 		t.Fatal("a late echo is still not believed after overdueQuiet")
 	}
 }
+
+// A late echo on most of the pool at once is load they share, so the sign is
+// withdrawn; on a few of them it is kept, and so are the signs that are not about
+// load.
+func TestSharedLoadIsNotAStall(t *testing.T) {
+	now := time.Now()
+	mk := func(late bool) *pooledSession {
+		ps := &pooledSession{}
+		ps.sureSince.Store(now.UnixNano())
+		ps.stalledSince.Store(now.UnixNano())
+		ps.lateOnly.Store(late)
+		return ps
+	}
+
+	few := []*pooledSession{mk(true), mk(false), mk(false), mk(false)}
+	if n := shedSharedLoad(few); n != 0 || few[0].sureSince.Load() == 0 {
+		t.Fatalf("a late echo on one connection of four was withdrawn (shed %d)", n)
+	}
+
+	half := []*pooledSession{mk(true), mk(true), mk(false), mk(false)}
+	if n := shedSharedLoad(half); n != 0 {
+		t.Fatalf("exactly half the pool counts as most of it (shed %d)", n)
+	}
+
+	most := []*pooledSession{mk(true), mk(true), mk(true), mk(false)}
+	silent := most[3] // sure for another reason: not about load
+	if n := shedSharedLoad(most); n != 3 {
+		t.Fatalf("shed %d, want 3", n)
+	}
+	for i, ps := range most[:3] {
+		if ps.sureSince.Load() != 0 || ps.stalledSince.Load() != 0 {
+			t.Fatalf("connection %d still shows the sign after it was withdrawn", i)
+		}
+	}
+	if silent.sureSince.Load() == 0 || silent.stalledSince.Load() == 0 {
+		t.Fatal("a connection whose sign is not a late echo lost it")
+	}
+	if !silent.dueToMove(now) {
+		t.Fatal("a silent connection is no longer due to be cleared")
+	}
+}

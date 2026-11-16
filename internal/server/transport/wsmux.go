@@ -306,6 +306,9 @@ type WsMuxTransport struct {
 	// with no working data path. Set on the initial loss, not on each re-arm.
 	graceStart time.Time
 
+	// lastShedLog paces the log line of shedSharedLoad; capacityLoop alone touches it.
+	lastShedLog time.Time
+
 	// events is a small ring buffer of disruption events (control-channel
 	// losses, restarts, replacements) with timestamps, so an operator can see
 	// *why* a tunnel dropped after the fact via the /diag endpoint instead of

@@ -48,6 +48,9 @@ type pooledSession struct {
 	// overdue, overdueAt when: see echoIsOverdue.
 	overdueSent atomic.Int64
 	overdueAt   atomic.Int64
+	// lateOnly is set while the only thing against the connection is a late echo
+	// (see noteHealth and shedSharedLoad).
+	lateOnly atomic.Bool
 	// reopenCap: the client on this session understands AttachFlagReopen.
 	reopenCap atomic.Bool
 	capEst    atomic.Uint64 // delivery estimate in bytes/s the penalty was computed from; 0 = none

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -97,35 +98,45 @@ func newBindForwardProxy(port int, enqueue func(conn net.Conn, remoteAddr string
 			proxy.ServeHTTP(w, r)
 			return
 		}
-		near, err := dial()
-		if err != nil {
-			http.Error(w, "bad gateway", http.StatusBadGateway)
-			return
-		}
 		conn, brw, err := hj.Hijack()
 		if err != nil {
-			near.Close()
 			return
 		}
-		// Request.Write adds a default User-Agent when none is set; an empty value
-		// keeps the request as the user sent it.
+		// Re-create what the user sent so far: the request just parsed plus
+		// whatever was already buffered behind it. Request.Write adds a default
+		// User-Agent when none is set; an empty value keeps the request as sent.
+		var pre bytes.Buffer
 		if _, has := r.Header["User-Agent"]; !has {
 			r.Header["User-Agent"] = []string{""}
 		}
-		_ = near.SetWriteDeadline(time.Now().Add(30 * time.Second))
-		if err := r.Write(near); err != nil {
-			near.Close()
+		if err := r.Write(&pre); err != nil {
 			conn.Close()
 			return
 		}
-		_ = near.SetWriteDeadline(time.Time{})
-
-		done := make(chan struct{}, 2)
-		go func() { _, _ = io.Copy(near, brw.Reader); done <- struct{}{} }()
-		go func() { _, _ = io.Copy(conn, near); done <- struct{}{} }()
-		<-done
-		near.Close()
-		conn.Close()
-		<-done
+		if n := brw.Reader.Buffered(); n > 0 {
+			rest, _ := brw.Reader.Peek(n)
+			pre.Write(rest)
+		}
+		// The user's own socket goes into the tunnel, like one accepted on a
+		// mapped port; only the replayed prefix is served ahead of it.
+		if !enqueue(&prefixConn{Conn: conn, pre: &pre}, remoteAddr) {
+			_, _ = io.WriteString(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+			conn.Close()
+		}
 	})
+}
+
+// prefixConn serves pre first, then the connection itself. LocalAddr and
+// RemoteAddr are the real socket's, so the flow is labelled with the bind port.
+type prefixConn struct {
+	net.Conn
+	pre *bytes.Buffer
+}
+
+func (c *prefixConn) Read(p []byte) (int, error) {
+	if c.pre != nil && c.pre.Len() > 0 {
+		return c.pre.Read(p)
+	}
+	c.pre = nil
+	return c.Conn.Read(p)
 }

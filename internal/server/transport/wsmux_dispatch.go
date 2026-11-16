@@ -498,6 +498,7 @@ func (s *WsMuxTransport) dispatchPlain(a *setupAttempt) {
 			return
 		}
 		a.releasePermit() // the flow is active: its data transfer holds no setup permit
+		s.logger.Debugf("flow setup to %s took %v since it was queued", incomingConn.remoteAddr, stampAge(incomingConn.timeCreated).Round(time.Microsecond))
 
 		defer atomic.AddInt32(&s.plainFlows, -1)
 		defer atomic.AddInt32(&s.streamCounter, -1)
@@ -622,6 +623,7 @@ func (s *WsMuxTransport) dispatchStriped(a *setupAttempt) {
 			stripedConn = striping.New(conns, striping.DefaultChunkSize)
 		}
 		a.releasePermit() // the flow is active: its data transfer holds no setup permit
+		s.logger.Debugf("striped flow setup to %s took %v since it was queued", incomingConn.remoteAddr, stampAge(incomingConn.timeCreated).Round(time.Microsecond))
 
 		defer atomic.AddInt32(&s.stripedFlows, -1) // hold the slot for the flow's lifetime
 		defer atomic.AddInt32(&s.streamCounter, -1)

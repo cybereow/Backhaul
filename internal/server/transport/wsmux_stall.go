@@ -58,9 +58,6 @@ const (
 	// overdueQuiet: how long after a connection's echo was taken for overdue the
 	// next late echo on it is not (see echoIsOverdue).
 	overdueQuiet = time.Minute
-	// lateEchoConfirm: how long a late echo that is the only sign must hold before
-	// the flows are moved (see dueToMove).
-	lateEchoConfirm = 750 * time.Millisecond
 )
 
 // echoSilent reports the second sign: a probe sent at sent (unix nanos, 0 = none
@@ -135,20 +132,8 @@ func (ps *pooledSession) noteHealth(now time.Time, socketStalled bool) {
 // dueToMove reports whether the session has been stalled long enough, for the
 // sign it shows, for its flows to be taken off it.
 func (ps *pooledSession) dueToMove(now time.Time) bool {
-	if sure := ps.sureSince.Load(); sure != 0 {
-		held := now.Sub(time.Unix(0, sure))
-		// A late echo is the one sure sign that load also produces, and load shows
-		// on the whole pool a moment later (see shedSharedLoad): the first look at
-		// it is too early to tell the two apart, so it is held for lateEchoConfirm.
-		// Moving the first few connections' flows at once started the cascade that
-		// the rule then had to stop.
-		if ps.lateOnly.Load() {
-			if held >= lateEchoConfirm {
-				return true
-			}
-		} else if held >= stallMoveAfterSure {
-			return true
-		}
+	if sure := ps.sureSince.Load(); sure != 0 && now.Sub(time.Unix(0, sure)) >= stallMoveAfterSure {
+		return true
 	}
 	since := ps.stalledSince.Load()
 	return since != 0 && now.Sub(time.Unix(0, since)) >= stallMoveAfter

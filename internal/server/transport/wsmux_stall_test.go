@@ -421,26 +421,3 @@ func TestSharedLoadIsNotAStall(t *testing.T) {
 		t.Fatal("a silent connection is no longer due to be cleared")
 	}
 }
-
-// A late echo that is the only sign is held for lateEchoConfirm before the flows
-// move, since load shows on the rest of the pool a moment later; a socket in
-// backoff or a silent connection is not held at all.
-func TestLateEchoIsHeldBeforeFlowsMove(t *testing.T) {
-	now := time.Now()
-	late, hard := &pooledSession{}, &pooledSession{}
-	for _, ps := range []*pooledSession{late, hard} {
-		ps.sureSince.Store(now.UnixNano())
-		ps.stalledSince.Store(now.UnixNano())
-	}
-	late.lateOnly.Store(true)
-
-	if late.dueToMove(now.Add(lateEchoConfirm - time.Millisecond)) {
-		t.Fatal("a late echo moved the flows before lateEchoConfirm")
-	}
-	if !late.dueToMove(now.Add(lateEchoConfirm)) {
-		t.Fatal("a late echo that held for lateEchoConfirm did not move the flows")
-	}
-	if !hard.dueToMove(now) {
-		t.Fatal("a sign that is not a late echo was held")
-	}
-}

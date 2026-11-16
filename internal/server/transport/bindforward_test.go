@@ -176,3 +176,43 @@ func TestBindForwardStreamsBodies(t *testing.T) {
 		}
 	}
 }
+
+// The user's socket must keep its half-close: after CloseWrite the peer sees EOF
+// but can still be written to, exactly as on a mapped port.
+func TestPrefixConnKeepsHalfClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	peer, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	srv, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	var c net.Conn = &prefixConn{Conn: srv, pre: bytes.NewBufferString("head")}
+	cw, ok := c.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatal("prefixConn has no CloseWrite")
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("peer should see EOF after CloseWrite, got %v", err)
+	}
+	if _, err := peer.Write([]byte("still open")); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, 4+10)
+	if _, err := io.ReadFull(c, got); err != nil || string(got) != "headstill open" {
+		t.Fatalf("read after CloseWrite: %q %v", got, err)
+	}
+}

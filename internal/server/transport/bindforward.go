@@ -141,6 +141,24 @@ type prefixConn struct {
 	pre *bytes.Buffer
 }
 
+// CloseWrite and CloseRead keep the half-close a mapped port's socket has: the
+// pumps send a clean FIN with CloseWrite so the peer can finish what it is still
+// sending; without it they fall back to closing the whole connection, which cuts
+// a proxied exchange short.
+func (c *prefixConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func (c *prefixConn) CloseRead() error {
+	if cr, ok := c.Conn.(interface{ CloseRead() error }); ok {
+		return cr.CloseRead()
+	}
+	return nil
+}
+
 // NetConn exposes the socket underneath, so socket tuning can reach it.
 func (c *prefixConn) NetConn() net.Conn { return c.Conn }
 

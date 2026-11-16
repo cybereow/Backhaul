@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -120,5 +121,58 @@ func TestBindForwardDisabledByPorts(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("got %d, want 401", resp.StatusCode)
+	}
+}
+
+// An upload must stream: the echo of the request head comes back before the body
+// has been sent, and the body arrives byte for byte (Content-Length and chunked).
+func TestBindForwardStreamsBodies(t *testing.T) {
+	for _, chunked := range []bool{false, true} {
+		h := newLCHarness(t, func(c *WsMuxConfig) { c.Ports = nil })
+		h.control()
+		h.pool() // the harness peer echoes every plain flow byte for byte
+
+		const size = 2 << 20
+		body := make([]byte, size)
+		for i := range body {
+			body[i] = byte(i * 7)
+		}
+		head := "POST /up HTTP/1.1\r\nHost: x\r\n"
+		wire := body
+		if chunked {
+			head += "Transfer-Encoding: chunked\r\n\r\n"
+			wire = append([]byte(fmt.Sprintf("%x\r\n", size)), body...)
+			wire = append(wire, []byte("\r\n0\r\n\r\n")...)
+		} else {
+			head += fmt.Sprintf("Content-Length: %d\r\n\r\n", size)
+		}
+
+		c, err := net.Dial("tcp", h.addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+		if _, err := c.Write([]byte(head)); err != nil {
+			t.Fatal(err)
+		}
+		// Head only so far: it must already be echoed back through the tunnel.
+		got := make([]byte, 10)
+		if _, err := io.ReadFull(c, got); err != nil || string(got[:5]) != "POST " {
+			t.Fatalf("chunked=%v: head not forwarded before the body: %q %v", chunked, got, err)
+		}
+		go c.Write(wire)
+		var echoed []byte
+		buf := make([]byte, 64<<10)
+		for !bytes.Contains(echoed, body[size-4096:]) {
+			n, err := c.Read(buf)
+			echoed = append(echoed, buf[:n]...)
+			if err != nil {
+				break
+			}
+		}
+		if !bytes.Contains(echoed, body[size-4096:]) {
+			t.Fatalf("chunked=%v: body tail missing after %d echoed bytes", chunked, len(echoed))
+		}
 	}
 }

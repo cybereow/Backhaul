@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -102,20 +104,26 @@ func newBindForwardProxy(port int, enqueue func(conn net.Conn, remoteAddr string
 		if err != nil {
 			return
 		}
-		// Re-create what the user sent so far: the request just parsed plus
-		// whatever was already buffered behind it. Request.Write adds a default
-		// User-Agent when none is set; an empty value keeps the request as sent.
+		// Re-create the request head exactly as parsed, without touching the body:
+		// the body (and anything pipelined behind it) is still raw bytes in the
+		// server's read buffer and on the socket, so it streams through as is.
+		// Reading it here (Request.Write) would buffer a whole upload in memory
+		// before the first byte reached the tunnel.
 		var pre bytes.Buffer
-		if _, has := r.Header["User-Agent"]; !has {
-			r.Header["User-Agent"] = []string{""}
+		fmt.Fprintf(&pre, "%s %s %s\r\nHost: %s\r\n", r.Method, r.RequestURI, r.Proto, r.Host)
+		_ = r.Header.Write(&pre)
+		for _, te := range r.TransferEncoding {
+			fmt.Fprintf(&pre, "Transfer-Encoding: %s\r\n", te)
 		}
-		if err := r.Write(&pre); err != nil {
-			conn.Close()
-			return
-		}
+		pre.WriteString("\r\n")
 		if n := brw.Reader.Buffered(); n > 0 {
 			rest, _ := brw.Reader.Peek(n)
 			pre.Write(rest)
+		}
+		// The server would have answered "Expect: 100-continue" once the body was
+		// read; nobody reads it here, so say it now or the client waits a second.
+		if strings.EqualFold(r.Header.Get("Expect"), "100-continue") {
+			_, _ = io.WriteString(conn, "HTTP/1.1 100 Continue\r\n\r\n")
 		}
 		// The user's own socket goes into the tunnel, like one accepted on a
 		// mapped port; only the replayed prefix is served ahead of it.

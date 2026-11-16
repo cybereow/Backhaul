@@ -120,15 +120,16 @@ func TestLoneStreamKeepsItsFullWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := io.ReadFull(r, make([]byte, 64<<10)); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.Now().Add(2 * time.Second)
+	go io.Copy(io.Discard, r)
+	// It gets there as it carries data: the window follows what is delivered.
+	deadline := time.Now().Add(3 * time.Second)
 	for atomic.LoadUint32(&w.peerWindow) != stream {
 		if time.Now().After(deadline) {
 			t.Fatalf("the writer was told a window of %d, want the configured %d", atomic.LoadUint32(&w.peerWindow), stream)
 		}
-		time.Sleep(10 * time.Millisecond)
+		if _, err := w.Write(make([]byte, 256<<10)); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -233,7 +234,10 @@ func TestIdleStreamGivesItsWindowBack(t *testing.T) {
 			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	waitFor("the busy stream never got its full window", 2*time.Second, func() bool { return window() == stream })
+	waitFor("the busy stream never got its full window", 3*time.Second, func() bool {
+		send()
+		return window() == stream
+	})
 	waitFor("the idle stream kept its window", idleReclaim+4*grantTick, func() bool { return window() == initialPeerWindow })
 	srv.grantMu.Lock()
 	sum := srv.grantSum
@@ -241,6 +245,57 @@ func TestIdleStreamGivesItsWindowBack(t *testing.T) {
 	if sum != initialPeerWindow {
 		t.Fatalf("an idle stream is still granted %d bytes", sum)
 	}
-	send()
-	waitFor("the stream did not get its window again once it carried data", 2*time.Second, func() bool { return window() == stream })
+	// The window comes back with the data: as fast as the connection is seen to
+	// deliver it.
+	waitFor("the stream did not get its window again once it carried data", 3*time.Second, func() bool {
+		send()
+		return window() == stream
+	})
+}
+
+// What a session grants follows what its connection delivers: a slow connection
+// is not handed a window it would take seconds to carry, a fast one gets the lot.
+func TestBudgetFollowsTheDeliveredRate(t *testing.T) {
+	const session, stream = 64 << 20, 16 << 20
+	cli, srv := grantPair(t, session, stream)
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, r)
+
+	// About 1 MB/s for a while: the budget is what that carries in rateHorizon,
+	// or the floor, nowhere near the 32 MiB the bucket would allow.
+	chunk := make([]byte, 100<<10)
+	for end := time.Now().Add(1500 * time.Millisecond); time.Now().Before(end); {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if b := srv.grantBudget(); b > 2<<20 {
+		t.Fatalf("a connection delivering about 1 MB/s is granted %d bytes", b)
+	}
+	if win := atomic.LoadUint32(&w.peerWindow); win > 2<<20 {
+		t.Fatalf("its stream was given a window of %d bytes", win)
+	}
+
+	// As fast as it goes: the budget grows back to the bucket's share.
+	big := make([]byte, 1<<20)
+	end := time.Now().Add(5 * time.Second)
+	for srv.grantBudget() < session/2 {
+		if time.Now().After(end) {
+			t.Fatalf("a fast connection is still granted only %d bytes", srv.grantBudget())
+		}
+		if _, err := w.Write(big); err != nil {
+			t.Fatal(err)
+		}
+	}
 }

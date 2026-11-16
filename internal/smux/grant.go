@@ -46,6 +46,29 @@ const (
 	// grantTick is how often a session counts the streams carrying data and
 	// takes back the windows of idle ones.
 	grantTick = 500 * time.Millisecond
+
+	// What may be granted also follows what the connection delivers.
+	//
+	// Whatever a peer is allowed to have outstanding it sends, and what the path
+	// cannot carry at once waits in it: in the peer's socket, and in every proxy
+	// between the two ends, each of which takes megabytes before it pushes back.
+	// Everything else on the connection waits behind that - a new flow's first
+	// bytes, a window update, a probe's echo - for (bytes outstanding) / (rate of
+	// the connection). 16 MiB outstanding on a connection that delivers 2.5 MB/s
+	// is six seconds, on every flow that shares it. Windows sized in bytes are, on
+	// a slow connection, a queue measured in seconds.
+	//
+	// So the budget is what the connection was seen to deliver in rateHorizon: a
+	// fast connection is granted as much as before, a slow one only what it can
+	// carry in that time. Twice what arrives leaves room to speed up - the rate
+	// can double every round trip up to rateHorizon/2 long - and bounds what waits
+	// in the path to about rateHorizon of delay.
+	rateTick    = 100 * time.Millisecond
+	rateSamples = 10 // the rate is the highest of this many ticks: a pause does not shrink it at once
+	rateHorizon = 500 * time.Millisecond
+	// rateFloor is the least a session's budget falls to, so that a connection
+	// which has carried nothing can show what it delivers.
+	rateFloor = 1 << 20
 	// idleReclaim: a stream with nothing buffered that has received no data for
 	// this long is taken to have nothing on its way either, and is put back on
 	// the initial window.
@@ -78,7 +101,7 @@ func (s *Session) grantClose(st *Stream) {
 // up to consumed, given the most st would take (limit: its configured or overridden
 // window).
 func (s *Session) grantWindow(st *Stream, consumed uint32, limit uint32) uint32 {
-	budget := int64(s.config.MaxReceiveBuffer) * grantShareNum / grantShareDen
+	budget := s.grantBudget()
 	active := int64(max(1, s.activeStreams.Load()))
 
 	s.grantMu.Lock()
@@ -106,16 +129,46 @@ func (s *Session) grantWindow(st *Stream, consumed uint32, limit uint32) uint32 
 	return uint32(want)
 }
 
-// grantLoop keeps activeStreams current and takes idle streams' windows back.
+// grantBudget is what the streams may be granted in all right now: the share of
+// the bucket set aside for it, or less on a connection that delivers less.
+func (s *Session) grantBudget() int64 {
+	most := int64(s.config.MaxReceiveBuffer) * grantShareNum / grantShareDen
+	// Nothing measured yet is nothing delivered yet: a connection starts on the
+	// floor and is granted more as it shows what it carries.
+	return min(most, max(rateFloor, s.rateBudget.Load()))
+}
+
+// grantLoop keeps the delivered rate and activeStreams current and takes idle
+// streams' windows back.
 func (s *Session) grantLoop() {
-	t := time.NewTicker(grantTick)
+	t := time.NewTicker(rateTick)
 	defer t.Stop()
-	var streams []*Stream
+	var (
+		streams []*Stream
+		samples [rateSamples]int64
+		tick    int
+		seen    = s.rxData.Load()
+		last    = time.Now()
+	)
 	for {
 		select {
 		case <-s.die:
 			return
 		case now := <-t.C:
+			if dt := now.Sub(last); dt > 0 {
+				got := s.rxData.Load()
+				samples[tick%rateSamples] = int64(float64(got-seen) / dt.Seconds())
+				seen, last = got, now
+				rate := int64(0)
+				for _, v := range samples {
+					rate = max(rate, v)
+				}
+				s.rateBudget.Store(max(rateFloor, int64(float64(rate)*rateHorizon.Seconds())))
+			}
+			tick++
+			if tick%int(grantTick/rateTick) != 0 {
+				continue
+			}
 			streams = streams[:0]
 			s.streamLock.Lock()
 			for _, st := range s.streams {

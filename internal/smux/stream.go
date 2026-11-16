@@ -631,6 +631,7 @@ func (s *Stream) RemoteAddr() net.Addr {
 // pushBytes append buf to buffers
 func (s *Stream) pushBytes(buf []byte) (written int, err error) {
 	s.lastData.Store(s.sess.lastRecv.Load()) // recvLoop stamped it for this frame
+	s.sess.rxData.Add(int64(len(buf)))
 	s.bufferLock.Lock()
 	s.buffers = append(s.buffers, buf)
 	s.heads = append(s.heads, buf)

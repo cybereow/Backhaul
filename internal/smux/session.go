@@ -95,6 +95,10 @@ type Session struct {
 	grantMu       sync.Mutex
 	grantSum      int64
 	activeStreams atomic.Int32
+	// rxData counts the stream data received; rateBudget is what the connection
+	// was seen to deliver in rateHorizon (see grant.go).
+	rxData     atomic.Int64
+	rateBudget atomic.Int64
 
 	// budgetHalts counts the times the read loop stopped because the bucket was
 	// empty, budgetHaltNs for how long in total (see BudgetHalts).

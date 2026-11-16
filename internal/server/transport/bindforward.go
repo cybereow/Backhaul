@@ -141,6 +141,9 @@ type prefixConn struct {
 	pre *bytes.Buffer
 }
 
+// NetConn exposes the socket underneath, so socket tuning can reach it.
+func (c *prefixConn) NetConn() net.Conn { return c.Conn }
+
 func (c *prefixConn) Read(p []byte) (int, error) {
 	if c.pre != nil && c.pre.Len() > 0 {
 		return c.pre.Read(p)

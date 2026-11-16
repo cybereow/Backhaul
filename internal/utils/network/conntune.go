@@ -1,7 +1,6 @@
 package network
 
 import (
-	"crypto/tls"
 	"net"
 	"time"
 )
@@ -13,11 +12,11 @@ import (
 // the socket under it; anything that is not TCP underneath is left untouched.
 func TuneUserConn(conn net.Conn, rcvBuf, sndBuf int, nodelay bool, keepAlive time.Duration) {
 	for {
-		tc, ok := conn.(*tls.Conn)
+		w, ok := conn.(interface{ NetConn() net.Conn })
 		if !ok {
 			break
 		}
-		conn = tc.NetConn()
+		conn = w.NetConn()
 	}
 	tcp, ok := conn.(*net.TCPConn)
 	if !ok {

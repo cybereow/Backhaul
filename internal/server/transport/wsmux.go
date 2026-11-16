@@ -736,6 +736,9 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 		if port, ok := bindForwardPort(s.config.BindAddr, s.config.Ports, s.config.Fallback); ok {
 			localCh := s.localChannel
 			fallback = newBindForwardProxy(port, func(conn net.Conn, remoteAddr string) bool {
+				// The socket did not come from a port listener, so give it the
+				// options a mapped port's sockets get.
+				network.TuneUserConn(conn, s.config.SO_RCVBUF, s.config.SO_SNDBUF, s.config.Nodelay, s.config.KeepAlive)
 				return s.enqueueLocalConn(g, localCh, conn, remoteAddr)
 			})
 			s.logger.Infof("ports is empty: non-tunnel requests on %s are forwarded to port %d on the client", addr, port)

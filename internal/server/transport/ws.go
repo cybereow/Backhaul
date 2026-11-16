@@ -411,6 +411,9 @@ func (s *WsTransport) tunnelListener() {
 		if port, ok := bindForwardPort(s.config.BindAddr, s.config.Ports, s.config.Fallback); ok {
 			localCh, reqCh := s.localChannel, s.reqNewConnChan
 			fallback = newBindForwardProxy(port, func(conn net.Conn, remoteAddr string) bool {
+				// The socket did not come from a port listener, so give it the
+				// options a mapped port's sockets get.
+				network.TuneUserConn(conn, 0, 0, s.config.Nodelay, s.config.KeepAlive)
 				if g.ctx.Err() != nil {
 					return false
 				}

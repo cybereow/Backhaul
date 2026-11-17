@@ -164,7 +164,11 @@ func (s *Session) grantWindow(st *Stream, consumed uint32, limit uint32) uint32 
 	want := min(int64(limit), max(grantFloor, budget/active))
 	if want > held {
 		// More than it has now: only out of what the other streams leave.
-		free := budget - (s.grantSum - st.grant)
+		// What the connection is granted at once is what is on its way, so only
+		// the streams carrying data count against the rate-based budget; the
+		// windows idle streams keep are bounded by the bucket's share alone.
+		free := budget - max(0, s.grantSum-s.idleGrant.Load()-st.grant)
+		free = min(free, int64(s.config.MaxReceiveBuffer)*grantShareNum/grantShareDen-(s.grantSum-st.grant))
 		if gb := globalGrantBudget.Load(); gb > 0 {
 			free = min(free, gb-(globalGranted.Load()-st.grant))
 		}
@@ -231,6 +235,7 @@ func (s *Session) grantLoop() {
 			s.streamLock.Unlock()
 
 			active := int32(0)
+			idle := streams[:0:0]
 			for _, st := range streams {
 				st.bufferLock.Lock()
 				buffered := len(st.buffers) > 0
@@ -241,8 +246,16 @@ func (s *Session) grantLoop() {
 					continue
 				}
 				st.reclaimWindow()
+				idle = append(idle, st)
 			}
 			s.activeStreams.Store(active)
+			s.grantMu.Lock()
+			held := int64(0)
+			for _, st := range idle {
+				held += st.grant
+			}
+			s.grantMu.Unlock()
+			s.idleGrant.Store(held)
 		}
 	}
 }

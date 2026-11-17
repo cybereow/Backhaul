@@ -96,6 +96,8 @@ type Session struct {
 	grantSum      int64
 	grantDead     bool // the session has ended and given its grants back (releaseGrants)
 	activeStreams atomic.Int32
+	// idleGrant is the part of grantSum held by streams that are idle (see grantLoop).
+	idleGrant atomic.Int64
 	// rxData counts the stream data received; rateBudget is what the connection
 	// was seen to deliver in rateHorizon (see grant.go).
 	rxData     atomic.Int64

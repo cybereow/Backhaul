@@ -378,3 +378,58 @@ func TestGlobalGrantBudgetBoundsAllSessions(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 }
+
+// Streams that sit idle keep the window they were last given (at least the
+// initial one), and that must not count against the streams that are carrying
+// data: with many open streams the idle ones' windows alone exceed what a slow
+// connection is granted, which pinned every busy stream at the floor, which kept
+// the connection slow, which kept the budget low.
+func TestIdleStreamsDoNotPinBusyOnesAtTheFloor(t *testing.T) {
+	const session, stream = 64 << 20, 16 << 20
+	cli, srv := grantPair(t, session, stream)
+	var idle []*Stream
+	for i := 0; i < 40; i++ {
+		c, err := cli.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		s, err := srv.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(s, b); err != nil {
+			t.Fatal(err)
+		}
+		idle = append(idle, c)
+	}
+	_ = idle
+	time.Sleep(idleReclaim + time.Second) // quiet: nothing buffered, nothing arriving
+
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, r)
+
+	chunk := make([]byte, 100<<10) // about 1 MB/s, as a slow connection delivers
+	for end := time.Now().Add(2500 * time.Millisecond); time.Now().Before(end); {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if win := atomic.LoadUint32(&w.peerWindow); win < 256<<10 {
+		t.Fatalf("the only busy stream of 41 was left on a window of %d bytes", win)
+	}
+}

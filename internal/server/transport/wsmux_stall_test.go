@@ -421,3 +421,37 @@ func TestSharedLoadIsNotAStall(t *testing.T) {
 		t.Fatal("a silent connection is no longer due to be cleared")
 	}
 }
+
+// A process that has not been getting its CPU time answers late, and a late
+// answer is not a sign about the connection: nothing is moved for it. The
+// kernel's own view of the socket still counts.
+func TestStarvedProcessDoesNotTakeItsOwnLatenessForAStall(t *testing.T) {
+	old := processStarved
+	defer func() { processStarved = old }()
+	now := time.Now()
+
+	processStarved = func(time.Time) bool { return false }
+	quiet := &pooledSession{}
+	quiet.probeFails.Store(2)
+	quiet.noteHealth(now, false)
+	if quiet.stalledSince.Load() == 0 {
+		t.Fatal("without starvation, failing probes did not mark the connection (the test would prove nothing)")
+	}
+
+	processStarved = func(time.Time) bool { return true }
+	starved := &pooledSession{}
+	starved.probeFails.Store(2)
+	starved.sureSince.Store(now.UnixNano())
+	starved.stalledSince.Store(now.UnixNano())
+	starved.lateOnly.Store(true)
+	starved.noteHealth(now, false)
+	if starved.stalledSince.Load() != 0 || starved.sureSince.Load() != 0 || starved.dueToMove(now.Add(time.Minute)) {
+		t.Fatal("a starved process took failing probes for a stalled connection")
+	}
+
+	backoff := &pooledSession{}
+	backoff.noteHealth(now, true)
+	if backoff.sureSince.Load() == 0 || !backoff.dueToMove(now) {
+		t.Fatal("a socket in TCP backoff stopped counting while the process was starved")
+	}
+}

@@ -148,8 +148,9 @@ func (r *Reporter) process(now time.Time) string {
 	if l.Memory > 0 {
 		mem = fmt.Sprintf("%d", l.Memory>>20)
 	}
-	return fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
+	return fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, longest wait for a CPU %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
 		cores, limit, u.Throttles-old.Throttles, (u.Throttled - old.Throttled).Round(time.Millisecond),
+		proclimits.Sched.Delay().Round(time.Millisecond),
 		u.Memory>>20, mem, u.Heap>>20, u.Goroutines, u.Procs)
 }
 

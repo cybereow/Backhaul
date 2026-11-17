@@ -8,6 +8,7 @@ import (
 
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/utils/poolhealth"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 	"github.com/sirupsen/logrus"
 )
 
@@ -177,6 +178,9 @@ const healthEvery = 2
 func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 	t := time.NewTicker(capSampleEvery)
 	defer t.Stop()
+	// How late this process's own timers fire: a stall is judged from late answers,
+	// and a process that is not getting its CPU time answers late (see noteHealth).
+	proclimits.Sched.Start(g.ctx)
 	// Stalls are looked for more often than capacity is sampled: every look that
 	// is late is that much longer a flow sits on a connection that has stopped.
 	st := time.NewTicker(stallEvery)

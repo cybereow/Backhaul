@@ -3,6 +3,8 @@ package transport
 import (
 	"fmt"
 	"time"
+
+	"github.com/musix/backhaul/internal/utils/proclimits"
 )
 
 // A pool connection that has stopped getting through.
@@ -104,11 +106,30 @@ func (ps *pooledSession) echoIsOverdue(sent int64, now time.Time) bool {
 	return true
 }
 
+// processStarved reports whether this process has recently been kept from running
+// (see package proclimits). A variable so that a test can say it was.
+var processStarved = func(now time.Time) bool { return proclimits.Sched.Starved(now) }
+
 // noteHealth records what the latest look at the session showed: socketStalled
 // from its TCP state, together with its RTT probes.
 func (ps *pooledSession) noteHealth(now time.Time, socketStalled bool) {
 	sure := socketStalled
 	lateOnly := false
+	// A probe is answered by this process and by the peer's: when this one has
+	// not been getting its CPU time, a probe that is late says nothing about the
+	// connection - it was this end that was late to read the echo - and only the
+	// kernel's own view of the socket (its backoff) can still be believed.
+	if processStarved(now) {
+		ps.lateOnly.Store(false)
+		if sure {
+			ps.sureSince.CompareAndSwap(0, now.UnixNano())
+			ps.stalledSince.CompareAndSwap(0, now.UnixNano())
+		} else {
+			ps.sureSince.Store(0)
+			ps.stalledSince.Store(0)
+		}
+		return
+	}
 	if sent := ps.probeSent.Load(); !sure && sent != 0 {
 		if echoSilent(sent, ps.session.LastRecv(), now) {
 			sure = true

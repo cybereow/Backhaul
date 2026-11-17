@@ -3,6 +3,7 @@ package smux
 import (
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -431,5 +432,28 @@ func TestIdleStreamsDoNotPinBusyOnesAtTheFloor(t *testing.T) {
 	}
 	if win := atomic.LoadUint32(&w.peerWindow); win < 256<<10 {
 		t.Fatalf("the only busy stream of 41 was left on a window of %d bytes", win)
+	}
+}
+
+func TestStallReportNamesAWriterWaitingForWindow(t *testing.T) {
+	cli, srv := grantPair(t, 4<<20, 256<<10)
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.AcceptStream(); err != nil { // nobody reads it
+		t.Fatal(err)
+	}
+	go w.Write(make([]byte, 8<<20)) // far more than the window
+	time.Sleep(600 * time.Millisecond)
+	rep := StallReport(300*time.Millisecond, 4)
+	if !strings.Contains(rep, "writers held up: stream") || !strings.Contains(rep, "KB outstanding") {
+		t.Fatalf("report = %q", rep)
+	}
+	if StallReport(time.Hour, 4) != "" {
+		t.Fatal("a report was made for waits that have not lasted that long")
 	}
 }

@@ -162,6 +162,9 @@ func (r *Reporter) process(now time.Time) string {
 	winWaiting, winWaited := smux.WindowGauges()
 	replay += fmt.Sprintf(" | smux: %d writers waiting for the peer's window (%v waited since the last line)", winWaiting, (winWaited - r.windowWaited).Round(time.Millisecond))
 	r.windowWaited = winWaited
+	if rep := smux.StallReport(2*time.Second, 4); rep != "" {
+		replay += " | " + rep
+	}
 	ar, tw, tr, aw := handlers.PumpWaits()
 	cur := [4]time.Duration{ar, tw, tr, aw}
 	replay += fmt.Sprintf(" | flows spent (all flows together, since the last line) reading the app %v, writing the tunnel %v, reading the tunnel %v, writing the app %v",

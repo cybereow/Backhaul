@@ -153,6 +153,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.bucketNotify = make(chan struct{}, 1)
 	s.shaper = make(chan writeRequest)
 	s.writes = make(chan writeRequest)
+	liveSessions.Store(s, struct{}{})
 	s.chSocketReadError = make(chan struct{})
 	s.chSocketWriteError = make(chan struct{})
 	s.chProtoError = make(chan struct{})
@@ -290,6 +291,7 @@ func (s *Session) Close() error {
 	})
 
 	if once {
+		liveSessions.Delete(s)
 		s.streamLock.Lock()
 		for k := range s.streams {
 			s.streams[k].sessionClose()

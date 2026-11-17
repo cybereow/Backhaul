@@ -69,6 +69,12 @@ type Stream struct {
 
 	updLock sync.Mutex // orders window updates, see sendWindowUpdate
 
+	// For the stall report (see report.go): when the writer began waiting for
+	// the peer's window (0 = not waiting) and when the peer's last window update
+	// arrived, both as UnixNano.
+	waitSince atomic.Int64
+	lastUpd   atomic.Int64
+
 	// rcvWindow, when not zero, is this stream's receive window in place of the
 	// session's MaxStreamBuffer (see SetReceiveWindow). Atomic.
 	rcvWindow uint32
@@ -527,7 +533,9 @@ func (s *Stream) writeV2(b []byte) (n int, err error) {
 		if len(b) > 0 {
 			waitStart := time.Now()
 			windowWaiting.Add(1)
+			s.waitSince.Store(waitStart.UnixNano())
 			endWait := func() {
+				s.waitSince.Store(0)
 				windowWaiting.Add(-1)
 				windowWaitNs.Add(int64(time.Since(waitStart)))
 			}
@@ -675,6 +683,7 @@ func (s *Stream) notifyReadEvent() {
 func (s *Stream) update(consumed uint32, window uint32) {
 	atomic.StoreUint32(&s.peerConsumed, consumed)
 	atomic.StoreUint32(&s.peerWindow, window)
+	s.lastUpd.Store(time.Now().UnixNano())
 	select {
 	case s.chUpdate <- struct{}{}:
 	default:

@@ -742,7 +742,9 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 					n, err = pend, srcErr
 					pend, srcErr = 0, nil
 				} else {
+					t0 := time.Now()
 					n, err = app.Read(buf)
+					pumpWait[waitAppRead].Add(int64(time.Since(t0)))
 				}
 				if n > 0 {
 					interrupted := false
@@ -765,7 +767,9 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 						}
 					}
 					if !interrupted {
+						t1 := time.Now()
 						w, werr := writeFull(dst, full[:n])
+						pumpWait[waitTunnelWrite].Add(int64(time.Since(t1)))
 						p.upBytes.Add(uint64(w))
 						if sniffer {
 							usage.AddOrUpdatePort(remotePort, uint64(n))
@@ -910,9 +914,13 @@ dl:
 					toRead = int(rem)
 				}
 			}
+			t0 := time.Now()
 			n, err := src.Read(buf[:toRead])
+			pumpWait[waitTunnelRead].Add(int64(time.Since(t0)))
 			if n > 0 {
+				t1 := time.Now()
 				w, werr := writeFull(app, buf[:n])
+				pumpWait[waitAppWrite].Add(int64(time.Since(t1)))
 				p.dlBytes.Add(uint64(w))
 				if sniffer {
 					usage.AddOrUpdatePort(remotePort, uint64(n))
@@ -1345,4 +1353,26 @@ func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
 			return false, false
 		}
 	}
+}
+
+// Where the time of a flow's pumps goes, summed over every flow of the process,
+// for the pool health line. A pump spends its time in one of four calls, and
+// which one it waits in says who holds the flow back: the user or the local
+// service (reading from, or writing to, the application socket), or the tunnel
+// (reading from, or writing to, it - which blocks on the peer's window).
+const (
+	waitAppRead = iota
+	waitTunnelWrite
+	waitTunnelRead
+	waitAppWrite
+	numWaits
+)
+
+var pumpWait [numWaits]atomic.Int64
+
+// PumpWaits are the totals so far, in the order: reading the application socket,
+// writing the tunnel, reading the tunnel, writing the application socket.
+func PumpWaits() (appRead, tunnelWrite, tunnelRead, appWrite time.Duration) {
+	return time.Duration(pumpWait[waitAppRead].Load()), time.Duration(pumpWait[waitTunnelWrite].Load()),
+		time.Duration(pumpWait[waitTunnelRead].Load()), time.Duration(pumpWait[waitAppWrite].Load())
 }

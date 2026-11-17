@@ -110,3 +110,19 @@ func TestApply(t *testing.T) {
 		t.Fatalf("operator settings overridden: %d threads, %d bytes", procs, heap)
 	}
 }
+
+func TestSocketBufferCap(t *testing.T) {
+	for _, c := range []struct {
+		mem  int64
+		want int
+	}{
+		{0, 0},                // no limit: left alone
+		{64 << 20, 512 << 10}, // never less than half a megabyte
+		{190 << 20, (190 << 20) / 128},
+		{64 << 30, 8 << 20}, // never more than 8 MiB
+	} {
+		if got := socketBufferCap(c.mem); got != c.want {
+			t.Errorf("socketBufferCap(%d MiB) = %d, want %d", c.mem>>20, got, c.want)
+		}
+	}
+}

@@ -47,6 +47,7 @@ type Reporter struct {
 	// the replay budget's refusals at the previous look
 	replayOpenRefused, replayGrowRefused int
 	replayWaited, windowWaited           time.Duration
+	pumpWaits                            [4]time.Duration
 }
 
 // New returns a Reporter whose lines are marked with role ("server", "client").
@@ -161,6 +162,12 @@ func (r *Reporter) process(now time.Time) string {
 	winWaiting, winWaited := smux.WindowGauges()
 	replay += fmt.Sprintf(" | smux: %d writers waiting for the peer's window (%v waited since the last line)", winWaiting, (winWaited - r.windowWaited).Round(time.Millisecond))
 	r.windowWaited = winWaited
+	ar, tw, tr, aw := handlers.PumpWaits()
+	cur := [4]time.Duration{ar, tw, tr, aw}
+	replay += fmt.Sprintf(" | flows spent (all flows together, since the last line) reading the app %v, writing the tunnel %v, reading the tunnel %v, writing the app %v",
+		(cur[0] - r.pumpWaits[0]).Round(time.Millisecond), (cur[1] - r.pumpWaits[1]).Round(time.Millisecond),
+		(cur[2] - r.pumpWaits[2]).Round(time.Millisecond), (cur[3] - r.pumpWaits[3]).Round(time.Millisecond))
+	r.pumpWaits = cur
 	r.replayOpenRefused, r.replayGrowRefused = rs.OpenRefused, rs.GrowRefused
 	return replay + " | " + fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, longest wait for a CPU %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
 		cores, limit, u.Throttles-old.Throttles, (u.Throttled-old.Throttled).Round(time.Millisecond),

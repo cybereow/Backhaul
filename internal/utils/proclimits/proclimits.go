@@ -175,3 +175,18 @@ func HeapLimit() int64 {
 	}
 	return l
 }
+
+// SocketBufferCap is the most one tunnel socket may be allowed to buffer in the
+// kernel, each way, when the container's memory is limited: a share of it that
+// leaves room for the pool's many sockets and for everything else the process
+// holds. 0 when there is no limit.
+func SocketBufferCap() int {
+	return socketBufferCap(Read().Memory)
+}
+
+func socketBufferCap(memory int64) int {
+	if memory <= 0 {
+		return 0
+	}
+	return int(max(512<<10, min(memory/128, 8<<20)))
+}

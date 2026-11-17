@@ -94,6 +94,7 @@ type Session struct {
 	// them are carrying data.
 	grantMu       sync.Mutex
 	grantSum      int64
+	grantDead     bool // the session has ended and given its grants back (releaseGrants)
 	activeStreams atomic.Int32
 	// rxData counts the stream data received; rateBudget is what the connection
 	// was seen to deliver in rateHorizon (see grant.go).

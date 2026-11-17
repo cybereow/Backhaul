@@ -18,6 +18,7 @@ import (
 	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -1000,8 +1001,21 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			if noControl {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				s.logger.Fatalf("failed to listen on %s: %v", addr, err)
+			var serveErr error
+			if bufCap := proclimits.SocketBufferCap(); bufCap > 0 {
+				// A container with a memory limit: the buffers of every tunnel socket
+				// are held to a share of it (see network.ListenCapped).
+				s.logger.Infof("tunnel sockets are held to %d KB of kernel buffer each way to fit the memory limit", bufCap>>10)
+				ln, err := network.ListenCapped(addr, bufCap, bufCap)
+				if err != nil {
+					s.logger.Fatalf("failed to listen on %s: %v", addr, err)
+				}
+				serveErr = server.Serve(ln)
+			} else {
+				serveErr = server.ListenAndServe()
+			}
+			if serveErr != nil && serveErr != http.ErrServerClosed {
+				s.logger.Fatalf("failed to listen on %s: %v", addr, serveErr)
 			}
 		})
 	} else {
@@ -1019,7 +1033,18 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
 			sndBuf, sndForce := s.tunnelLegSendBuf()
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, sndBuf, sndForce)
+			rcvBuf := s.config.SO_RCVBUF
+			if bufCap := proclimits.SocketBufferCap(); bufCap > 0 {
+				// Held to a share of the container's memory (see network.ListenCapped).
+				if rcvBuf == 0 || rcvBuf > bufCap {
+					rcvBuf = bufCap
+				}
+				if sndBuf == 0 || sndBuf > bufCap {
+					sndBuf, sndForce = bufCap, false
+				}
+				s.logger.Infof("tunnel sockets are held to %d KB of kernel buffer each way to fit the memory limit", bufCap>>10)
+			}
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, rcvBuf, sndBuf, sndForce)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}

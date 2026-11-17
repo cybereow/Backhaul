@@ -11,6 +11,7 @@ import (
 	"github.com/musix/backhaul/internal/client"
 
 	"github.com/musix/backhaul/internal/server"
+	"github.com/musix/backhaul/internal/smux"
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/handlers"
@@ -144,6 +145,12 @@ func Run(configPath string, ctx context.Context) {
 	if total := handlers.ReplayBudgetFor(proclimits.HeapLimit()); total < handlers.ReplayBudgetTotal {
 		handlers.DefaultReplayBudget.SetTotal(total)
 		logger.Infof("replay buffers of all flows are held to %d MB to fit the heap limit", total>>20)
+	}
+	// So does what the streams of all sessions together may be granted to have in
+	// flight: sessions are limited one by one, and sixteen of them are not.
+	if hl := proclimits.HeapLimit(); hl > 0 {
+		smux.SetGlobalGrantBudget(hl / 4)
+		logger.Infof("receive windows of all streams together are held to %d MB to fit the heap limit", (hl/4)>>20)
 	}
 	if v := os.Getenv("BACKHAUL_REPLAY_MB"); v != "" {
 		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {

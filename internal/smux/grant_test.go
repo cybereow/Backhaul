@@ -299,3 +299,82 @@ func TestBudgetFollowsTheDeliveredRate(t *testing.T) {
 		}
 	}
 }
+
+// What every session of a process may be granted is bounded as a whole, and a
+// session that ends gives its share back.
+func TestGlobalGrantBudgetBoundsAllSessions(t *testing.T) {
+	// 32 streams (16 on each end) start with their initial windows: 8 MiB. The
+	// budget leaves room beyond that for the busy ones, and no more.
+	const global = 12 << 20
+	// Whatever earlier tests' sessions still hold is given back as they end.
+	for end := time.Now().Add(5 * time.Second); GlobalGranted() != 0 && time.Now().Before(end); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	SetGlobalGrantBudget(global)
+	defer SetGlobalGrantBudget(0)
+	base := GlobalGranted()
+
+	var servers []*Session
+	var clients []*Session
+	for p := 0; p < 4; p++ {
+		cli, srv := grantPair(t, 16<<20, 8<<20)
+		// Connections that deliver a lot: each session's own budget is its whole half-bucket.
+		cli.rateBudget.Store(1 << 30)
+		srv.rateBudget.Store(1 << 30)
+		clients, servers = append(clients, cli), append(servers, srv)
+		for i := 0; i < 4; i++ {
+			w, err := cli.OpenStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(make([]byte, 128<<10)); err != nil {
+				t.Fatal(err)
+			}
+			r, err := srv.AcceptStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(r, make([]byte, 128<<10)); err != nil {
+				t.Fatal(err)
+			}
+			go func() { // sends all it is allowed to; its reader stops
+				buf := make([]byte, 64<<10)
+				for {
+					if _, err := w.Write(buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}
+	time.Sleep(2 * time.Second)
+
+	// A stream that opens when the budget is spent still starts on the initial
+	// window its peer assumes, so those come on top; without the limit every
+	// session grants its own half-bucket to its streams, and this is several
+	// times higher.
+	granted := GlobalGranted() - base
+	if granted > global+32*initialPeerWindow {
+		t.Fatalf("%d bytes granted in all, with a budget of %d", granted, global)
+	}
+	var sum int64
+	for _, sess := range append(append([]*Session(nil), servers...), clients...) {
+		sess.grantMu.Lock()
+		sum += sess.grantSum
+		sess.grantMu.Unlock()
+	}
+	if sum != granted {
+		t.Fatalf("the sessions say %d, the process %d", sum, granted)
+	}
+
+	for _, s := range append(clients, servers...) {
+		s.Close()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for GlobalGranted() != base {
+		if time.Now().After(deadline) {
+			t.Fatalf("ended sessions still hold %d bytes of the budget", GlobalGranted()-base)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

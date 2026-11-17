@@ -2,6 +2,7 @@ package smux
 
 import (
 	"encoding/binary"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -75,6 +76,49 @@ const (
 	idleReclaim = 3 * time.Second
 )
 
+// The process-wide limit. Every session shares the process's memory, and a
+// server on a few hundred megabytes cannot afford what each of sixteen sessions
+// may be granted: with 16 of them each granted a share of 32 MiB, the streams of a
+// busy pool could hold more than the process has - and a process that is full is
+// not slow, it is stopped (the heap sits at its limit and the collector runs all
+// the time, until the container is killed). SetGlobalGrantBudget bounds what all
+// the streams of all sessions are granted at once; a stream still always keeps
+// its grantFloor, so none stops, but a busy one gets more only out of what is
+// left. 0 (the default) is no limit.
+var (
+	globalGrantBudget atomic.Int64
+	globalGranted     atomic.Int64
+	globalGrantMu     sync.Mutex
+)
+
+// SetGlobalGrantBudget sets the most the streams of all sessions together may be
+// granted to have outstanding (0 = no limit). It is meant to be set once, at
+// start.
+func SetGlobalGrantBudget(n int64) { globalGrantBudget.Store(max(n, 0)) }
+
+// GlobalGranted is what the streams of all sessions are granted now.
+func GlobalGranted() int64 { return globalGranted.Load() }
+
+// addGrant moves the session's grant sum, and the process's with it. The caller
+// holds grantMu.
+func (s *Session) addGrant(delta int64) {
+	s.grantSum += delta
+	if !s.grantDead {
+		globalGranted.Add(delta)
+	}
+}
+
+// releaseGrants gives everything this session was granted back to the process's
+// budget when the session ends: its streams may never be closed one by one.
+func (s *Session) releaseGrants() {
+	s.grantMu.Lock()
+	if !s.grantDead {
+		globalGranted.Add(-s.grantSum)
+		s.grantDead = true
+	}
+	s.grantMu.Unlock()
+}
+
 // grantOpen accounts for a new stream: until its first update the peer assumes
 // initialPeerWindow.
 func (s *Session) grantOpen(st *Stream) {
@@ -84,7 +128,7 @@ func (s *Session) grantOpen(st *Stream) {
 	s.grantMu.Lock()
 	st.limit = initialPeerWindow
 	st.grant = initialPeerWindow
-	s.grantSum += st.grant
+	s.addGrant(st.grant)
 	s.grantMu.Unlock()
 	atomic.StoreUint32(&st.announced, initialPeerWindow)
 }
@@ -92,7 +136,7 @@ func (s *Session) grantOpen(st *Stream) {
 // grantClose gives a closed stream's grant back.
 func (s *Session) grantClose(st *Stream) {
 	s.grantMu.Lock()
-	s.grantSum -= st.grant
+	s.addGrant(-st.grant)
 	st.grant = 0
 	s.grantMu.Unlock()
 }
@@ -106,6 +150,12 @@ func (s *Session) grantWindow(st *Stream, consumed uint32, limit uint32) uint32 
 
 	s.grantMu.Lock()
 	defer s.grantMu.Unlock()
+	if globalGrantBudget.Load() > 0 {
+		// What is left for this stream and what it is then granted are one step,
+		// across sessions: two sessions that each saw the same room would both take it.
+		globalGrantMu.Lock()
+		defer globalGrantMu.Unlock()
+	}
 
 	st.consumed64 += uint64(consumed - st.updConsumed) // wrap-safe
 	st.updConsumed = consumed
@@ -115,6 +165,9 @@ func (s *Session) grantWindow(st *Stream, consumed uint32, limit uint32) uint32 
 	if want > held {
 		// More than it has now: only out of what the other streams leave.
 		free := budget - (s.grantSum - st.grant)
+		if gb := globalGrantBudget.Load(); gb > 0 {
+			free = min(free, gb-(globalGranted.Load()-st.grant))
+		}
 		want = max(held, min(want, free))
 	}
 	want = max(want, min(grantFloor, int64(limit)))
@@ -123,7 +176,7 @@ func (s *Session) grantWindow(st *Stream, consumed uint32, limit uint32) uint32 
 		st.limit = pos
 	}
 	grant := int64(st.limit - st.consumed64)
-	s.grantSum += grant - st.grant
+	s.addGrant(grant - st.grant)
 	st.grant = grant
 	atomic.StoreUint32(&st.announced, uint32(want))
 	return uint32(want)
@@ -153,6 +206,7 @@ func (s *Session) grantLoop() {
 	for {
 		select {
 		case <-s.die:
+			s.releaseGrants()
 			return
 		case now := <-t.C:
 			if dt := now.Sub(last); dt > 0 {
@@ -213,7 +267,7 @@ func (s *Stream) reclaimWindow() {
 	s.updConsumed = consumed
 	window := min(uint32(initialPeerWindow), s.receiveWindow())
 	s.limit = s.consumed64 + uint64(window)
-	sess.grantSum += int64(window) - s.grant
+	sess.addGrant(int64(window) - s.grant)
 	s.grant = int64(window)
 	sess.grantMu.Unlock()
 	atomic.StoreUint32(&s.announced, window)

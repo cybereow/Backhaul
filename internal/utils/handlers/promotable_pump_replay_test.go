@@ -263,3 +263,56 @@ func TestReplayRingGrowsWhenFull(t *testing.T) {
 		t.Fatalf("the ring holds %d bytes, over the budget", n)
 	}
 }
+
+// A flow that grew its ring for a transfer and then goes quiet gives the budget
+// what the growth was charged, so other flows can grow in turn.
+func TestIdleFlowGivesItsGrowthBack(t *testing.T) {
+	const limit = ReplayFlowStart
+	ctx, _ := testCtx(t)
+	b := NewReplayBudget(8 << 20)
+	grant := b.Open(false)
+	ta, tb := tcpConnPair(t)
+	a0, b0 := NewHalfCloseConn(ta), NewHalfCloseConn(tb)
+	u, appc := tcpConnPair(t)
+	p := NewPromotablePump(ctx, false, appc, a0, testLogger(), testUsage(t), 0, false)
+	p.SetReplayGrower(grant.Grow)
+	p.SetReplayShrinker(grant.Shrink)
+	if err := p.EnableReplay(grant.Limit()); err != nil {
+		t.Fatal(err)
+	}
+	p.Start()
+	B := newReplayFlowEnd(t, ctx, b0, limit)
+
+	// A transfer that needed a bigger ring (here: it is made bigger by hand, a
+	// loopback acknowledges too fast for the sender ever to wait), then delivered
+	// and acknowledged.
+	for i := 0; i < 4; i++ {
+		if !p.growReplay() {
+			t.Fatal("the ring would not grow")
+		}
+	}
+	if b.Used() <= replayStartCharge {
+		t.Fatal("growing the ring was not charged")
+	}
+	payload := genPayload(300 << 10)
+	go u.Write(payload)
+	readExact(t, B.user, len(payload))
+	waitReplayEmpty(t, p, "sender after the transfer")
+
+	deadline := time.Now().Add(replayShrinkAfter + 3*time.Second)
+	for b.Used() != replayStartCharge {
+		if time.Now().After(deadline) {
+			t.Fatalf("an idle flow still holds %d bytes of the budget, want %d", b.Used(), replayStartCharge)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if got := p.replay.ring.getLimit(); got != ReplayFlowStart {
+		t.Fatalf("the ring limit is %d, want the starting %d", got, ReplayFlowStart)
+	}
+
+	// And it can grow again for the next transfer.
+	again := genPayload(6 << 20)
+	go u.Write(again)
+	readExact(t, B.user, len(again))
+	waitReplayEmpty(t, p, "sender after the second transfer")
+}

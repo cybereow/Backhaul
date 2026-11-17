@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/musix/backhaul/internal/smux"
+	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/utils/proclimits"
 )
@@ -43,6 +44,8 @@ type Reporter struct {
 	// proc is the process's own use at the previous look, procAt when it was taken.
 	proc   proclimits.Usage
 	procAt time.Time
+	// the replay budget's refusals at the previous look
+	replayOpenRefused, replayGrowRefused int
 }
 
 // New returns a Reporter whose lines are marked with role ("server", "client").
@@ -148,8 +151,11 @@ func (r *Reporter) process(now time.Time) string {
 	if l.Memory > 0 {
 		mem = fmt.Sprintf("%d", l.Memory>>20)
 	}
-	return fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, longest wait for a CPU %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
-		cores, limit, u.Throttles-old.Throttles, (u.Throttled - old.Throttled).Round(time.Millisecond),
+	rs := handlers.DefaultReplayBudget.Stats()
+	replay := fmt.Sprintf("replay budget %d of %d MB, refused %d new flows and %d growths", rs.Used>>20, rs.Total>>20, rs.OpenRefused-r.replayOpenRefused, rs.GrowRefused-r.replayGrowRefused)
+	r.replayOpenRefused, r.replayGrowRefused = rs.OpenRefused, rs.GrowRefused
+	return replay + " | " + fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, longest wait for a CPU %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
+		cores, limit, u.Throttles-old.Throttles, (u.Throttled-old.Throttled).Round(time.Millisecond),
 		proclimits.Sched.Delay().Round(time.Millisecond),
 		u.Memory>>20, mem, u.Heap>>20, u.Goroutines, u.Procs)
 }

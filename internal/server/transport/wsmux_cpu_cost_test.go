@@ -40,7 +40,7 @@ func processCPU() time.Duration {
 //
 //	BACKHAUL_CPU_COST=1 GOMAXPROCS=1 go test ./internal/server/transport -run TestWsMuxCPUCost -v
 //
-// CPU_COST_DIR is D (to the user), U (from the user) or B; CPU_COST_FLOWS and
+// CPU_COST_IDLE adds flows that carry nothing; CPU_COST_REPLAY_MB sets the replay budget; CPU_COST_DIR is D (to the user), U (from the user) or B; CPU_COST_FLOWS and
 // CPU_COST_SECS size the run; CPU_COST_RESUME_S=0 turns flow resumption off.
 // Add -cpuprofile to see where the time goes.
 func TestWsMuxCPUCost(t *testing.T) {
@@ -83,6 +83,10 @@ func TestWsMuxCPUCost(t *testing.T) {
 					return
 				}
 				b := make([]byte, 64<<10)
+				if mode[0] == 'I' { // an idle flow: open, nothing to say
+					_, _ = io.Copy(io.Discard, c)
+					return
+				}
 				if mode[0] == 'U' {
 					for {
 						n, err := c.Read(b)
@@ -145,6 +149,10 @@ func TestWsMuxCPUCost(t *testing.T) {
 			return
 		}
 		b := make([]byte, 64<<10)
+		if mode == 'I' {
+			_, _ = io.Copy(io.Discard, c)
+			return
+		}
 		if mode == 'U' {
 			for ctx.Err() == nil {
 				if _, err := c.Write(b); err != nil {
@@ -161,6 +169,10 @@ func TestWsMuxCPUCost(t *testing.T) {
 			}
 		}
 	}
+	for i := 0; i < cpuCostEnv("CPU_COST_IDLE", 0); i++ { // flows that only sit there
+		go flow('I')
+	}
+	time.Sleep(time.Second)
 	for i := 0; i < flows; i++ {
 		if dir == "D" || dir == "B" {
 			go flow('D')

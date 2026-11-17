@@ -1564,6 +1564,7 @@ func (c *WsMuxTransport) localDialerResumable(stream *smux.Stream, flowID uint64
 		}
 		defer grant.Release()
 		swapper.SetReplayGrower(grant.Grow)
+		swapper.SetReplayShrinker(grant.Shrink)
 		swapper.OnReplayEnd(grant.Release)
 		if err := swapper.EnableReplay(grant.Limit()); err != nil {
 			c.logger.Errorf("resumable flow %d: %v", flowID, err)

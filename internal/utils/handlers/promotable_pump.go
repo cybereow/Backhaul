@@ -77,7 +77,10 @@ type PumpSwapper struct {
 	// Replay (level B): nil unless EnableReplay was called before Start.
 	replay     *replayState
 	replayGrow func(cur int) int // nil: the ring keeps its size
-	replayEnd  func()            // nil, or called once when replay is given up (OnReplayEnd)
+	// replayShrink gives back what a grown ring was charged once it has been
+	// idle (see SetReplayShrinker); nil: it keeps what it holds.
+	replayShrink func() int
+	replayEnd    func() // nil, or called once when replay is given up (OnReplayEnd)
 
 	holdReleased bool          // HoldReleasedTunnels
 	freezeWake   chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
@@ -1110,6 +1113,32 @@ const replayGrowAfter = 3 * time.Millisecond
 // idle ones stay small. Call before Start.
 func (p *PumpSwapper) SetReplayGrower(grow func(cur int) int) { p.replayGrow = grow }
 
+// replayShrinkAfter is how long a ring that has been emptied is left alone before
+// it is taken back to its starting size: a transfer that has just ended may be
+// followed by another on the same connection.
+const replayShrinkAfter = 2 * time.Second
+
+// SetReplayShrinker lets the replay ring go back to its starting size when it
+// has been empty for replayShrinkAfter; shrink gives the budget back what the
+// growth was charged and returns the starting limit.
+func (p *PumpSwapper) SetReplayShrinker(shrink func() int) { p.replayShrink = shrink }
+
+// replayEmptied is called when an ACK has emptied the ring.
+func (p *PumpSwapper) replayEmptied() {
+	if p.replayShrink == nil || p.replay == nil {
+		return
+	}
+	ring := p.replay.ring
+	if ring.getLimit() <= ReplayFlowStart {
+		return
+	}
+	ring.arm(replayShrinkAfter, func() {
+		if ring.shrinkIfIdle(ReplayFlowStart) {
+			p.replayShrink()
+		}
+	})
+}
+
 // growReplay tries to enlarge the full replay ring; it reports whether it did.
 func (p *PumpSwapper) growReplay() bool {
 	if p.replayGrow == nil {
@@ -1134,6 +1163,7 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 		return errors.New("replay needs a tunnel that carries ACK records")
 	}
 	ring := newReplayRing(limit)
+	ring.onEmpty = p.replayEmptied
 	if len(p.proxyHeader) > 0 {
 		ring.append(p.proxyHeader) // already written, and counted in UpBytes: keep it until the peer has it
 	}

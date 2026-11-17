@@ -24,6 +24,9 @@ type replayRing struct {
 	limit int
 
 	space chan struct{} // signalled (capacity 1) when an ACK freed room
+
+	onEmpty func()      // called, outside mu, when an ACK has emptied the ring
+	idle    *time.Timer // see arm
 }
 
 const (
@@ -178,17 +181,47 @@ func (r *replayRing) ackTo(off uint64) {
 	r.head = (r.head + drop) % max(len(r.buf), 1)
 	r.size -= drop
 	r.base = off
-	if r.size == 0 {
+	empty := r.size == 0
+	if empty {
 		r.head = 0
 		if len(r.buf) > replayReleaseAt {
 			r.buf = nil
 		}
 	}
+	hook := r.onEmpty
 	r.mu.Unlock()
 	select {
 	case r.space <- struct{}{}:
 	default:
 	}
+	if empty && hook != nil {
+		hook()
+	}
+}
+
+// shrinkIfIdle puts the limit back to to if nothing is retained, and reports
+// whether it did.
+func (r *replayRing) shrinkIfIdle(to int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size != 0 || r.limit <= to {
+		return false
+	}
+	r.limit = to
+	r.buf = nil
+	return true
+}
+
+// arm runs f after d unless the ring is armed again first: it is how a ring that
+// has been emptied is given a moment to be filled again before it is shrunk.
+func (r *replayRing) arm(d time.Duration, f func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.idle == nil {
+		r.idle = time.AfterFunc(d, f)
+		return
+	}
+	r.idle.Reset(d)
 }
 
 // readAt copies retained bytes starting at flow offset off into p and returns how

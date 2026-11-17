@@ -215,6 +215,7 @@ func (s *WsMuxTransport) dispatchResumable(g *wsGeneration, appConn net.Conn, st
 		// The client was told (by the flow's kind byte) that this flow keeps replay
 		// state, so a flow that cannot is not an option: end it.
 		sw.SetReplayGrower(grant.Grow)
+		sw.SetReplayShrinker(grant.Shrink)
 		sw.OnReplayEnd(grant.Release)
 		if err := sw.EnableReplay(grant.Limit()); err != nil {
 			s.logger.Errorf("resumable flow %d: %v", flowID, err)

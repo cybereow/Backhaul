@@ -162,8 +162,13 @@ func (r *Reporter) process(now time.Time) string {
 	winWaiting, winWaited := smux.WindowGauges()
 	replay += fmt.Sprintf(" | smux: %d writers waiting for the peer's window (%v waited since the last line)", winWaiting, (winWaited - r.windowWaited).Round(time.Millisecond))
 	r.windowWaited = winWaited
-	if rep := smux.StallReport(2*time.Second, 4); rep != "" {
-		replay += " | " + rep
+	// Several writers waiting at once is a pool held up by windows. Each wait is
+	// short (a window fills, an update comes, it fills again), so what is named
+	// is whoever waits as the line is made, not whoever has waited long.
+	if winWaiting >= 2 {
+		if rep := smux.StallReport(0, 4); rep != "" {
+			replay += " | " + rep
+		}
 	}
 	ar, tw, tr, aw := handlers.PumpWaits()
 	cur := [4]time.Duration{ar, tw, tr, aw}

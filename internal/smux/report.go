@@ -40,7 +40,7 @@ func StallReport(minWait time.Duration, most int) string {
 				if u := st.lastUpd.Load(); u != 0 {
 					upd = now.Sub(time.Unix(0, u)).Round(time.Millisecond).String() + " ago"
 				}
-				stuck = append(stuck, fmt.Sprintf("stream %d waited %v with %d KB outstanding of the %d KB window it was last granted (update %s; its session carries %d streams, %d active, budget %d KB)",
+				stuck = append(stuck, fmt.Sprintf("stream %d waiting for %v now, %d KB outstanding of the %d KB window it was last granted (update %s; its session carries %d streams, %d active, budget %d KB)",
 					st.id, now.Sub(time.Unix(0, w)).Round(time.Millisecond), infl>>10, st.peerWindowNow()>>10, upd, n, s.activeStreams.Load(), s.grantBudget()>>10))
 			}
 			if d := now.UnixNano() - st.lastData.Load(); st.lastData.Load() != 0 && d < int64(time.Second) {

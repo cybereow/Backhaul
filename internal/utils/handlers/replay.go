@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,6 +16,21 @@ import (
 // is the same backpressure TCP's window gives. Memory is only held while there are
 // unacknowledged bytes: it starts empty, grows by doubling, and is released when
 // everything has been acknowledged.
+// Process-wide figures about the rings, for the pool health line: what they hold
+// now, and how many senders wait for room in one, for how long in all.
+var (
+	replayHeld    atomic.Int64
+	replayWaiting atomic.Int64
+	replayWaitNs  atomic.Int64
+)
+
+// ReplayGauges are the process's replay figures: bytes held in rings now,
+// senders waiting for room in a full ring now, and the time senders have waited
+// for room since the process started.
+func ReplayGauges() (held, waiting int64, waited time.Duration) {
+	return replayHeld.Load(), replayWaiting.Load(), time.Duration(replayWaitNs.Load())
+}
+
 type replayRing struct {
 	mu    sync.Mutex
 	buf   []byte
@@ -62,6 +78,7 @@ func (r *replayRing) setLimit(n int) {
 // will never be used again must not, its share of the budget is being released.)
 func (r *replayRing) discard() {
 	r.mu.Lock()
+	replayHeld.Add(-int64(r.size))
 	r.base += uint64(r.size)
 	r.head, r.size, r.buf = 0, 0, nil
 	r.mu.Unlock()
@@ -154,6 +171,7 @@ func (r *replayRing) append(p []byte) {
 		copy(r.buf, p[n:])
 	}
 	r.size += len(p)
+	replayHeld.Add(int64(len(p)))
 }
 
 // copyOut copies the retained bytes, in order, into dst (len(dst) <= size).
@@ -178,6 +196,7 @@ func (r *replayRing) ackTo(off uint64) {
 		return
 	}
 	drop := int(off - r.base)
+	replayHeld.Add(-int64(drop))
 	r.head = (r.head + drop) % max(len(r.buf), 1)
 	r.size -= drop
 	r.base = off

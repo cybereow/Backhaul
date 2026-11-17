@@ -3,7 +3,9 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
 	"runtime"
+	"strconv"
 
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/client"
@@ -123,6 +125,8 @@ func Run(configPath string, ctx context.Context) {
 	// Apply default values to the configuration
 	applyDefaults(cfg)
 
+	logger.Infof("%s", buildDescription())
+
 	// Size the Go runtime by the container, not by the machine under it.
 	limits := proclimits.Read()
 	procs, heap := proclimits.Apply(limits)
@@ -135,10 +139,19 @@ func Run(configPath string, ctx context.Context) {
 	if heap > 0 {
 		logger.Infof("keeping the heap under %d MB to stay within the memory limit", heap>>20)
 	}
-	// What flows may hold for replay follows the heap, however its limit was set.
+	// What flows may hold for replay follows the heap, however its limit was set;
+	// BACKHAUL_REPLAY_MB, when set, says it outright.
 	if total := handlers.ReplayBudgetFor(proclimits.HeapLimit()); total < handlers.ReplayBudgetTotal {
 		handlers.DefaultReplayBudget.SetTotal(total)
 		logger.Infof("replay buffers of all flows are held to %d MB to fit the heap limit", total>>20)
+	}
+	if v := os.Getenv("BACKHAUL_REPLAY_MB"); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			handlers.DefaultReplayBudget.SetTotal(mb << 20)
+			logger.Infof("replay buffers of all flows are held to %d MB (BACKHAUL_REPLAY_MB)", mb)
+		} else {
+			logger.Warnf("BACKHAUL_REPLAY_MB=%q is not a number of megabytes: ignored", v)
+		}
 	}
 
 	configType := detectConfigType(cfg)

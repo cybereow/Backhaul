@@ -18,8 +18,10 @@ COPY . .
 # default image to keep it portable and cgo-free.
 ARG TARGETOS
 ARG TARGETARCH
+# The commit the image is built from, shown in the first line of its log.
+ARG COMMIT=unknown
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/backhaul ./main.go
+    go build -ldflags="-s -w -X github.com/musix/backhaul/cmd.BuildCommit=${COMMIT}" -o /out/backhaul ./main.go
 
 # ---- runtime stage ----
 FROM alpine:3.20

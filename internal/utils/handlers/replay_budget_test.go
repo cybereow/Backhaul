@@ -144,3 +144,25 @@ func TestEmptiedRingShrinksOnlyWhenIdle(t *testing.T) {
 		t.Fatal("a ring at its starting size was shrunk again")
 	}
 }
+
+// The gauges follow what the rings hold: bytes in on append, out on ACK and on
+// discard.
+func TestReplayGaugesFollowTheRings(t *testing.T) {
+	base, _, _ := ReplayGauges()
+	a, b := newReplayRing(1<<20), newReplayRing(1<<20)
+	a.append(make([]byte, 5000))
+	b.append(make([]byte, 7000))
+	if held, _, _ := ReplayGauges(); held-base != 12000 {
+		t.Fatalf("rings hold %d, want 12000", held-base)
+	}
+	a.ackTo(2000)
+	a.ackTo(1) // stale: ignored
+	if held, _, _ := ReplayGauges(); held-base != 10000 {
+		t.Fatalf("after an ACK rings hold %d, want 10000", held-base)
+	}
+	a.discard()
+	b.ackTo(7000)
+	if held, _, _ := ReplayGauges(); held != base {
+		t.Fatalf("empty rings hold %d more than before", held-base)
+	}
+}

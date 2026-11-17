@@ -525,16 +525,27 @@ func (s *Stream) writeV2(b []byte) (n int, err error) {
 		// wait until stream closes, window changes or deadline reached
 		// this blocking behavior will back propagate flow control to upper layer.
 		if len(b) > 0 {
+			waitStart := time.Now()
+			windowWaiting.Add(1)
+			endWait := func() {
+				windowWaiting.Add(-1)
+				windowWaitNs.Add(int64(time.Since(waitStart)))
+			}
 			select {
 			case <-s.chFinEvent:
+				endWait()
 				return 0, io.EOF
 			case <-s.die:
+				endWait()
 				return sent, io.ErrClosedPipe
 			case <-deadline:
+				endWait()
 				return sent, ErrTimeout
 			case <-s.sess.chSocketWriteError:
+				endWait()
 				return sent, s.sess.socketWriteError.Load().(error)
 			case <-s.chUpdate: // notify of remote data consuming and window update
+				endWait()
 				continue
 			}
 		} else {
@@ -675,4 +686,17 @@ func (s *Stream) fin() {
 	s.finEventOnce.Do(func() {
 		close(s.chFinEvent)
 	})
+}
+
+// Process-wide figures about writers held up by the peer's window, for the pool
+// health line: how many wait now, and for how long in all.
+var (
+	windowWaiting atomic.Int64
+	windowWaitNs  atomic.Int64
+)
+
+// WindowGauges are the number of stream writers now waiting for the peer to open
+// its window, and the time writers have waited for it since the process started.
+func WindowGauges() (waiting int64, waited time.Duration) {
+	return windowWaiting.Load(), time.Duration(windowWaitNs.Load())
 }

@@ -46,6 +46,7 @@ type Reporter struct {
 	procAt time.Time
 	// the replay budget's refusals at the previous look
 	replayOpenRefused, replayGrowRefused int
+	replayWaited, windowWaited           time.Duration
 }
 
 // New returns a Reporter whose lines are marked with role ("server", "client").
@@ -152,7 +153,14 @@ func (r *Reporter) process(now time.Time) string {
 		mem = fmt.Sprintf("%d", l.Memory>>20)
 	}
 	rs := handlers.DefaultReplayBudget.Stats()
-	replay := fmt.Sprintf("replay budget %d of %d MB, refused %d new flows and %d growths", rs.Used>>20, rs.Total>>20, rs.OpenRefused-r.replayOpenRefused, rs.GrowRefused-r.replayGrowRefused)
+	held, waiting, waited := handlers.ReplayGauges()
+	replay := fmt.Sprintf("replay budget %d of %d MB, refused %d new flows and %d growths; rings hold %d KB, %d senders waiting for room (%v waited since the last line)",
+		rs.Used>>20, rs.Total>>20, rs.OpenRefused-r.replayOpenRefused, rs.GrowRefused-r.replayGrowRefused,
+		held>>10, waiting, (waited - r.replayWaited).Round(time.Millisecond))
+	r.replayWaited = waited
+	winWaiting, winWaited := smux.WindowGauges()
+	replay += fmt.Sprintf(" | smux: %d writers waiting for the peer's window (%v waited since the last line)", winWaiting, (winWaited - r.windowWaited).Round(time.Millisecond))
+	r.windowWaited = winWaited
 	r.replayOpenRefused, r.replayGrowRefused = rs.OpenRefused, rs.GrowRefused
 	return replay + " | " + fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, longest wait for a CPU %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
 		cores, limit, u.Throttles-old.Throttles, (u.Throttled-old.Throttled).Round(time.Millisecond),

@@ -1289,6 +1289,15 @@ func (p *PumpSwapper) flushAck() {
 // resume, so the caller holds its read back rather than overfilling the ring. ok is
 // false when the flow was aborted.
 func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
+	if p.replay.ring.free() < n {
+		// A sender held up by a full ring: counted while it waits (see ReplayGauges).
+		replayWaiting.Add(1)
+		since := time.Now()
+		defer func() {
+			replayWaiting.Add(-1)
+			replayWaitNs.Add(int64(time.Since(since)))
+		}()
+	}
 	// The ring only grows for a sender that has waited a real round trip for room: a
 	// full ring that an ACK frees within microseconds (a LAN, a busy scheduler) is
 	// not what limits the flow, and a big ring costs cache for nothing.

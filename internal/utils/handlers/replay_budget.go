@@ -28,6 +28,33 @@ type ReplayBudget struct {
 // NewReplayBudget returns a budget of total bytes.
 func NewReplayBudget(total int) *ReplayBudget { return &ReplayBudget{total: total} }
 
+// replayHeapShare is the part of a heap limit that replay rings may hold in all.
+// Measured, bulk flows through a process held to a 143 MiB heap spent twice the
+// CPU per byte when their rings were free to fill 256 MiB: the heap sat at its
+// limit and the collector ran 150 times a second. A quarter of the limit leaves
+// room for everything else a flow holds and costs the flows no speed.
+const (
+	replayHeapShare = 4
+	replayBudgetMin = 4 << 20
+)
+
+// ReplayBudgetFor is the replay budget that goes with a heap limit (0 = none): all
+// of ReplayBudgetTotal without a limit, a share of the limit with one.
+func ReplayBudgetFor(heapLimit int64) int {
+	if heapLimit <= 0 {
+		return ReplayBudgetTotal
+	}
+	return int(min(int64(ReplayBudgetTotal), max(int64(replayBudgetMin), heapLimit/replayHeapShare)))
+}
+
+// SetTotal changes what the budget allows. Rings that are already larger keep what
+// they hold until their flows end; nothing new is granted past the new total.
+func (b *ReplayBudget) SetTotal(total int) {
+	b.mu.Lock()
+	b.total = total
+	b.mu.Unlock()
+}
+
 // DefaultReplayBudget is the process-wide budget.
 var DefaultReplayBudget = NewReplayBudget(ReplayBudgetTotal)
 

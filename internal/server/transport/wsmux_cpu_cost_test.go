@@ -5,6 +5,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"strconv"
 	"sync/atomic"
 	"syscall"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/musix/backhaul/config"
 	client_transport "github.com/musix/backhaul/internal/client/transport"
+	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/sirupsen/logrus"
 )
 
@@ -52,6 +55,9 @@ func TestWsMuxCPUCost(t *testing.T) {
 		dir = "D"
 	}
 
+	if mb := cpuCostEnv("CPU_COST_REPLAY_MB", 0); mb > 0 { // what cmd sets from a memory limit
+		handlers.DefaultReplayBudget.SetTotal(mb << 20)
+	}
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -164,12 +170,29 @@ func TestWsMuxCPUCost(t *testing.T) {
 		}
 	}
 	time.Sleep(3 * time.Second) // warm up
+	var m0 runtime.MemStats
+	runtime.ReadMemStats(&m0)
 	c0, d0, u0, t0 := processCPU(), down.Load(), up.Load(), time.Now()
-	time.Sleep(time.Duration(secs) * time.Second)
+	peak := uint64(0)
+	for end := t0.Add(time.Duration(secs) * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		peak = max(peak, m.HeapInuse)
+	}
 	cpu, d, u, el := processCPU()-c0, down.Load()-d0, up.Load()-u0, time.Since(t0).Seconds()
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	// CPU_COST_HEAP=file writes what the heap holds while the flows still run.
+	if name := os.Getenv("CPU_COST_HEAP"); name != "" {
+		if f, err := os.Create(name); err == nil {
+			_ = pprof.Lookup("heap").WriteTo(f, 0)
+			f.Close()
+		}
+	}
 	if d+u == 0 {
 		t.Fatal("nothing got through")
 	}
 	t.Logf("flows=%d dir=%s resume=%v: to the user %.0f Mbit/s, from the user %.0f Mbit/s, %.2f cores, %.2f CPU seconds per GiB",
 		flows, dir, resume, float64(d)*8/el/1e6, float64(u)*8/el/1e6, cpu.Seconds()/el, cpu.Seconds()/(float64(d+u)/(1<<30)))
+	t.Logf("memory: peak heap %d MB, %d collections in the run (%.1f per second)", peak>>20, m1.NumGC-m0.NumGC, float64(m1.NumGC-m0.NumGC)/el)
 }

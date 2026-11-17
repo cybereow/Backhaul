@@ -89,7 +89,7 @@ func TestApply(t *testing.T) {
 	if procs != 2 || runtime.GOMAXPROCS(0) != 2 {
 		t.Fatalf("procs = %d, runtime has %d, want 2", procs, runtime.GOMAXPROCS(0))
 	}
-	if want := int64(768 << 20); heap != want || debug.SetMemoryLimit(-1) != want {
+	if want := int64(768 << 20); heap != want || debug.SetMemoryLimit(-1) != want || HeapLimit() != want {
 		t.Fatalf("heap limit = %d, want %d", heap, want)
 	}
 

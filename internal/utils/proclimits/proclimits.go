@@ -165,3 +165,13 @@ func Apply(l Limits) (procs int, heap int64) {
 	}
 	return procs, heap
 }
+
+// HeapLimit is the soft memory limit the Go runtime is under (from GOMEMLIMIT or
+// Apply), 0 when there is none.
+func HeapLimit() int64 {
+	l := debug.SetMemoryLimit(-1)
+	if l == math.MaxInt64 {
+		return 0
+	}
+	return l
+}

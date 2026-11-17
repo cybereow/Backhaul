@@ -11,6 +11,7 @@ import (
 	"github.com/musix/backhaul/internal/server"
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/proclimits"
 
 	"github.com/BurntSushi/toml"
@@ -133,6 +134,11 @@ func Run(configPath string, ctx context.Context) {
 	}
 	if heap > 0 {
 		logger.Infof("keeping the heap under %d MB to stay within the memory limit", heap>>20)
+	}
+	// What flows may hold for replay follows the heap, however its limit was set.
+	if total := handlers.ReplayBudgetFor(proclimits.HeapLimit()); total < handlers.ReplayBudgetTotal {
+		handlers.DefaultReplayBudget.SetTotal(total)
+		logger.Infof("replay buffers of all flows are held to %d MB to fit the heap limit", total>>20)
 	}
 
 	configType := detectConfigType(cfg)

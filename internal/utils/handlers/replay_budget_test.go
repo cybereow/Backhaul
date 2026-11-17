@@ -63,3 +63,24 @@ func TestReplayBudgetForceIsBounded(t *testing.T) {
 		t.Fatal("a normal flow got a ring beyond the budget")
 	}
 }
+
+func TestReplayBudgetFollowsTheHeapLimit(t *testing.T) {
+	for _, c := range []struct {
+		heap int64
+		want int
+	}{
+		{0, ReplayBudgetTotal},       // no limit: as before
+		{143 << 20, (143 << 20) / 4}, // a quarter
+		{1 << 30, ReplayBudgetTotal}, // never more than the cap
+		{8 << 20, replayBudgetMin},   // never less than a few rings
+	} {
+		if got := ReplayBudgetFor(c.heap); got != c.want {
+			t.Errorf("ReplayBudgetFor(%d MiB) = %d, want %d", c.heap>>20, got, c.want)
+		}
+	}
+	b := NewReplayBudget(ReplayBudgetTotal)
+	b.SetTotal(replayBudgetMin)
+	if b.Open(false) == nil {
+		t.Fatal("a flow could not open a ring within a small budget")
+	}
+}

@@ -343,6 +343,12 @@ func (p *PumpSwapper) start() {
 		wg.Wait()
 		p.app.Close()
 		p.lingerForAcks()
+		if p.replay != nil {
+			// The flow is over: whatever the ring still holds can never be
+			// replayed, so let it go now instead of when the pump is collected,
+			// and take it out of the process-wide figure.
+			p.replay.ring.discard()
+		}
 		close(p.done)
 		p.mu.Lock()
 		cur, next := p.cur, p.next

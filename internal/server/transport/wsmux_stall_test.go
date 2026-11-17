@@ -426,11 +426,10 @@ func TestSharedLoadIsNotAStall(t *testing.T) {
 // answer is not a sign about the connection: nothing is moved for it. The
 // kernel's own view of the socket still counts.
 func TestStarvedProcessDoesNotTakeItsOwnLatenessForAStall(t *testing.T) {
-	old := processStarved
-	defer func() { processStarved = old }()
+	defer setProcessStarved(nil)() // back to the test binary's default after
 	now := time.Now()
 
-	processStarved = func(time.Time) bool { return false }
+	setProcessStarved(func(time.Time) bool { return false })
 	quiet := &pooledSession{}
 	quiet.probeFails.Store(2)
 	quiet.noteHealth(now, false)
@@ -438,7 +437,7 @@ func TestStarvedProcessDoesNotTakeItsOwnLatenessForAStall(t *testing.T) {
 		t.Fatal("without starvation, failing probes did not mark the connection (the test would prove nothing)")
 	}
 
-	processStarved = func(time.Time) bool { return true }
+	setProcessStarved(func(time.Time) bool { return true })
 	starved := &pooledSession{}
 	starved.probeFails.Store(2)
 	starved.sureSince.Store(now.UnixNano())

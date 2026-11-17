@@ -2,6 +2,7 @@ package transport
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/musix/backhaul/internal/utils/proclimits"
@@ -106,9 +107,18 @@ func (ps *pooledSession) echoIsOverdue(sent int64, now time.Time) bool {
 	return true
 }
 
+// starvedOverride replaces the real monitor (see processStarved). An atomic: the
+// capacity loops of earlier transports may still be running when a test sets it.
+var starvedOverride atomic.Pointer[func(time.Time) bool]
+
 // processStarved reports whether this process has recently been kept from running
-// (see package proclimits). A variable so that a test can say it was.
-var processStarved = func(now time.Time) bool { return proclimits.Sched.Starved(now) }
+// (see package proclimits). A test can say it was, or was not (setProcessStarved).
+func processStarved(now time.Time) bool {
+	if f := starvedOverride.Load(); f != nil {
+		return (*f)(now)
+	}
+	return proclimits.Sched.Starved(now)
+}
 
 // noteHealth records what the latest look at the session showed: socketStalled
 // from its TCP state, together with its RTT probes.

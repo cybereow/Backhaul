@@ -170,6 +170,13 @@ func capacityPenalty(est, best float64) float64 {
 	return math.Min(best/est, capMaxPenalty)
 }
 
+// How often, and for how long, a busy process looks at where its CPU goes (debug
+// level only; see proclimits.Sampler).
+const (
+	cpuProfileEvery = 30 * time.Second
+	cpuProfileFor   = 3 * time.Second
+)
+
 // healthEvery is how many capacity samples pass between two pool health lines.
 const healthEvery = 2
 
@@ -189,6 +196,7 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 	// Where the pool's data is waiting, once every healthEvery samples while it
 	// carries traffic (debug level only): see package poolhealth.
 	health, tick := poolhealth.New("server"), 0
+	var sampler proclimits.Sampler
 	snapshot := func() []*pooledSession {
 		s.sessionsMu.Lock()
 		defer s.sessionsMu.Unlock()
@@ -212,6 +220,8 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 				}
 				if line, ok := health.Report(now, members); ok {
 					s.logger.Debug(line)
+					// While the pool is busy: where the CPU goes, now and then.
+					sampler.Maybe(now, cpuProfileEvery, cpuProfileFor, 6, func(l string) { s.logger.Debug(l) })
 				}
 			}
 		case now := <-st.C:

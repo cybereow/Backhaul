@@ -16,6 +16,7 @@ import (
 	"github.com/musix/backhaul/internal/utils/handlers"
 	"github.com/musix/backhaul/internal/utils/network"
 	"github.com/musix/backhaul/internal/utils/poolhealth"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 	"github.com/musix/backhaul/internal/utils/striping"
 	"github.com/musix/backhaul/internal/web"
 
@@ -1775,6 +1776,7 @@ func (c *WsMuxTransport) healthLoop() {
 	t := time.NewTicker(2 * time.Second)
 	defer t.Stop()
 	health := poolhealth.New("client")
+	var sampler proclimits.Sampler
 	for {
 		select {
 		case <-c.parentctx.Done():
@@ -1791,7 +1793,16 @@ func (c *WsMuxTransport) healthLoop() {
 			c.healthMu.Unlock()
 			if line, ok := health.Report(now, members); ok {
 				c.logger.Debug(line)
+				// While the pool is busy: where the CPU goes, now and then.
+				sampler.Maybe(now, cpuProfileEvery, cpuProfileFor, 6, func(s string) { c.logger.Debug(s) })
 			}
 		}
 	}
 }
+
+// How often, and for how long, a busy process looks at where its CPU goes (debug
+// level only; see proclimits.Sampler).
+const (
+	cpuProfileEvery = 30 * time.Second
+	cpuProfileFor   = 3 * time.Second
+)

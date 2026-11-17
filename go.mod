@@ -1,10 +1,11 @@
 module github.com/musix/backhaul
 
-go 1.26
+go 1.26.0
 
 require (
 	github.com/BurntSushi/toml v1.4.0
 	github.com/gobwas/ws v1.5.0
+	github.com/google/pprof v0.0.0-20261111200114-fac431ef4d26
 	github.com/klauspost/reedsolomon v1.14.2
 	github.com/libp2p/go-openssl v0.1.0
 	github.com/miekg/dns v1.1.63

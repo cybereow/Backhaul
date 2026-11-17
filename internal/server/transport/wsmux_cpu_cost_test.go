@@ -2,12 +2,14 @@ package transport
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -24,6 +26,25 @@ func cpuCostEnv(name string, def int) int {
 		return v
 	}
 	return def
+}
+
+// processSyscalls returns how many read-like and write-like system calls this
+// process has made so far (Linux /proc/self/io), 0,0 elsewhere.
+func processSyscalls() (r, w int64) {
+	b, err := os.ReadFile("/proc/self/io")
+	if err != nil {
+		return 0, 0
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		var v int64
+		if _, e := fmt.Sscanf(l, "syscr: %d", &v); e == nil {
+			r = v
+		}
+		if _, e := fmt.Sscanf(l, "syscw: %d", &v); e == nil {
+			w = v
+		}
+	}
+	return r, w
 }
 
 func processCPU() time.Duration {
@@ -185,12 +206,14 @@ func TestWsMuxCPUCost(t *testing.T) {
 	var m0 runtime.MemStats
 	runtime.ReadMemStats(&m0)
 	c0, d0, u0, t0 := processCPU(), down.Load(), up.Load(), time.Now()
+	r0, w0 := processSyscalls()
 	peak := uint64(0)
 	for end := t0.Add(time.Duration(secs) * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
 		var m runtime.MemStats
 		runtime.ReadMemStats(&m)
 		peak = max(peak, m.HeapInuse)
 	}
+	r1, w1 := processSyscalls()
 	cpu, d, u, el := processCPU()-c0, down.Load()-d0, up.Load()-u0, time.Since(t0).Seconds()
 	var m1 runtime.MemStats
 	runtime.ReadMemStats(&m1)
@@ -206,5 +229,7 @@ func TestWsMuxCPUCost(t *testing.T) {
 	}
 	t.Logf("flows=%d dir=%s resume=%v: to the user %.0f Mbit/s, from the user %.0f Mbit/s, %.2f cores, %.2f CPU seconds per GiB",
 		flows, dir, resume, float64(d)*8/el/1e6, float64(u)*8/el/1e6, cpu.Seconds()/el, cpu.Seconds()/(float64(d+u)/(1<<30)))
+	gib := float64(d+u) / (1 << 30)
+	t.Logf("system calls per GiB: %.0f reads, %.0f writes (a read or write moves %.0f KB on average)", float64(r1-r0)/gib, float64(w1-w0)/gib, float64(d+u)/1024/float64(max(1, r1-r0+w1-w0)))
 	t.Logf("memory: peak heap %d MB, %d collections in the run (%.1f per second)", peak>>20, m1.NumGC-m0.NumGC, float64(m1.NumGC-m0.NumGC)/el)
 }

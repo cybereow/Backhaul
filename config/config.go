@@ -54,6 +54,7 @@ type ServerConfig struct {
 	ProxyProtocol        bool          `toml:"proxy_protocol"`
 	MuxWSFraming         bool          `toml:"mux_ws_framing"` // wsmux/wssmux: carry every mux leg as standards-framed RFC 6455 binary messages, negotiated with the backhaul-mux-v1 subprotocol. Enabled by default (a server rejects peers that do not offer it); set false on BOTH ends for the legacy raw mode. Ignored by other transports.
 	MuxHalfClose         bool          `toml:"mux_half_close"` // wsmux/wssmux (mux_version >= 2): plain flows carry a request-EOF-then-reply-safe (directional EOF) envelope. STRICT: upgrades from clients that do not offer the halfclose-v1 capability are rejected. Default false. Promotable flows (promote_bytes) keep legacy full-close semantics. Ignored by other transports.
+	Raw                  bool          `toml:"raw"`            // ws/wss server: after the flow-open message the tunnel connection carries plain bytes, not WebSocket frames, so the server can splice(2) it to the user socket. Clients must be a build that understands it. No resume. Default false. Ignored by other transports.
 	Path                 string        `toml:"path"`
 	Fallback             string        `toml:"fallback"`
 	TLSEngine            string        `toml:"tls_engine"`

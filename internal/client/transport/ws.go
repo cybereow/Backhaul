@@ -637,6 +637,11 @@ func (c *WsTransport) tunnelDialer() {
 			leavePool()
 
 			remoteAddr := string(remoteAddrBytes)
+			raw := false
+			if strings.HasPrefix(remoteAddr, handlers.RawFlowPrefix) {
+				raw = true
+				remoteAddr = strings.TrimPrefix(remoteAddr, handlers.RawFlowPrefix)
+			}
 
 			// Extract the port from the received address
 			port, resolvedAddr, err := network.ResolveRemoteAddr(remoteAddr)
@@ -646,17 +651,21 @@ func (c *WsTransport) tunnelDialer() {
 				return
 			}
 
-			c.localDialer(tunnelConn, resolvedAddr, port)
+			c.localDialer(tunnelConn, resolvedAddr, port, raw)
 			return
 		}
 	}
 }
 
-func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr string, port int) {
+func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr string, port int, raw bool) {
 	ctx := c.ctx // this worker's generation, read once
 	var sendBuf, recvBuf int
 
-	if strings.Contains(remoteAddr, "127.0.0.1") {
+	// A raw flow is spliced by the kernel, and a 32KB socket buffer is smaller
+	// than a loopback segment: the receiver's window then closes and reopens only
+	// through persist-timer probes, seconds apart (seen as a transfer whose last
+	// bytes and EOF arrive late). Left at the default the kernel sizes it itself.
+	if strings.Contains(remoteAddr, "127.0.0.1") && !raw {
 		// Use 32 KB for localhost
 		sendBuf = 32 * 1024
 		recvBuf = 32 * 1024
@@ -674,5 +683,10 @@ func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr s
 	}
 	c.logger.Debugf("connected to local address %s successfully", remoteAddr)
 
+	if raw {
+		left, conn := tunnelCon.Detach()
+		handlers.RawConnectionHandler(ctx, false, conn, left, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+		return
+	}
 	handlers.WSConnectionHandler(ctx, false, tunnelCon, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
 }

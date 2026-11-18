@@ -222,15 +222,16 @@ func TestReplayAcksCountProxyHeader(t *testing.T) {
 	waitReplayEmpty(t, p, "sender after the peer delivered everything")
 }
 
-// An ring that must hold a little more than its limit (a read admitted so a swap
-// can reach its boundary) grows to what is needed, not to the next power of two.
+// A ring that must hold a little more than its limit (a read admitted so a swap
+// can reach its boundary) keeps what is needed and one chunk more at most, not
+// the next power of two.
 func TestReplayRingOverflowDoesNotDouble(t *testing.T) {
 	const limit = 1 << 20
 	r := newReplayRing(limit)
 	r.append(make([]byte, limit))
 	r.append(make([]byte, 1))
-	if got := len(r.buf); got != limit+1 {
-		t.Fatalf("capacity %d after one byte past the limit, want %d", got, limit+1)
+	if got, max := len(r.chunks), limit/copyBufferSize+1; got != max {
+		t.Fatalf("%d chunks after one byte past the limit, want %d", got, max)
 	}
 }
 

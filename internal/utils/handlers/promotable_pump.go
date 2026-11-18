@@ -721,7 +721,8 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	full := *bufPtr // what a read may use; buf below is the part it uses on this tunnel
 	buf := full
-	defer copyBufferPool.Put(bufPtr)
+	// bufPtr changes when the replay ring takes a buffer over (see appendOwned).
+	defer func() { copyBufferPool.Put(bufPtr) }()
 
 	p.mu.Lock()
 	dst := p.cur
@@ -754,6 +755,7 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 				}
 				if n > 0 {
 					interrupted := false
+					sent := full[:n] // what goes to the tunnel
 					if p.replaying() != nil {
 						// Keep what is being sent until the peer acknowledges it, and
 						// wait here (not in the app's socket) while a full window of it
@@ -768,13 +770,21 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 							// the ACKs that would make room only come after it: hold the
 							// read instead of letting the ring grow past its limit.
 							pend = n
+						} else if n >= ringOwnMin {
+							// The ring keeps this very buffer until the peer has the
+							// bytes: no copy. What is written below is read from it, and
+							// cannot be acknowledged before it has been written.
+							p.replay.ring.appendOwned(bufPtr, n)
+							sent = full[:n]
+							bufPtr = copyBufferPool.Get().(*[]byte)
+							full = *bufPtr
 						} else {
 							p.replay.ring.append(full[:n])
 						}
 					}
 					if !interrupted {
 						t1 := time.Now()
-						w, werr := writeFull(dst, full[:n])
+						w, werr := writeFull(dst, sent)
 						pumpWait[waitTunnelWrite].Add(int64(time.Since(t1)))
 						p.upBytes.Add(uint64(w))
 						if sniffer {

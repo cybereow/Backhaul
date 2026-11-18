@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/pprof"
 	"strconv"
 
 	"github.com/musix/backhaul/config"
@@ -117,6 +118,18 @@ func validateHalfClose(cfg *config.Config, configType string) error {
 }
 
 func Run(configPath string, ctx context.Context) {
+	// BACKHAUL_CPUPROFILE=file records a CPU profile of the whole run, written when
+	// the process is asked to stop: the way to see where a build spends its time
+	// under a real load (go tool pprof -top file).
+	if path := os.Getenv("BACKHAUL_CPUPROFILE"); path != "" {
+		if f, err := os.Create(path); err == nil {
+			if pprof.StartCPUProfile(f) == nil {
+				defer func() { pprof.StopCPUProfile(); f.Close() }()
+			} else {
+				f.Close()
+			}
+		}
+	}
 	// Load and parse the configuration file
 	cfg, err := loadConfig(configPath)
 	if err != nil {

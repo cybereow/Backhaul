@@ -6,6 +6,8 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +92,7 @@ func startWsE2EFull(t *testing.T, dest func(net.Conn), maxAge time.Duration, poo
 		KeepAlive:    30 * time.Second,
 		DialTimeOut:  10 * time.Second,
 		ConnPoolSize: pool,
+		ConnPoolMax:  poolMax,
 		Nodelay:      true,
 		Mode:         config.WS,
 		Path:         "/",
@@ -181,5 +184,73 @@ func TestWsRestartAfterIdleRotation(t *testing.T) {
 		}
 		require.Less(t, time.Since(start), 10*time.Second)
 		require.NotSame(t, before, srv.gen, "no new generation was started")
+	})
+}
+
+// A burst of overlapping flows is served in full, and the idle connections the
+// client keeps (as the server sees them queued) stay under the ceiling.
+func TestWsIdleCeilingBoundsThePoolWithoutStarvingFlows(t *testing.T) {
+	const pool, ceiling = 2, 6
+	slow := func(c net.Conn) {
+		defer c.Close()
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return
+		}
+		time.Sleep(700 * time.Millisecond) // keep the flow open so they overlap
+		c.Write(b)
+	}
+	eachMode(t, func(t *testing.T) {
+		addr, srv := startWsE2EFull(t, slow, 0, pool, ceiling)
+
+		var peak int32
+		stop := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				case <-time.After(10 * time.Millisecond):
+					if n := int32(len(srv.tunnelChannel)); n > atomic.LoadInt32(&peak) {
+						atomic.StoreInt32(&peak, n)
+					}
+				}
+			}
+		}()
+		defer close(stop)
+
+		const flows = 30
+		var wg sync.WaitGroup
+		errs := make(chan error, flows)
+		for i := 0; i < flows; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c, err := net.Dial("tcp", addr)
+				if err != nil {
+					errs <- err
+					return
+				}
+				defer c.Close()
+				c.SetDeadline(time.Now().Add(20 * time.Second))
+				if _, err := c.Write([]byte("x")); err != nil {
+					errs <- err
+					return
+				}
+				b := make([]byte, 1)
+				if _, err := io.ReadFull(c, b); err != nil {
+					errs <- err
+				}
+			}()
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			t.Errorf("a flow of the burst was not served: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond) // let the pool settle
+		if p := atomic.LoadInt32(&peak); p > ceiling {
+			t.Errorf("the server saw %d idle connections queued, over the ceiling of %d", p, ceiling)
+		}
 	})
 }

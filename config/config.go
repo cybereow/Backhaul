@@ -72,6 +72,7 @@ type ClientConfig struct {
 	Transport            TransportType `toml:"transport"`
 	Token                string        `toml:"token"`
 	ConnectionPool       int           `toml:"connection_pool"`
+	ConnectionPoolMax    int           `toml:"connection_pool_max"` // ws/wss client: ceiling on idle plus in-flight tunnel connections (connections serving a flow do not count). 0 = 4 x connection_pool, at least connection_pool + 16. Bounds a pile-up of unused connections (and the burst of handshakes that comes with it) when the server is not handing them out.
 	RetryInterval        int           `toml:"retry_interval"`
 	Nodelay              bool          `toml:"nodelay"`
 	Keepalive            int           `toml:"keepalive_period"`

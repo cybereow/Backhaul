@@ -1,0 +1,235 @@
+package transport
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/musix/backhaul/config"
+	client_transport "github.com/musix/backhaul/internal/client/transport"
+	"github.com/musix/backhaul/internal/utils/handlers"
+	"github.com/sirupsen/logrus"
+)
+
+func cpuCostEnv(name string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(name)); err == nil {
+		return v
+	}
+	return def
+}
+
+// processSyscalls returns how many read-like and write-like system calls this
+// process has made so far (Linux /proc/self/io), 0,0 elsewhere.
+func processSyscalls() (r, w int64) {
+	b, err := os.ReadFile("/proc/self/io")
+	if err != nil {
+		return 0, 0
+	}
+	for _, l := range strings.Split(string(b), "\n") {
+		var v int64
+		if _, e := fmt.Sscanf(l, "syscr: %d", &v); e == nil {
+			r = v
+		}
+		if _, e := fmt.Sscanf(l, "syscw: %d", &v); e == nil {
+			w = v
+		}
+	}
+	return r, w
+}
+
+func processCPU() time.Duration {
+	var ru syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
+// TestWsMuxCPUCost measures what a byte costs: bulk flows through a real server
+// and a real client over loopback, reported as throughput and CPU seconds per
+// GiB. The figure covers both ends of the tunnel and the load on either side of
+// it, so it is for comparing one build with another, not an absolute. Run it on
+// one thread to see the ceiling of a single core:
+//
+//	BACKHAUL_CPU_COST=1 GOMAXPROCS=1 go test ./internal/server/transport -run TestWsMuxCPUCost -v
+//
+// CPU_COST_IDLE adds flows that carry nothing; CPU_COST_REPLAY_MB sets the replay budget; CPU_COST_DIR is D (to the user), U (from the user) or B; CPU_COST_FLOWS and
+// CPU_COST_SECS size the run; CPU_COST_RESUME_S=0 turns flow resumption off.
+// Add -cpuprofile to see where the time goes.
+func TestWsMuxCPUCost(t *testing.T) {
+	if os.Getenv("BACKHAUL_CPU_COST") == "" {
+		t.Skip("a measurement, not a check: set BACKHAUL_CPU_COST=1 to run it")
+	}
+	flows := cpuCostEnv("CPU_COST_FLOWS", 8)
+	secs := cpuCostEnv("CPU_COST_SECS", 10)
+	resume := time.Duration(cpuCostEnv("CPU_COST_RESUME_S", 30)) * time.Second
+	dir := os.Getenv("CPU_COST_DIR")
+	if dir == "" {
+		dir = "D"
+	}
+
+	if mb := cpuCostEnv("CPU_COST_REPLAY_MB", 0); mb > 0 { // what cmd sets from a memory limit
+		handlers.DefaultReplayBudget.SetTotal(mb << 20)
+	}
+	logger := logrus.New()
+	logger.SetOutput(io.Discard)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var down, up atomic.Int64
+	serverAddr, userAddr := lcFreeAddr(t), lcFreeAddr(t)
+	backend, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backend.Close()
+	go func() {
+		for {
+			c, err := backend.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				mode := make([]byte, 1)
+				if _, err := io.ReadFull(c, mode); err != nil {
+					return
+				}
+				b := make([]byte, 64<<10)
+				if mode[0] == 'I' { // an idle flow: open, nothing to say
+					_, _ = io.Copy(io.Discard, c)
+					return
+				}
+				if mode[0] == 'U' {
+					for {
+						n, err := c.Read(b)
+						up.Add(int64(n))
+						if err != nil {
+							return
+						}
+					}
+				}
+				for {
+					if _, err := c.Write(b); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	maxAge, maxDrain := RotationPlan(180 * time.Second)
+	NewWSMuxServer(ctx, &WsMuxConfig{
+		BindAddr: serverAddr, Token: lcToken, Mode: config.WSMUX, Path: "/", MuxVersion: 2, MuxCon: 32,
+		ChannelSize: 8192, MaxFrameSize: 32768, MaxReceiveBuffer: 64 << 20, MaxStreamBuffer: 16 << 20,
+		KeepAlive: 30 * time.Second, Heartbeat: 20 * time.Second, Nodelay: true,
+		MaxConnAge: maxAge, MaxDrain: maxDrain, ResumeWindow: resume, WSFraming: true,
+		Ports: []string{userAddr + "=" + backend.Addr().String()},
+	}, logger).Start()
+	lcWaitFor(t, "server", func() bool {
+		c, err := net.Dial("tcp", serverAddr)
+		if err != nil {
+			return false
+		}
+		c.Close()
+		return true
+	})
+	go client_transport.NewWSMuxClient(ctx, &client_transport.WsMuxConfig{
+		RemoteAddr: serverAddr, Token: lcToken, Mode: config.WSMUX, Path: "/", MuxVersion: 2,
+		ConnPoolSize: 16, DialTimeOut: 5 * time.Second, RetryInterval: 100 * time.Millisecond,
+		KeepAlive: 30 * time.Second, Nodelay: true, MaxFrameSize: 32768, MaxReceiveBuffer: 64 << 20,
+		MaxStreamBuffer: 16 << 20, WSFraming: true, ResumeWindow: resume,
+	}, logger).Start()
+	lcWaitFor(t, "tunnel", func() bool {
+		x, err := net.DialTimeout("tcp", userAddr, time.Second)
+		if err != nil {
+			return false
+		}
+		defer x.Close()
+		_, err = x.Write([]byte("U"))
+		return err == nil
+	})
+	time.Sleep(2 * time.Second) // the pool fills
+
+	flow := func(mode byte) {
+		c, err := net.Dial("tcp", userAddr)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte{mode}); err != nil {
+			return
+		}
+		b := make([]byte, 64<<10)
+		if mode == 'I' {
+			_, _ = io.Copy(io.Discard, c)
+			return
+		}
+		if mode == 'U' {
+			for ctx.Err() == nil {
+				if _, err := c.Write(b); err != nil {
+					return
+				}
+			}
+			return
+		}
+		for {
+			n, err := c.Read(b)
+			down.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}
+	for i := 0; i < cpuCostEnv("CPU_COST_IDLE", 0); i++ { // flows that only sit there
+		go flow('I')
+	}
+	time.Sleep(time.Second)
+	for i := 0; i < flows; i++ {
+		if dir == "D" || dir == "B" {
+			go flow('D')
+		}
+		if dir == "U" || dir == "B" {
+			go flow('U')
+		}
+	}
+	time.Sleep(3 * time.Second) // warm up
+	var m0 runtime.MemStats
+	runtime.ReadMemStats(&m0)
+	c0, d0, u0, t0 := processCPU(), down.Load(), up.Load(), time.Now()
+	r0, w0 := processSyscalls()
+	peak := uint64(0)
+	for end := t0.Add(time.Duration(secs) * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+		peak = max(peak, m.HeapInuse)
+	}
+	r1, w1 := processSyscalls()
+	cpu, d, u, el := processCPU()-c0, down.Load()-d0, up.Load()-u0, time.Since(t0).Seconds()
+	var m1 runtime.MemStats
+	runtime.ReadMemStats(&m1)
+	// CPU_COST_HEAP=file writes what the heap holds while the flows still run.
+	if name := os.Getenv("CPU_COST_HEAP"); name != "" {
+		if f, err := os.Create(name); err == nil {
+			_ = pprof.Lookup("heap").WriteTo(f, 0)
+			f.Close()
+		}
+	}
+	if d+u == 0 {
+		t.Fatal("nothing got through")
+	}
+	t.Logf("flows=%d dir=%s resume=%v: to the user %.0f Mbit/s, from the user %.0f Mbit/s, %.2f cores, %.2f CPU seconds per GiB",
+		flows, dir, resume, float64(d)*8/el/1e6, float64(u)*8/el/1e6, cpu.Seconds()/el, cpu.Seconds()/(float64(d+u)/(1<<30)))
+	gib := float64(d+u) / (1 << 30)
+	t.Logf("system calls per GiB: %.0f reads, %.0f writes (a read or write moves %.0f KB on average)", float64(r1-r0)/gib, float64(w1-w0)/gib, float64(d+u)/1024/float64(max(1, r1-r0+w1-w0)))
+	t.Logf("memory: peak heap %d MB, %d collections in the run (%.1f per second)", peak>>20, m1.NumGC-m0.NumGC, float64(m1.NumGC-m0.NumGC)/el)
+}

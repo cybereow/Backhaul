@@ -3,7 +3,7 @@
 # ---- build stage ----
 # Build on the native builder arch and cross-compile to the target, so
 # multi-arch builds don't run the Go compiler under slow QEMU emulation.
-FROM --platform=$BUILDPLATFORM golang:1.24-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 WORKDIR /src
 
@@ -18,8 +18,10 @@ COPY . .
 # default image to keep it portable and cgo-free.
 ARG TARGETOS
 ARG TARGETARCH
+# The commit the image is built from, shown in the first line of its log.
+ARG COMMIT=unknown
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -ldflags="-s -w" -o /out/backhaul ./main.go
+    go build -ldflags="-s -w -X github.com/musix/backhaul/cmd.BuildCommit=${COMMIT}" -o /out/backhaul ./main.go
 
 # ---- runtime stage ----
 FROM alpine:3.20

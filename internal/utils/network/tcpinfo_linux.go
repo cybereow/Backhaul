@@ -79,3 +79,63 @@ func TCPDeliveryInfo(c net.Conn) (d TCPDelivery, ok bool) {
 	}
 	return d, ok
 }
+
+// TCPPath is the kernel's view of where a TCP connection's data is right now and
+// what has been holding its sender back. Every duration is cumulative since the
+// connection was opened; a caller wanting a rate takes the difference of two looks.
+type TCPPath struct {
+	RTT           time.Duration // smoothed round-trip time
+	NotSent       uint32        // bytes in the send queue TCP has not sent yet
+	Unacked       uint32        // segments sent and not yet acknowledged
+	Cwnd          uint32        // congestion window, in segments
+	MSS           uint32        // segment size
+	DeliveryRate  uint64        // bytes per second, the latest sample
+	Retrans       uint32        // segments retransmitted, in total
+	BytesAcked    uint64
+	BytesRecv     uint64
+	Busy          time.Duration // time with data waiting to be sent or acknowledged
+	RwndLimited   time.Duration // of that, time held back by the peer's receive window
+	SndbufLimited time.Duration // of that, time held back by this end's send buffer
+	Unread        uint32        // bytes received and not yet read by this process
+}
+
+// TCPPathInfo reads TCPPath from the TCP connection under c (see TCPDeliveryInfo
+// for what c may be).
+func TCPPathInfo(c net.Conn) (p TCPPath, ok bool) {
+	tc := underlyingTCP(c)
+	if tc == nil {
+		return p, false
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return p, false
+	}
+	cerr := raw.Control(func(fd uintptr) {
+		info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
+		if err != nil {
+			return
+		}
+		p = TCPPath{
+			RTT:           time.Duration(info.Rtt) * time.Microsecond,
+			NotSent:       info.Notsent_bytes,
+			Unacked:       info.Unacked,
+			Cwnd:          info.Snd_cwnd,
+			MSS:           info.Snd_mss,
+			DeliveryRate:  info.Delivery_rate,
+			Retrans:       info.Total_retrans,
+			BytesAcked:    info.Bytes_acked,
+			BytesRecv:     info.Bytes_received,
+			Busy:          time.Duration(info.Busy_time) * time.Microsecond,
+			RwndLimited:   time.Duration(info.Rwnd_limited) * time.Microsecond,
+			SndbufLimited: time.Duration(info.Sndbuf_limited) * time.Microsecond,
+		}
+		if n, err := unix.IoctlGetInt(int(fd), unix.SIOCINQ); err == nil && n > 0 {
+			p.Unread = uint32(n)
+		}
+		ok = true
+	})
+	if cerr != nil {
+		return TCPPath{}, false
+	}
+	return p, ok
+}

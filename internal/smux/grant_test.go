@@ -1,0 +1,459 @@
+package smux
+
+import (
+	"io"
+	"net"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+func grantPair(t *testing.T, session, stream int) (cli, srv *Session) {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.Version = 2
+	cfg.MaxReceiveBuffer = session
+	cfg.MaxStreamBuffer = stream
+	a, b := net.Pipe()
+	cli, err := Client(a, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cli.Close() })
+	srv, err = Server(b, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	return cli, srv
+}
+
+// Streams whose readers stop must not use up the session's receive budget: the
+// connection has to stay readable, so that a new stream can still be opened and
+// used while they are stuck. (Before the budget was shared among the streams,
+// four full streams halted the whole session.)
+func TestStalledStreamsDoNotHaltTheSession(t *testing.T) {
+	const session, stream = 4 << 20, 1 << 20
+	cli, srv := grantPair(t, session, stream)
+
+	// Eight streams, each read once (which announces its window) and then never
+	// again, while their writers send all they are allowed to.
+	for i := 0; i < 8; i++ {
+		w, err := cli.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		r, err := srv.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(r, make([]byte, 1)); err != nil {
+			t.Fatal(err)
+		}
+		go func() {
+			buf := make([]byte, 64<<10)
+			for {
+				if _, err := w.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(time.Second) // every writer has run into its window by now
+
+	// The session is still being read: a new stream gets through at once.
+	done := make(chan error, 1)
+	go func() {
+		w, err := cli.OpenStream()
+		if err != nil {
+			done <- err
+			return
+		}
+		if _, err := w.Write([]byte("ping")); err != nil {
+			done <- err
+			return
+		}
+		r, err := srv.AcceptStream()
+		if err != nil {
+			done <- err
+			return
+		}
+		_, err = io.ReadFull(r, make([]byte, 4))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a new stream did not get through: the session stopped being read")
+	}
+
+	if n, d := srv.BudgetHalts(); n != 0 {
+		t.Fatalf("the read loop halted on the budget %d time(s), %v in all", n, d)
+	}
+	srv.grantMu.Lock()
+	sum := srv.grantSum
+	srv.grantMu.Unlock()
+	if sum > session {
+		t.Fatalf("%d bytes granted out of a %d byte budget", sum, session)
+	}
+}
+
+// A stream that has the session to itself gets its whole configured window, as
+// before: sharing only starts when the streams carrying data would not all fit.
+func TestLoneStreamKeepsItsFullWindow(t *testing.T) {
+	const session, stream = 8 << 20, 2 << 20
+	cli, srv := grantPair(t, session, stream)
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(make([]byte, 64<<10)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, r)
+	// It gets there as it carries data: the window follows what is delivered.
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadUint32(&w.peerWindow) != stream {
+		if time.Now().After(deadline) {
+			t.Fatalf("the writer was told a window of %d, want the configured %d", atomic.LoadUint32(&w.peerWindow), stream)
+		}
+		if _, err := w.Write(make([]byte, 256<<10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// When more streams carry data than fit, they share the budget; and when the
+// streams end, everything granted is given back.
+func TestBusyStreamsShareTheBudgetAndGiveItBack(t *testing.T) {
+	const session, stream, n = 4 << 20, 2 << 20, 8
+	cli, srv := grantPair(t, session, stream)
+	var readers, writers []*Stream
+	for i := 0; i < n; i++ {
+		w, err := cli.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		r, err := srv.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		readers, writers = append(readers, r), append(writers, w)
+		go io.Copy(io.Discard, r)
+		go func() {
+			buf := make([]byte, 32<<10)
+			for {
+				if _, err := w.Write(buf); err != nil {
+					return
+				}
+			}
+		}()
+	}
+	time.Sleep(3 * grantTick) // the streams are counted and their windows settle
+
+	budget := int64(session) * grantShareNum / grantShareDen
+	srv.grantMu.Lock()
+	sum := srv.grantSum
+	srv.grantMu.Unlock()
+	if sum > budget+n*grantFloor {
+		t.Fatalf("%d bytes granted to %d busy streams out of a %d byte budget", sum, n, budget)
+	}
+	for i, w := range writers {
+		if win := atomic.LoadUint32(&w.peerWindow); win >= stream {
+			t.Fatalf("stream %d still has the full window (%d) with %d streams sharing %d", i, win, n, budget)
+		}
+	}
+	if halts, _ := srv.BudgetHalts(); halts != 0 {
+		t.Fatalf("the read loop halted on the budget %d time(s)", halts)
+	}
+
+	for i := range readers {
+		writers[i].Close()
+		readers[i].Close()
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		srv.grantMu.Lock()
+		sum = srv.grantSum
+		srv.grantMu.Unlock()
+		if sum == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d bytes are still granted after every stream was closed", sum)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A stream that has gone quiet gives its window back, and gets it again when it
+// carries data once more.
+func TestIdleStreamGivesItsWindowBack(t *testing.T) {
+	const session, stream = 8 << 20, 2 << 20
+	cli, srv := grantPair(t, session, stream)
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	send := func() {
+		t.Helper()
+		if _, err := w.Write(make([]byte, 512<<10)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, r)
+	send()
+	window := func() uint32 { return atomic.LoadUint32(&w.peerWindow) }
+	waitFor := func(what string, d time.Duration, ok func() bool) {
+		t.Helper()
+		end := time.Now().Add(d)
+		for !ok() {
+			if time.Now().After(end) {
+				t.Fatalf("%s (window %d)", what, window())
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	waitFor("the busy stream never got its full window", 3*time.Second, func() bool {
+		send()
+		return window() == stream
+	})
+	waitFor("the idle stream kept its window", idleReclaim+4*grantTick, func() bool { return window() == initialPeerWindow })
+	srv.grantMu.Lock()
+	sum := srv.grantSum
+	srv.grantMu.Unlock()
+	if sum != initialPeerWindow {
+		t.Fatalf("an idle stream is still granted %d bytes", sum)
+	}
+	// The window comes back with the data: as fast as the connection is seen to
+	// deliver it.
+	waitFor("the stream did not get its window again once it carried data", 3*time.Second, func() bool {
+		send()
+		return window() == stream
+	})
+}
+
+// What a session grants follows what its connection delivers: a slow connection
+// is not handed a window it would take seconds to carry, a fast one gets the lot.
+func TestBudgetFollowsTheDeliveredRate(t *testing.T) {
+	const session, stream = 64 << 20, 16 << 20
+	cli, srv := grantPair(t, session, stream)
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, r)
+
+	// About 1 MB/s for a while: the budget is what that carries in rateHorizon,
+	// or the floor, nowhere near the 32 MiB the bucket would allow.
+	chunk := make([]byte, 100<<10)
+	for end := time.Now().Add(1500 * time.Millisecond); time.Now().Before(end); {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if b := srv.grantBudget(); b > 2<<20 {
+		t.Fatalf("a connection delivering about 1 MB/s is granted %d bytes", b)
+	}
+	if win := atomic.LoadUint32(&w.peerWindow); win > 2<<20 {
+		t.Fatalf("its stream was given a window of %d bytes", win)
+	}
+
+	// As fast as it goes: the budget grows back to the bucket's share.
+	big := make([]byte, 1<<20)
+	end := time.Now().Add(5 * time.Second)
+	for srv.grantBudget() < session/2 {
+		if time.Now().After(end) {
+			t.Fatalf("a fast connection is still granted only %d bytes", srv.grantBudget())
+		}
+		if _, err := w.Write(big); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// What every session of a process may be granted is bounded as a whole, and a
+// session that ends gives its share back.
+func TestGlobalGrantBudgetBoundsAllSessions(t *testing.T) {
+	// 32 streams (16 on each end) start with their initial windows: 8 MiB. The
+	// budget leaves room beyond that for the busy ones, and no more.
+	const global = 12 << 20
+	// Whatever earlier tests' sessions still hold is given back as they end.
+	for end := time.Now().Add(5 * time.Second); GlobalGranted() != 0 && time.Now().Before(end); {
+		time.Sleep(20 * time.Millisecond)
+	}
+	SetGlobalGrantBudget(global)
+	defer SetGlobalGrantBudget(0)
+	base := GlobalGranted()
+
+	var servers []*Session
+	var clients []*Session
+	for p := 0; p < 4; p++ {
+		cli, srv := grantPair(t, 16<<20, 8<<20)
+		// Connections that deliver a lot: each session's own budget is its whole half-bucket.
+		cli.rateBudget.Store(1 << 30)
+		srv.rateBudget.Store(1 << 30)
+		clients, servers = append(clients, cli), append(servers, srv)
+		for i := 0; i < 4; i++ {
+			w, err := cli.OpenStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.Write(make([]byte, 128<<10)); err != nil {
+				t.Fatal(err)
+			}
+			r, err := srv.AcceptStream()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(r, make([]byte, 128<<10)); err != nil {
+				t.Fatal(err)
+			}
+			go func() { // sends all it is allowed to; its reader stops
+				buf := make([]byte, 64<<10)
+				for {
+					if _, err := w.Write(buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}
+	time.Sleep(2 * time.Second)
+
+	// A stream that opens when the budget is spent still starts on the initial
+	// window its peer assumes, so those come on top; without the limit every
+	// session grants its own half-bucket to its streams, and this is several
+	// times higher.
+	granted := GlobalGranted() - base
+	if granted > global+32*initialPeerWindow {
+		t.Fatalf("%d bytes granted in all, with a budget of %d", granted, global)
+	}
+	var sum int64
+	for _, sess := range append(append([]*Session(nil), servers...), clients...) {
+		sess.grantMu.Lock()
+		sum += sess.grantSum
+		sess.grantMu.Unlock()
+	}
+	if sum != granted {
+		t.Fatalf("the sessions say %d, the process %d", sum, granted)
+	}
+
+	for _, s := range append(clients, servers...) {
+		s.Close()
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for GlobalGranted() != base {
+		if time.Now().After(deadline) {
+			t.Fatalf("ended sessions still hold %d bytes of the budget", GlobalGranted()-base)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Streams that sit idle keep the window they were last given (at least the
+// initial one), and that must not count against the streams that are carrying
+// data: with many open streams the idle ones' windows alone exceed what a slow
+// connection is granted, which pinned every busy stream at the floor, which kept
+// the connection slow, which kept the budget low.
+func TestIdleStreamsDoNotPinBusyOnesAtTheFloor(t *testing.T) {
+	const session, stream = 64 << 20, 16 << 20
+	cli, srv := grantPair(t, session, stream)
+	var idle []*Stream
+	for i := 0; i < 40; i++ {
+		c, err := cli.OpenStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Write([]byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		s, err := srv.AcceptStream()
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(s, b); err != nil {
+			t.Fatal(err)
+		}
+		idle = append(idle, c)
+	}
+	_ = idle
+	time.Sleep(idleReclaim + time.Second) // quiet: nothing buffered, nothing arriving
+
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := srv.AcceptStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go io.Copy(io.Discard, r)
+
+	chunk := make([]byte, 100<<10) // about 1 MB/s, as a slow connection delivers
+	for end := time.Now().Add(2500 * time.Millisecond); time.Now().Before(end); {
+		if _, err := w.Write(chunk); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if win := atomic.LoadUint32(&w.peerWindow); win < 256<<10 {
+		t.Fatalf("the only busy stream of 41 was left on a window of %d bytes", win)
+	}
+}
+
+func TestStallReportNamesAWriterWaitingForWindow(t *testing.T) {
+	cli, srv := grantPair(t, 4<<20, 256<<10)
+	w, err := cli.OpenStream()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.AcceptStream(); err != nil { // nobody reads it
+		t.Fatal(err)
+	}
+	go w.Write(make([]byte, 8<<20)) // far more than the window
+	time.Sleep(600 * time.Millisecond)
+	rep := StallReport(300*time.Millisecond, 4)
+	if !strings.Contains(rep, "writers held up: stream") || !strings.Contains(rep, "KB outstanding") {
+		t.Fatalf("report = %q", rep)
+	}
+	if StallReport(time.Hour, 4) != "" {
+		t.Fatal("a report was made for waits that have not lasted that long")
+	}
+}

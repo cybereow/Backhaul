@@ -77,7 +77,10 @@ type PumpSwapper struct {
 	// Replay (level B): nil unless EnableReplay was called before Start.
 	replay     *replayState
 	replayGrow func(cur int) int // nil: the ring keeps its size
-	replayEnd  func()            // nil, or called once when replay is given up (OnReplayEnd)
+	// replayShrink gives back what a grown ring was charged once it has been
+	// idle (see SetReplayShrinker); nil: it keeps what it holds.
+	replayShrink func() int
+	replayEnd    func() // nil, or called once when replay is given up (OnReplayEnd)
 
 	holdReleased bool          // HoldReleasedTunnels
 	freezeWake   chan struct{} // FreezeUp nudges an upload pump parked on a full replay ring
@@ -340,6 +343,12 @@ func (p *PumpSwapper) start() {
 		wg.Wait()
 		p.app.Close()
 		p.lingerForAcks()
+		if p.replay != nil {
+			// The flow is over: whatever the ring still holds can never be
+			// replayed, so let it go now instead of when the pump is collected,
+			// and take it out of the process-wide figure.
+			p.replay.ring.discard()
+		}
 		close(p.done)
 		p.mu.Lock()
 		cur, next := p.cur, p.next
@@ -712,7 +721,8 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 	bufPtr := copyBufferPool.Get().(*[]byte)
 	full := *bufPtr // what a read may use; buf below is the part it uses on this tunnel
 	buf := full
-	defer copyBufferPool.Put(bufPtr)
+	// bufPtr changes when the replay ring takes a buffer over (see appendOwned).
+	defer func() { copyBufferPool.Put(bufPtr) }()
 
 	p.mu.Lock()
 	dst := p.cur
@@ -739,10 +749,13 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 					n, err = pend, srcErr
 					pend, srcErr = 0, nil
 				} else {
+					t0 := time.Now()
 					n, err = app.Read(buf)
+					pumpWait[waitAppRead].Add(int64(time.Since(t0)))
 				}
 				if n > 0 {
 					interrupted := false
+					sent := full[:n] // what goes to the tunnel
 					if p.replaying() != nil {
 						// Keep what is being sent until the peer acknowledges it, and
 						// wait here (not in the app's socket) while a full window of it
@@ -757,12 +770,22 @@ func (p *PumpSwapper) pumpAppToTunnel(usage *web.Usage, remotePort int, sniffer 
 							// the ACKs that would make room only come after it: hold the
 							// read instead of letting the ring grow past its limit.
 							pend = n
+						} else if n >= ringOwnMin {
+							// The ring keeps this very buffer until the peer has the
+							// bytes: no copy. What is written below is read from it, and
+							// cannot be acknowledged before it has been written.
+							p.replay.ring.appendOwned(bufPtr, n)
+							sent = full[:n]
+							bufPtr = copyBufferPool.Get().(*[]byte)
+							full = *bufPtr
 						} else {
 							p.replay.ring.append(full[:n])
 						}
 					}
 					if !interrupted {
-						w, werr := writeFull(dst, full[:n])
+						t1 := time.Now()
+						w, werr := writeFull(dst, sent)
+						pumpWait[waitTunnelWrite].Add(int64(time.Since(t1)))
 						p.upBytes.Add(uint64(w))
 						if sniffer {
 							usage.AddOrUpdatePort(remotePort, uint64(n))
@@ -907,9 +930,13 @@ dl:
 					toRead = int(rem)
 				}
 			}
+			t0 := time.Now()
 			n, err := src.Read(buf[:toRead])
+			pumpWait[waitTunnelRead].Add(int64(time.Since(t0)))
 			if n > 0 {
+				t1 := time.Now()
 				w, werr := writeFull(app, buf[:n])
+				pumpWait[waitAppWrite].Add(int64(time.Since(t1)))
 				p.dlBytes.Add(uint64(w))
 				if sniffer {
 					usage.AddOrUpdatePort(remotePort, uint64(n))
@@ -1110,6 +1137,32 @@ const replayGrowAfter = 3 * time.Millisecond
 // idle ones stay small. Call before Start.
 func (p *PumpSwapper) SetReplayGrower(grow func(cur int) int) { p.replayGrow = grow }
 
+// replayShrinkAfter is how long a ring that has been emptied is left alone before
+// it is taken back to its starting size: a transfer that has just ended may be
+// followed by another on the same connection.
+const replayShrinkAfter = 2 * time.Second
+
+// SetReplayShrinker lets the replay ring go back to its starting size when it
+// has been empty for replayShrinkAfter; shrink gives the budget back what the
+// growth was charged and returns the starting limit.
+func (p *PumpSwapper) SetReplayShrinker(shrink func() int) { p.replayShrink = shrink }
+
+// replayEmptied is called when an ACK has emptied the ring.
+func (p *PumpSwapper) replayEmptied() {
+	if p.replayShrink == nil || p.replay == nil {
+		return
+	}
+	ring := p.replay.ring
+	if ring.getLimit() <= ReplayFlowStart {
+		return
+	}
+	ring.arm(replayShrinkAfter, func() {
+		if ring.shrinkIfIdle(ReplayFlowStart) {
+			p.replayShrink()
+		}
+	})
+}
+
 // growReplay tries to enlarge the full replay ring; it reports whether it did.
 func (p *PumpSwapper) growReplay() bool {
 	if p.replayGrow == nil {
@@ -1134,6 +1187,7 @@ func (p *PumpSwapper) EnableReplay(limit int) error {
 		return errors.New("replay needs a tunnel that carries ACK records")
 	}
 	ring := newReplayRing(limit)
+	ring.onEmpty = p.replayEmptied
 	if len(p.proxyHeader) > 0 {
 		ring.append(p.proxyHeader) // already written, and counted in UpBytes: keep it until the peer has it
 	}
@@ -1259,6 +1313,15 @@ func (p *PumpSwapper) flushAck() {
 // resume, so the caller holds its read back rather than overfilling the ring. ok is
 // false when the flow was aborted.
 func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
+	if p.replay.ring.free() < n {
+		// A sender held up by a full ring: counted while it waits (see ReplayGauges).
+		replayWaiting.Add(1)
+		since := time.Now()
+		defer func() {
+			replayWaiting.Add(-1)
+			replayWaitNs.Add(int64(time.Since(since)))
+		}()
+	}
 	// The ring only grows for a sender that has waited a real round trip for room: a
 	// full ring that an ACK frees within microseconds (a LAN, a busy scheduler) is
 	// not what limits the flow, and a big ring costs cache for nothing.
@@ -1306,4 +1369,26 @@ func (p *PumpSwapper) waitReplayRoom(n int) (ok, interrupted bool) {
 			return false, false
 		}
 	}
+}
+
+// Where the time of a flow's pumps goes, summed over every flow of the process,
+// for the pool health line. A pump spends its time in one of four calls, and
+// which one it waits in says who holds the flow back: the user or the local
+// service (reading from, or writing to, the application socket), or the tunnel
+// (reading from, or writing to, it - which blocks on the peer's window).
+const (
+	waitAppRead = iota
+	waitTunnelWrite
+	waitTunnelRead
+	waitAppWrite
+	numWaits
+)
+
+var pumpWait [numWaits]atomic.Int64
+
+// PumpWaits are the totals so far, in the order: reading the application socket,
+// writing the tunnel, reading the tunnel, writing the application socket.
+func PumpWaits() (appRead, tunnelWrite, tunnelRead, appWrite time.Duration) {
+	return time.Duration(pumpWait[waitAppRead].Load()), time.Duration(pumpWait[waitTunnelWrite].Load()),
+		time.Duration(pumpWait[waitTunnelRead].Load()), time.Duration(pumpWait[waitAppWrite].Load())
 }

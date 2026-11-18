@@ -7,6 +7,9 @@ import (
 	"time"
 
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/poolhealth"
+	"github.com/musix/backhaul/internal/utils/proclimits"
+	"github.com/sirupsen/logrus"
 )
 
 // Capacity-aware placement.
@@ -167,16 +170,35 @@ func capacityPenalty(est, best float64) float64 {
 	return math.Min(best/est, capMaxPenalty)
 }
 
+// How often, and for how long, a busy process looks at where its CPU goes (debug
+// level only; see proclimits.Sampler).
+const (
+	briefEvery      = 30 * time.Second // how often the info level writes its short pool line, while busy
+	cpuProfileEvery = 30 * time.Second
+	cpuProfileFor   = 3 * time.Second
+)
+
+// healthEvery is how many capacity samples pass between two pool health lines.
+const healthEvery = 2
+
 // capacityLoop samples every pool session once a capSampleEvery and refreshes
 // the penalties. It is the only goroutine that touches the estimates.
 func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 	t := time.NewTicker(capSampleEvery)
 	defer t.Stop()
+	// How late this process's own timers fire: a stall is judged from late answers,
+	// and a process that is not getting its CPU time answers late (see noteHealth).
+	proclimits.Sched.Start(g.ctx)
 	// Stalls are looked for more often than capacity is sampled: every look that
 	// is late is that much longer a flow sits on a connection that has stopped.
 	st := time.NewTicker(stallEvery)
 	defer st.Stop()
 	hosts := make(map[string]*hostCapacity)
+	// Where the pool's data is waiting, once every healthEvery samples while it
+	// carries traffic (debug level only): see package poolhealth.
+	health, tick := poolhealth.New("server"), 0
+	var lastBrief time.Time
+	var sampler proclimits.Sampler
 	snapshot := func() []*pooledSession {
 		s.sessionsMu.Lock()
 		defer s.sessionsMu.Unlock()
@@ -187,7 +209,37 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 		case <-g.ctx.Done():
 			return
 		case now := <-t.C:
-			sampleCapacity(snapshot(), hosts, now, network.TCPDeliveryInfo)
+			sessions := snapshot()
+			sampleCapacity(sessions, hosts, now, network.TCPDeliveryInfo)
+			debug := s.logger.IsLevelEnabled(logrus.DebugLevel)
+			tick++
+			if !debug && now.Sub(lastBrief) >= briefEvery {
+				// A short line now and then keeps the throughput and the process's use
+				// visible without the debug level's volume.
+				lastBrief = now
+				members := make([]poolhealth.Member, 0, len(sessions))
+				for _, ps := range sessions {
+					members = append(members, poolhealth.Member{Conn: ps.conn, Session: ps.session})
+				}
+				if _, ok := health.Report(now, members); ok {
+					s.logger.Info(health.Brief())
+				}
+			}
+			if tick%healthEvery == 0 && debug {
+				members := make([]poolhealth.Member, 0, len(sessions))
+				for _, ps := range sessions {
+					m := poolhealth.Member{Conn: ps.conn, Session: ps.session}
+					if sent := ps.probeSent.Load(); sent != 0 {
+						m.ProbeOut = now.Sub(time.Unix(0, sent))
+					}
+					members = append(members, m)
+				}
+				if line, ok := health.Report(now, members); ok {
+					s.logger.Debug(line)
+					// While the pool is busy: where the CPU goes, now and then.
+					sampler.Maybe(now, cpuProfileEvery, cpuProfileFor, 6, func(l string) { s.logger.Debug(l) })
+				}
+			}
 		case now := <-st.C:
 			sessions := snapshot()
 			for _, ps := range sessions {
@@ -196,6 +248,10 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 					d, ok = network.TCPDeliveryInfo(ps.conn)
 				}
 				ps.noteHealth(now, ok && d.Backoff >= stallBackoff)
+			}
+			if n := shedSharedLoad(sessions); n > 0 && now.Sub(s.lastShedLog) >= 5*time.Second {
+				s.lastShedLog = now
+				s.logger.Debugf("%d of %d pool connections show only a late echo: taken for load they share, not a stall; their flows stay", n, len(sessions))
 			}
 			s.moveOffStalled(g, sessions, now)
 		}

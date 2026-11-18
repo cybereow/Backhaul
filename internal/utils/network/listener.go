@@ -87,3 +87,36 @@ func ListenWithBuffers(network, address string, rcvBufSize, sndBufSize, mss int,
 
 	return listener, err
 }
+
+// ListenCapped is net.Listen("tcp", address) with the receive and send buffer of
+// every accepted connection held to rcv and snd bytes (0 = left to the kernel).
+//
+// A socket left to autotuning may take megabytes for itself (tcp_rmem and
+// tcp_wmem allow it), and the kernel charges them to the container: on a server
+// held to a couple of hundred megabytes, a pool of sockets whose reader is
+// starved for CPU fills them and the container is killed. A cap on the buffer is
+// also what pushes back on a fast peer, through the TCP window, in time.
+func ListenCapped(address string, rcv, snd int) (net.Listener, error) {
+	lc := &net.ListenConfig{
+		Control: func(network, addr string, c syscall.RawConn) error {
+			var err error
+			if cerr := c.Control(func(fd uintptr) {
+				if rcv > 0 {
+					if e := setRecvBuf(int(fd), rcv); e != nil {
+						err = fmt.Errorf("failed to set SO_RCVBUF: %v", e)
+						return
+					}
+				}
+				if snd > 0 {
+					if e := setSendBuf(int(fd), snd); e != nil {
+						err = fmt.Errorf("failed to set SO_SNDBUF: %v", e)
+					}
+				}
+			}); cerr != nil {
+				return cerr
+			}
+			return err
+		},
+	}
+	return lc.Listen(context.Background(), "tcp", address)
+}

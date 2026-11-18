@@ -69,9 +69,28 @@ type Stream struct {
 
 	updLock sync.Mutex // orders window updates, see sendWindowUpdate
 
+	// For the stall report (see report.go): when the writer began waiting for
+	// the peer's window (0 = not waiting) and when the peer's last window update
+	// arrived, both as UnixNano.
+	waitSince atomic.Int64
+	lastUpd   atomic.Int64
+
 	// rcvWindow, when not zero, is this stream's receive window in place of the
 	// session's MaxStreamBuffer (see SetReceiveWindow). Atomic.
 	rcvWindow uint32
+
+	// The stream's part of the session budget (see grant.go). announced is the
+	// window the peer was last told (atomic); the rest belongs to sess.grantMu:
+	// grant is the most the peer may have outstanding, limit the highest position
+	// it was ever allowed to send up to, consumed64 and updConsumed how far the
+	// reader had got at the last update.
+	announced   uint32
+	grant       int64
+	limit       uint64
+	consumed64  uint64
+	updConsumed uint32
+	// lastData is when data last arrived for this stream, in unix nanoseconds.
+	lastData atomic.Int64
 }
 
 // newStream initiates a Stream struct
@@ -85,6 +104,8 @@ func newStream(id uint32, frameSize int, sess *Session) *Stream {
 	s.die = make(chan struct{})
 	s.chFinEvent = make(chan struct{})
 	s.peerWindow = initialPeerWindow // set to initial window size
+	s.lastData.Store(time.Now().UnixNano())
+	sess.grantOpen(s)
 	return s
 }
 
@@ -188,7 +209,7 @@ func (s *Stream) tryReadv2(b []byte) (n int, err error) {
 	s.incr += uint32(n)
 
 	// for initial reading, send window update
-	if s.incr >= s.receiveWindow()/windowUpdateDivisor || s.numRead == uint32(n) {
+	if s.incr >= s.updateQuantum() || s.numRead == uint32(n) {
 		notifyConsumed = s.numRead
 		s.incr = 0 // reset couting for next window update
 	}
@@ -265,7 +286,7 @@ func (s *Stream) writeTov2(w io.Writer) (n int64, err error) {
 		}
 		s.numRead += uint32(len(buf))
 		s.incr += uint32(len(buf))
-		if s.incr >= s.receiveWindow()/windowUpdateDivisor || s.numRead == uint32(len(buf)) {
+		if s.incr >= s.updateQuantum() || s.numRead == uint32(len(buf)) {
 			notifyConsumed = s.numRead
 			s.incr = 0
 		}
@@ -348,7 +369,7 @@ func (s *Stream) sendWindowUpdate() error {
 	frame := newFrame(byte(s.sess.config.Version), cmdUPD, s.id)
 	var hdr updHeader
 	binary.LittleEndian.PutUint32(hdr[:], consumed)
-	binary.LittleEndian.PutUint32(hdr[4:], s.receiveWindow())
+	binary.LittleEndian.PutUint32(hdr[4:], s.sess.grantWindow(s, consumed, s.receiveWindow()))
 	frame.data = hdr[:]
 	_, err := s.sess.writeFrameInternal(frame, deadline, CLSCTRL)
 	return err
@@ -510,16 +531,29 @@ func (s *Stream) writeV2(b []byte) (n int, err error) {
 		// wait until stream closes, window changes or deadline reached
 		// this blocking behavior will back propagate flow control to upper layer.
 		if len(b) > 0 {
+			waitStart := time.Now()
+			windowWaiting.Add(1)
+			s.waitSince.Store(waitStart.UnixNano())
+			endWait := func() {
+				s.waitSince.Store(0)
+				windowWaiting.Add(-1)
+				windowWaitNs.Add(int64(time.Since(waitStart)))
+			}
 			select {
 			case <-s.chFinEvent:
+				endWait()
 				return 0, io.EOF
 			case <-s.die:
+				endWait()
 				return sent, io.ErrClosedPipe
 			case <-deadline:
+				endWait()
 				return sent, ErrTimeout
 			case <-s.sess.chSocketWriteError:
+				endWait()
 				return sent, s.sess.socketWriteError.Load().(error)
 			case <-s.chUpdate: // notify of remote data consuming and window update
+				endWait()
 				continue
 			}
 		} else {
@@ -615,6 +649,8 @@ func (s *Stream) RemoteAddr() net.Addr {
 
 // pushBytes append buf to buffers
 func (s *Stream) pushBytes(buf []byte) (written int, err error) {
+	s.lastData.Store(s.sess.lastRecv.Load()) // recvLoop stamped it for this frame
+	s.sess.rxData.Add(int64(len(buf)))
 	s.bufferLock.Lock()
 	s.buffers = append(s.buffers, buf)
 	s.heads = append(s.heads, buf)
@@ -647,6 +683,7 @@ func (s *Stream) notifyReadEvent() {
 func (s *Stream) update(consumed uint32, window uint32) {
 	atomic.StoreUint32(&s.peerConsumed, consumed)
 	atomic.StoreUint32(&s.peerWindow, window)
+	s.lastUpd.Store(time.Now().UnixNano())
 	select {
 	case s.chUpdate <- struct{}{}:
 	default:
@@ -658,4 +695,17 @@ func (s *Stream) fin() {
 	s.finEventOnce.Do(func() {
 		close(s.chFinEvent)
 	})
+}
+
+// Process-wide figures about writers held up by the peer's window, for the pool
+// health line: how many wait now, and for how long in all.
+var (
+	windowWaiting atomic.Int64
+	windowWaitNs  atomic.Int64
+)
+
+// WindowGauges are the number of stream writers now waiting for the peer to open
+// its window, and the time writers have waited for it since the process started.
+func WindowGauges() (waiting int64, waited time.Duration) {
+	return windowWaiting.Load(), time.Duration(windowWaitNs.Load())
 }

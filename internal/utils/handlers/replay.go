@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,21 +16,45 @@ import (
 // is the same backpressure TCP's window gives. Memory is only held while there are
 // unacknowledged bytes: it starts empty, grows by doubling, and is released when
 // everything has been acknowledged.
-type replayRing struct {
-	mu    sync.Mutex
-	buf   []byte
-	head  int    // index in buf of the first retained byte
-	size  int    // retained bytes
-	base  uint64 // flow offset of the first retained byte
-	limit int
+// Process-wide figures about the rings, for the pool health line: what they hold
+// now, and how many senders wait for room in one, for how long in all.
+var (
+	replayHeld    atomic.Int64
+	replayWaiting atomic.Int64
+	replayWaitNs  atomic.Int64
+)
 
-	space chan struct{} // signalled (capacity 1) when an ACK freed room
+// ReplayGauges are the process's replay figures: bytes held in rings now,
+// senders waiting for room in a full ring now, and the time senders have waited
+// for room since the process started.
+func ReplayGauges() (held, waiting int64, waited time.Duration) {
+	return replayHeld.Load(), replayWaiting.Load(), time.Duration(replayWaitNs.Load())
 }
 
-const (
-	replayMinCap    = 32 << 10
-	replayReleaseAt = 256 << 10 // an emptied ring bigger than this gives its memory back
-)
+// A ringChunk is a stretch of retained bytes in a buffer from copyBufferPool,
+// returned to it once all of the chunk has been acknowledged.
+type ringChunk struct {
+	bp   *[]byte
+	s, e int // the retained bytes are (*bp)[s:e]
+}
+
+type replayRing struct {
+	mu     sync.Mutex
+	chunks []ringChunk // oldest first
+	size   int         // retained bytes
+	base   uint64      // flow offset of the first retained byte
+	limit  int
+
+	space chan struct{} // signalled (capacity 1) when an ACK freed room
+
+	onEmpty func()      // called, outside mu, when an ACK has emptied the ring
+	idle    *time.Timer // see arm
+}
+
+// ringOwnMin is the least a read must be for the ring to take over its buffer
+// (appendOwned) instead of copying it: a smaller one would leave most of a
+// chunk's memory idle for as long as its bytes are retained.
+const ringOwnMin = copyBufferSize * 3 / 4
 
 var (
 	errReplayTooLarge = errors.New("replay: write larger than the replay limit")
@@ -59,8 +84,12 @@ func (r *replayRing) setLimit(n int) {
 // will never be used again must not, its share of the budget is being released.)
 func (r *replayRing) discard() {
 	r.mu.Lock()
+	replayHeld.Add(-int64(r.size))
 	r.base += uint64(r.size)
-	r.head, r.size, r.buf = 0, 0, nil
+	for _, c := range r.chunks {
+		copyBufferPool.Put(c.bp)
+	}
+	r.chunks, r.size = nil, 0
 	r.mu.Unlock()
 	select {
 	case r.space <- struct{}{}:
@@ -125,44 +154,34 @@ func (r *replayRing) waitFree(ctx context.Context, abort <-chan struct{}, wake <
 	}
 }
 
-// append stores p. The caller has made room with waitFree; the ring does not
-// exceed its limit even if it has not.
+// append stores a copy of p. The caller has made room with waitFree; the ring
+// does not exceed its limit even if it has not.
 func (r *replayRing) append(p []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if need := r.size + len(p); need > len(r.buf) {
-		newCap := len(r.buf) * 2
-		if newCap < replayMinCap {
-			newCap = replayMinCap
+	for len(p) > 0 {
+		if n := len(r.chunks); n == 0 || r.chunks[n-1].e == copyBufferSize {
+			r.chunks = append(r.chunks, ringChunk{bp: copyBufferPool.Get().(*[]byte)})
 		}
-		for newCap < need {
-			newCap *= 2
-		}
-		if newCap > r.limit {
-			newCap = max(r.limit, need) // never more than needed past the limit
-		}
-		nb := make([]byte, newCap)
-		r.copyOut(nb[:r.size])
-		r.buf, r.head = nb, 0
+		t := &r.chunks[len(r.chunks)-1]
+		c := copy((*t.bp)[t.e:], p)
+		t.e += c
+		p = p[c:]
+		r.size += c
+		replayHeld.Add(int64(c))
 	}
-	tail := (r.head + r.size) % len(r.buf)
-	n := copy(r.buf[tail:], p)
-	if n < len(p) {
-		copy(r.buf, p[n:])
-	}
-	r.size += len(p)
 }
 
-// copyOut copies the retained bytes, in order, into dst (len(dst) <= size).
-// The caller holds mu.
-func (r *replayRing) copyOut(dst []byte) {
-	if len(dst) == 0 {
-		return
-	}
-	n := copy(dst, r.buf[r.head:min(r.head+r.size, len(r.buf))])
-	if n < len(dst) {
-		copy(dst[n:], r.buf)
-	}
+// appendOwned retains the first n bytes of *bp without copying them: the ring
+// takes the buffer, and the caller must neither write to those bytes nor put the
+// buffer back (it may go on reading them, until the bytes have been sent: the
+// peer cannot acknowledge what has not been). n must be at least ringOwnMin.
+func (r *replayRing) appendOwned(bp *[]byte, n int) {
+	r.mu.Lock()
+	r.chunks = append(r.chunks, ringChunk{bp: bp, e: n})
+	r.size += n
+	r.mu.Unlock()
+	replayHeld.Add(int64(n))
 }
 
 // ackTo drops every byte before flow offset off. An offset outside what is
@@ -175,20 +194,58 @@ func (r *replayRing) ackTo(off uint64) {
 		return
 	}
 	drop := int(off - r.base)
-	r.head = (r.head + drop) % max(len(r.buf), 1)
+	replayHeld.Add(-int64(drop))
 	r.size -= drop
 	r.base = off
-	if r.size == 0 {
-		r.head = 0
-		if len(r.buf) > replayReleaseAt {
-			r.buf = nil
+	for left := drop; left > 0; {
+		c := &r.chunks[0]
+		if avail := c.e - c.s; left >= avail {
+			left -= avail
+			copyBufferPool.Put(c.bp)
+			r.chunks[0] = ringChunk{}
+			r.chunks = r.chunks[1:]
+		} else {
+			c.s += left
+			left = 0
 		}
 	}
+	empty := r.size == 0
+	if empty {
+		r.chunks = nil
+	}
+	hook := r.onEmpty
 	r.mu.Unlock()
 	select {
 	case r.space <- struct{}{}:
 	default:
 	}
+	if empty && hook != nil {
+		hook()
+	}
+}
+
+// shrinkIfIdle puts the limit back to to if nothing is retained, and reports
+// whether it did.
+func (r *replayRing) shrinkIfIdle(to int) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size != 0 || r.limit <= to {
+		return false
+	}
+	r.limit = to
+	return true
+}
+
+// arm runs f after d unless the ring is armed again first: it is how a ring that
+// has been emptied is given a moment to be filled again before it is shrunk.
+func (r *replayRing) arm(d time.Duration, f func()) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.idle == nil {
+		r.idle = time.AfterFunc(d, f)
+		return
+	}
+	r.idle.Reset(d)
 }
 
 // readAt copies retained bytes starting at flow offset off into p and returns how
@@ -202,10 +259,17 @@ func (r *replayRing) readAt(off uint64, p []byte) int {
 	}
 	skip := int(off - r.base)
 	n := min(len(p), r.size-skip)
-	start := (r.head + skip) % len(r.buf)
-	c := copy(p[:n], r.buf[start:min(start+n, len(r.buf))])
-	if c < n {
-		copy(p[c:n], r.buf)
+	got := 0
+	for _, c := range r.chunks {
+		if avail := c.e - c.s; skip >= avail {
+			skip -= avail
+			continue
+		}
+		got += copy(p[got:n], (*c.bp)[c.s+skip:c.e])
+		skip = 0
+		if got == n {
+			break
+		}
 	}
-	return n
+	return got
 }

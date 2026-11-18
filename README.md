@@ -121,6 +121,11 @@ To start using the solution, you'll need to configure both server and client com
 
 
 
+    # ws/wss/wsmux/wssmux: if `ports` is empty AND `fallback` is unset, requests that reach bind_addr but are
+    # not tunnel traffic are forwarded through the tunnel to the SAME port on the client. E.g. with
+    # bind_addr = "0.0.0.0:443" the tunnel and a public HTTP service behind the client (port 443 there)
+    # share port 443. The client receives plain HTTP (TLS is already terminated by the server for wss/wssmux);
+    # WebSocket upgrades are proxied too. Set `ports` or `fallback` to turn this off.
     ports = [
     "443-600",                  # Listen on all ports in the range 443 to 600
     "443-600=5201",             # Listen on all ports in the range 443 to 600 and forward traffic to 5201

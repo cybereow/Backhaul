@@ -120,15 +120,76 @@ func TestReplayRingBackpressure(t *testing.T) {
 func TestReplayRingReleasesMemory(t *testing.T) {
 	r := newReplayRing(4 << 20)
 	r.append(make([]byte, 1<<20))
-	if len(r.buf) < 1<<20 {
-		t.Fatal("ring did not grow")
+	if len(r.chunks) < (1<<20)/copyBufferSize {
+		t.Fatalf("ring holds %d chunks for 1 MiB", len(r.chunks))
 	}
 	r.ackTo(1 << 20)
-	if r.buf != nil {
-		t.Fatalf("an empty ring still holds %d bytes", len(r.buf))
+	if r.chunks != nil {
+		t.Fatalf("an empty ring still holds %d chunks", len(r.chunks))
 	}
 	r.append([]byte("again")) // and works afterwards
 	if r.len() != 5 || r.end() != 1<<20+5 {
 		t.Fatalf("len=%d end=%d", r.len(), r.end())
+	}
+}
+
+// Bytes handed over with appendOwned are kept as they are, in order with copied
+// ones, read back across chunk boundaries, and released only when acknowledged.
+func TestReplayRingKeepsOwnedBuffers(t *testing.T) {
+	r := newReplayRing(8 << 20)
+	var want []byte
+	put := func(n int, own bool) {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(len(want) + i)
+		}
+		want = append(want, b...)
+		if own {
+			bp := copyBufferPool.Get().(*[]byte)
+			copy(*bp, b)
+			r.appendOwned(bp, n)
+		} else {
+			r.append(b)
+		}
+	}
+	put(1000, false)
+	put(copyBufferSize, true)
+	put(70000, false) // spans two chunks
+	put(copyBufferSize-5, true)
+	put(3, false)
+	if r.len() != len(want) || r.end() != uint64(len(want)) {
+		t.Fatalf("len=%d end=%d want %d", r.len(), r.end(), len(want))
+	}
+	got := make([]byte, len(want))
+	for off := 0; off < len(want); {
+		n := r.readAt(uint64(off), got[off:min(len(got), off+9000)])
+		if n == 0 {
+			t.Fatalf("nothing at %d", off)
+		}
+		off += n
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatal("what was read back differs from what was stored")
+	}
+	// Acknowledge in odd steps, reading what is left each time.
+	acked := 0
+	for _, step := range []int{1, 999, 1, copyBufferSize, 33333, 40000} {
+		acked += step
+		r.ackTo(uint64(acked))
+		rest := make([]byte, len(want)-acked)
+		for off := 0; off < len(rest); {
+			n := r.readAt(uint64(acked+off), rest[off:])
+			if n == 0 {
+				t.Fatalf("after ack %d: nothing at %d", acked, acked+off)
+			}
+			off += n
+		}
+		if !bytes.Equal(rest, want[acked:]) {
+			t.Fatalf("after ack %d the rest differs", acked)
+		}
+	}
+	r.ackTo(uint64(len(want)))
+	if r.chunks != nil || r.len() != 0 {
+		t.Fatal("not empty after everything was acknowledged")
 	}
 }

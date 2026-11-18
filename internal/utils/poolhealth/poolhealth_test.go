@@ -86,4 +86,14 @@ func TestReportDescribesABusyPool(t *testing.T) {
 			t.Errorf("line lacks %q:\n%s", want, line)
 		}
 	}
+	// The short form, for the info level, is much shorter and has the same figures.
+	brief := r.Brief()
+	for _, want := range []string{"pool (client)", "1 conns", "1 streams", "out ", "process: cpu"} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("brief lacks %q:\n%s", want, brief)
+		}
+	}
+	if len(brief) >= len(line)/2 {
+		t.Errorf("the brief line (%d bytes) is not much shorter than the full one (%d)", len(brief), len(line))
+	}
 }

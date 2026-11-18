@@ -173,6 +173,7 @@ func capacityPenalty(est, best float64) float64 {
 // How often, and for how long, a busy process looks at where its CPU goes (debug
 // level only; see proclimits.Sampler).
 const (
+	briefEvery      = 30 * time.Second // how often the info level writes its short pool line, while busy
 	cpuProfileEvery = 30 * time.Second
 	cpuProfileFor   = 3 * time.Second
 )
@@ -196,6 +197,7 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 	// Where the pool's data is waiting, once every healthEvery samples while it
 	// carries traffic (debug level only): see package poolhealth.
 	health, tick := poolhealth.New("server"), 0
+	var lastBrief time.Time
 	var sampler proclimits.Sampler
 	snapshot := func() []*pooledSession {
 		s.sessionsMu.Lock()
@@ -209,7 +211,21 @@ func (s *WsMuxTransport) capacityLoop(g *wsGeneration) {
 		case now := <-t.C:
 			sessions := snapshot()
 			sampleCapacity(sessions, hosts, now, network.TCPDeliveryInfo)
-			if tick++; tick%healthEvery == 0 && s.logger.IsLevelEnabled(logrus.DebugLevel) {
+			debug := s.logger.IsLevelEnabled(logrus.DebugLevel)
+			tick++
+			if !debug && now.Sub(lastBrief) >= briefEvery {
+				// A short line now and then keeps the throughput and the process's use
+				// visible without the debug level's volume.
+				lastBrief = now
+				members := make([]poolhealth.Member, 0, len(sessions))
+				for _, ps := range sessions {
+					members = append(members, poolhealth.Member{Conn: ps.conn, Session: ps.session})
+				}
+				if _, ok := health.Report(now, members); ok {
+					s.logger.Info(health.Brief())
+				}
+			}
+			if tick%healthEvery == 0 && debug {
 				members := make([]poolhealth.Member, 0, len(sessions))
 				for _, ps := range sessions {
 					m := poolhealth.Member{Conn: ps.conn, Session: ps.session}

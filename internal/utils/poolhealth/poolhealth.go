@@ -48,6 +48,8 @@ type Reporter struct {
 	replayOpenRefused, replayGrowRefused int
 	replayWaited, windowWaited           time.Duration
 	pumpWaits                            [4]time.Duration
+	// brief is the short form of the line Report last made (see Brief).
+	brief, procBrief string
 }
 
 // New returns a Reporter whose lines are marked with role ("server", "client").
@@ -120,6 +122,7 @@ func (r *Reporter) Report(now time.Time, members []Member) (line string, ok bool
 	if n == 0 || out+in < minRate {
 		return "", false
 	}
+	r.brief = fmt.Sprintf("pool (%s): %d conns, %d streams | out %.1f MB/s, in %.1f MB/s | %s", r.role, n, streams, out/(1<<20), in/(1<<20), r.procBrief)
 	return fmt.Sprintf("pool health (%s): %d conns, %d streams | out %.1f MB/s, in %.1f MB/s | rtt ms min/med/max %.0f/%.0f/%.0f | unsent KB med/max %.0f/%.0f | est. wait behind unsent ms med/max %.0f/%.0f | held by peer's window %% avg/max %.0f/%.0f | held by own send buffer %% avg/max %.0f/%.0f | busy %% avg %.0f | retrans %d | session budget halts %d (longest %v) | probes waiting %d (oldest %v) | unread KB med/max %.0f/%.0f | %s",
 		r.role, n, streams, out/(1<<20), in/(1<<20),
 		minOf(rtts), median(rtts), maxOf(rtts),
@@ -132,6 +135,10 @@ func (r *Reporter) Report(now time.Time, members []Member) (line string, ok bool
 		probes, probeMax.Round(time.Millisecond),
 		median(unread), maxOf(unread), process), true
 }
+
+// Brief is the short form of the last line Report returned: throughput and what
+// the process used, for a log level that does not take the long one.
+func (r *Reporter) Brief() string { return r.brief }
 
 // process describes what this process used since the previous look, next to what
 // its container allows. A pool whose sockets are all idle and whose answers are
@@ -177,6 +184,8 @@ func (r *Reporter) process(now time.Time) string {
 		(cur[2] - r.pumpWaits[2]).Round(time.Millisecond), (cur[3] - r.pumpWaits[3]).Round(time.Millisecond))
 	r.pumpWaits = cur
 	r.replayOpenRefused, r.replayGrowRefused = rs.OpenRefused, rs.GrowRefused
+	r.procBrief = fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times, memory %d of %s MB, heap %d MB",
+		cores, limit, u.Throttles-old.Throttles, u.Memory>>20, mem, u.Heap>>20)
 	return replay + " | " + fmt.Sprintf("process: cpu %.2f cores (%s), throttled %d times for %v, longest wait for a CPU %v, memory %d of %s MB, heap %d MB, goroutines %d, threads allowed %d",
 		cores, limit, u.Throttles-old.Throttles, (u.Throttled-old.Throttled).Round(time.Millisecond),
 		proclimits.Sched.Delay().Round(time.Millisecond),

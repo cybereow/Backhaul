@@ -1777,12 +1777,14 @@ func (c *WsMuxTransport) healthLoop() {
 	defer t.Stop()
 	health := poolhealth.New("client")
 	var sampler proclimits.Sampler
+	var lastBrief time.Time
 	for {
 		select {
 		case <-c.parentctx.Done():
 			return
 		case now := <-t.C:
-			if !c.logger.IsLevelEnabled(logrus.DebugLevel) {
+			debug := c.logger.IsLevelEnabled(logrus.DebugLevel)
+			if !debug && now.Sub(lastBrief) < briefEvery {
 				continue
 			}
 			c.healthMu.Lock()
@@ -1791,6 +1793,13 @@ func (c *WsMuxTransport) healthLoop() {
 				members = append(members, poolhealth.Member{Conn: conn, Session: s})
 			}
 			c.healthMu.Unlock()
+			if !debug {
+				lastBrief = now
+				if _, ok := health.Report(now, members); ok {
+					c.logger.Info(health.Brief())
+				}
+				continue
+			}
 			if line, ok := health.Report(now, members); ok {
 				c.logger.Debug(line)
 				// While the pool is busy: where the CPU goes, now and then.
@@ -1803,6 +1812,9 @@ func (c *WsMuxTransport) healthLoop() {
 // How often, and for how long, a busy process looks at where its CPU goes (debug
 // level only; see proclimits.Sampler).
 const (
+	// briefEvery is how often the info level writes its short pool line, while
+	// the pool carries traffic.
+	briefEvery      = 30 * time.Second
 	cpuProfileEvery = 30 * time.Second
 	cpuProfileFor   = 3 * time.Second
 )

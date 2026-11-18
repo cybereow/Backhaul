@@ -78,6 +78,7 @@ type WsConfig struct {
 	Fallback      string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine     string        // "go" (default) or "openssl" for wss TLS termination
 	MaxConnAge    time.Duration // idle pool connections are replaced at this age (0 = never); see RotationPlan
+	Raw           bool          // flows leave WebSocket framing after the open message (clients must understand handlers.RawFlowPrefix)
 }
 
 func NewWSServer(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
@@ -892,7 +893,11 @@ func (s *WsTransport) handleLoop() {
 					default:
 					}
 
-					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(localConn.remoteAddr)); err != nil {
+					open := localConn.remoteAddr
+					if s.config.Raw {
+						open = handlers.RawFlowPrefix + open
+					}
+					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(open)); err != nil {
 						s.logger.Debugf("%v", err)                               // failed to send port number
 						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
 						tunnelConnection.conn.Close()
@@ -931,6 +936,11 @@ func (s *WsTransport) handleLoop() {
 					if !g.start(func() {
 						defer atomic.AddInt32(&s.activeFlows, -1)
 						defer g.release(tunnelConn)
+						if s.config.Raw {
+							left, raw := tunnelConn.Detach()
+							handlers.RawConnectionHandler(ctx, s.config.ProxyProtocol, raw, left, userConn, s.logger, s.usageMonitor, userConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
+							return
+						}
 						handlers.WSConnectionHandler(ctx, s.config.ProxyProtocol, tunnelConn, userConn, s.logger, s.usageMonitor, userConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 					}) {
 						// Stopped: nobody will serve this flow.

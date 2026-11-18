@@ -159,6 +159,18 @@ func (c *prefixConn) CloseRead() error {
 	return nil
 }
 
+// TakePrefix hands out what is left of the prefix and the socket itself, for a
+// raw flow that moves bytes with splice(2) (handlers.PrefixedConn). c is not to
+// be read again afterwards.
+func (c *prefixConn) TakePrefix() ([]byte, net.Conn) {
+	var pre []byte
+	if c.pre != nil && c.pre.Len() > 0 {
+		pre = append(pre, c.pre.Bytes()...)
+	}
+	c.pre = nil
+	return pre, c.Conn
+}
+
 // NetConn exposes the socket underneath, so socket tuning can reach it.
 func (c *prefixConn) NetConn() net.Conn { return c.Conn }
 

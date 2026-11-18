@@ -27,6 +27,20 @@ import (
 // splice-able form of the flow (see handlers.RawFlowPrefix).
 func startWsE2E(t *testing.T, raw bool, dest func(net.Conn)) string {
 	t.Helper()
+	return startWsE2EAged(t, raw, dest, 0)
+}
+
+// startWsE2EAged is startWsE2E with idle-connection rotation on: an idle pool
+// connection is replaced once it is about maxAge old (see RotationPlan).
+func startWsE2EAged(t *testing.T, raw bool, dest func(net.Conn), maxAge time.Duration) string {
+	t.Helper()
+	addr, _ := startWsE2EServer(t, raw, dest, maxAge)
+	return addr
+}
+
+// startWsE2EServer also returns the server, for tests that restart it.
+func startWsE2EServer(t *testing.T, raw bool, dest func(net.Conn), maxAge time.Duration) (string, *WsTransport) {
+	t.Helper()
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	if os.Getenv("RAW_TEST_LOG") != "" {
@@ -34,6 +48,11 @@ func startWsE2E(t *testing.T, raw bool, dest func(net.Conn)) string {
 		logger.SetLevel(logrus.DebugLevel)
 		logger.SetFormatter(&logrus.TextFormatter{FullTimestamp: true, TimestampFormat: "05.000"})
 	}
+	// Its own logger: Restart changes the level of the server's, and in a real
+	// deployment the two are different processes.
+	clientLogger := logrus.New()
+	clientLogger.SetOutput(logger.Out)
+	clientLogger.SetLevel(logger.Level)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -62,6 +81,7 @@ func startWsE2E(t *testing.T, raw bool, dest func(net.Conn)) string {
 		Mode:        config.WS,
 		Ports:       []string{fmt.Sprintf("127.0.0.1:%d=%s", publicPort, ln.Addr().String())},
 		Raw:         raw,
+		MaxConnAge:  maxAge,
 	}, logger)
 	go server.Start()
 	time.Sleep(500 * time.Millisecond)
@@ -75,7 +95,7 @@ func startWsE2E(t *testing.T, raw bool, dest func(net.Conn)) string {
 		Nodelay:      true,
 		Mode:         config.WS,
 		Path:         "/",
-	}, logger)
+	}, clientLogger)
 	go client.Start()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", publicPort)
@@ -90,7 +110,7 @@ func startWsE2E(t *testing.T, raw bool, dest func(net.Conn)) string {
 				b := make([]byte, 1)
 				if _, err := io.ReadFull(c, b); err == nil {
 					c.Close()
-					return addr
+					return addr, server
 				}
 			}
 			c.Close()
@@ -98,7 +118,7 @@ func startWsE2E(t *testing.T, raw bool, dest func(net.Conn)) string {
 		time.Sleep(200 * time.Millisecond)
 	}
 	t.Fatal("ws tunnel never carried a probe flow")
-	return ""
+	return "", nil
 }
 
 func echoDest(c net.Conn) {
@@ -436,5 +456,60 @@ func TestWsRawStreamIntegrity(t *testing.T) {
 				t.Errorf("flow %d upload hash differs: %v", seed, v)
 			}
 		}
+	})
+}
+
+// Idle pool connections that reached their rotation age are closed by the
+// server. They stay queued until a flow picks one; a flow must then be served by
+// another connection, not hang on the retired one.
+func TestWsFlowsAfterIdleRotation(t *testing.T) {
+	rawModes(t, func(t *testing.T, raw bool) {
+		addr := startWsE2EAged(t, raw, echoDest, 2*time.Second)
+		time.Sleep(7 * time.Second) // several rotation cycles with no traffic
+		for i := 0; i < 12; i++ {
+			c, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			c.SetDeadline(time.Now().Add(6 * time.Second))
+			msg := []byte(fmt.Sprintf("flow %d", i))
+			_, err = c.Write(msg)
+			require.NoError(t, err)
+			got := make([]byte, len(msg))
+			_, err = io.ReadFull(c, got)
+			require.NoError(t, err, "flow %d after rotation was not served", i)
+			require.Equal(t, msg, got)
+			c.Close()
+		}
+	})
+}
+
+// A generation that has had idle connections retired still stops: nothing is
+// left waiting on a retired connection's lock, so Restart joins at once instead
+// of running into its 30s join timeout and retrying for ever.
+func TestWsRestartAfterIdleRotation(t *testing.T) {
+	rawModes(t, func(t *testing.T, raw bool) {
+		addr, srv := startWsE2EServer(t, raw, echoDest, 2*time.Second)
+		time.Sleep(6 * time.Second) // rotation cycles; retired entries stay queued
+		// Make the handle loops dequeue them: a burst of flows.
+		for i := 0; i < 8; i++ {
+			c, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			c.SetDeadline(time.Now().Add(6 * time.Second))
+			c.Write([]byte("x"))
+			b := make([]byte, 1)
+			_, err = io.ReadFull(c, b)
+			require.NoError(t, err)
+			c.Close()
+		}
+		before := srv.gen
+		start := time.Now()
+		done := make(chan struct{})
+		go func() { srv.Restart(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+			t.Fatal("Restart did not return: a worker of the old generation is stuck")
+		}
+		require.Less(t, time.Since(start), 10*time.Second)
+		require.NotSame(t, before, srv.gen, "no new generation was started")
 	})
 }

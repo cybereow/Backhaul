@@ -532,9 +532,10 @@ func (s *WsTransport) tunnelListener() {
 					return
 				}
 				wsConn := TunnelChannel{
-					conn: conn,
-					ping: make(chan struct{}),
-					mu:   &sync.Mutex{},
+					conn:    conn,
+					ping:    make(chan struct{}),
+					mu:      &sync.Mutex{},
+					retired: new(atomic.Bool),
 				}
 				select {
 				case tunnelCh <- wsConn:
@@ -827,6 +828,12 @@ func (s *WsTransport) handleLoop() {
 					default:
 					}
 
+					// Rotation may have closed this connection while it sat in the
+					// queue: it holds its hand-over lock for good, so waiting for the
+					// lock below would never end. Take the next one instead.
+					if tunnelConnection.isRetired() {
+						continue loop
+					}
 					close(tunnelConnection.ping)
 					// Apply the remaining setup deadline to the underlying net.Conn
 					// now, before acquiring the handover lock, so that any
@@ -840,7 +847,26 @@ func (s *WsTransport) handleLoop() {
 					// holding this forever is the handover. The mutex dies with
 					// the per-connection struct, so nothing leaks - do not
 					// "balance" it with an Unlock.
-					tunnelConnection.mu.Lock()
+					if !tunnelConnection.acquire(ctx, setupDeadline) {
+						// Retired between the check above and now (the next queued
+						// connection will do), or the budget or the generation ended.
+						if tunnelConnection.isRetired() {
+							continue loop
+						}
+						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
+						tunnelConnection.conn.Close()
+						localConn.conn.Close()
+						if !setupTimer.Stop() {
+							select {
+							case <-setupTimer.C:
+							default:
+							}
+						}
+						if ctx.Err() != nil {
+							return
+						}
+						break loop
+					}
 
 					// Recheck after acquiring the lock: cancel or timer may have
 					// fired while we were waiting.
@@ -970,6 +996,9 @@ func (s *WsTransport) closeIdleTunnel(conn *TunnelChannel) bool {
 		return false
 	}
 	s.logger.Debug("idle tunnel connection reached its rotation age, closing")
+	if conn.retired != nil {
+		conn.retired.Store(true) // it stays queued, with its lock held for good
+	}
 	conn.conn.Close()
 	return true
 }

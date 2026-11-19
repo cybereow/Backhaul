@@ -17,6 +17,41 @@ type TunnelChannel struct { // for websocket
 	conn *network.WebSocketConn
 	ping chan struct{}
 	mu   *sync.Mutex
+	// retired is set once rotation has closed this connection. It stays queued
+	// until a flow dequeues it, and its hand-over lock is then held for good, so
+	// a taker must look at this before waiting for the lock. Nil-safe.
+	retired *atomic.Bool
+	// rawOK is set when the client dialled this connection on the raw tunnel
+	// path: its entry point has shown that raw flows get through.
+	rawOK bool
+	// born is when the connection was accepted: a CDN counts a connection's age
+	// from its start, so this is what a flow's move is scheduled from.
+	born time.Time
+}
+
+// isRetired reports whether rotation has closed the connection.
+func (t *TunnelChannel) isRetired() bool { return t.retired != nil && t.retired.Load() }
+
+// acquire takes the hand-over lock, or reports that it cannot be had: the
+// connection was retired (its closer holds the lock for good), the context
+// ended, or the deadline passed. It never blocks past those, unlike Lock, which
+// on a retired connection waits forever and takes the handle loop - and with it
+// every restart of the generation - down with it. A keepAlive writing a ping
+// holds the lock only briefly, so a short poll is enough.
+func (t *TunnelChannel) acquire(ctx context.Context, deadline time.Time) bool {
+	for {
+		if t.mu.TryLock() {
+			return true
+		}
+		if t.isRetired() || ctx.Err() != nil || !time.Now().Before(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(2 * time.Millisecond):
+		}
+	}
 }
 
 type LocalTCPConn struct {

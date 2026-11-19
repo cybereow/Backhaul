@@ -2,9 +2,13 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -500,5 +504,91 @@ func TestReadMessageAndNextReaderShareBuffer(t *testing.T) {
 		if rest[i] != second[i] {
 			t.Fatalf("second message corrupted at byte %d", i)
 		}
+	}
+}
+
+// Detach hands out the bytes read ahead of the message boundary and the socket
+// itself, so a raw stream picks up exactly where the last frame ended.
+func TestWebSocketConnDetach(t *testing.T) {
+	srvCh := make(chan *WebSocketConn, 1)
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nc, br, _, err := ws.UpgradeHTTP(r, w)
+		if err != nil {
+			return
+		}
+		srvCh <- NewWebSocketConn(nc, ws.StateServerSide, br.Reader)
+	}))
+	defer hs.Close()
+	nc, br, _, err := ws.DefaultDialer.Dial(context.Background(), "ws"+strings.TrimPrefix(hs.URL, "http"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewWebSocketConn(nc, ws.StateClientSide, br)
+	defer client.Close()
+	srv := <-srvCh
+	defer srv.Close()
+
+	// One frame, then raw bytes in the same write burst.
+	if err := srv.WriteMessage(TextMessage, []byte("open")); err != nil {
+		t.Fatal(err)
+	}
+	raw := srv.Conn.(*bufferedConn).UnderlyingConn()
+	if _, err := raw.Write([]byte("RAWBYTES")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // let both arrive together
+
+	_, msg, err := client.ReadMessage()
+	if err != nil || string(msg) != "open" {
+		t.Fatalf("ReadMessage = %q, %v", msg, err)
+	}
+	left, conn := client.Detach()
+	if _, ok := conn.(*net.TCPConn); !ok {
+		t.Fatalf("Detach conn is %T, want *net.TCPConn (a wrapper would defeat splice)", conn)
+	}
+	got := string(left)
+	for len(got) < len("RAWBYTES") {
+		b := make([]byte, 16)
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := conn.Read(b)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got += string(b[:n])
+	}
+	if got != "RAWBYTES" {
+		t.Fatalf("raw stream = %q", got)
+	}
+}
+
+// The dialer wraps the socket for the upgrade request; Detach must hand out the
+// socket itself, with its CloseWrite, not the wrapper.
+func TestWebSocketConnDetachPeelsUpgradeWrapper(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		c, _ := ln.Accept()
+		if c != nil {
+			defer c.Close()
+			io.Copy(io.Discard, c)
+		}
+	}()
+	tcp, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tcp.Close()
+
+	wrapped := &orderedUpgradeConn{Conn: tcp, done: true}
+	c := NewWebSocketConn(wrapped, ws.StateClientSide, nil)
+	_, conn := c.Detach()
+	if _, ok := conn.(*net.TCPConn); !ok {
+		t.Fatalf("Detach returned %T, want the *net.TCPConn under the wrappers", conn)
 	}
 }

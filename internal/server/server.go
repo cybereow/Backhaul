@@ -140,6 +140,7 @@ func (s *Server) Start() {
 			Fallback:      s.config.Fallback,
 			TLSEngine:     s.config.TLSEngine,
 			ProxyProtocol: s.config.ProxyProtocol,
+			Raw:           s.config.Raw,
 		}
 
 		wsServer := transport.NewWSServer(s.ctx, wsConfig, s.logger)

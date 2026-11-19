@@ -54,6 +54,17 @@ type WsTransport struct {
 	// a missing control channel must not tear down.
 	activeFlows   int32
 	fallbackProxy http.Handler
+	// rawOKAt / rawBadAt are the times (UnixNano) of the last probe that showed
+	// raw flows get through, and of the last that showed they do not; rawCaps is
+	// what the client reported with the good one. See rawMode.
+	rawOKAt, rawBadAt atomic.Int64
+	rawCaps           atomic.Uint32
+	// rawFlows / framedFlows count the flows started in each form.
+	rawFlows, framedFlows atomic.Int64
+	// flows holds the raw flows that can be moved, by id. moves counts completed
+	// moves, for diagnostics and tests.
+	flows sync.Map
+	moves atomic.Int64
 }
 
 type WsConfig struct {
@@ -78,6 +89,8 @@ type WsConfig struct {
 	Fallback      string        // decoy backend for non-tunnel requests (host:port), optional
 	TLSEngine     string        // "go" (default) or "openssl" for wss TLS termination
 	MaxConnAge    time.Duration // idle pool connections are replaced at this age (0 = never); see RotationPlan
+	Raw           bool          // use raw flows (see handlers.RawFlowPrefix) while the path is verified to carry them; framed otherwise
+	RawProbeTTL   time.Duration // how long a successful probe is trusted (0 = default)
 }
 
 func NewWSServer(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
@@ -451,7 +464,8 @@ func (s *WsTransport) tunnelListener() {
 			// if a decoy fallback is configured it is reverse-proxied there so
 			// the origin looks like an ordinary website, otherwise it is
 			// rejected as before.
-			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
+			probePrefix := rawProbePath(basePath)
+			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix) || strings.HasPrefix(r.URL.Path, probePrefix)
 			if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) || !isTunnelPath {
 				if fallback != nil {
 					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
@@ -526,14 +540,22 @@ func (s *WsTransport) tunnelListener() {
 					s.logger.Info("control channel reattached, pool preserved")
 				}
 
+			} else if strings.HasPrefix(r.URL.Path, probePrefix) {
+				if !g.own(conn) {
+					return
+				}
+				g.start(func() { s.runRawProbe(g, conn) })
 			} else if strings.HasPrefix(r.URL.Path, tunnelPathPrefix) {
 				if !g.own(conn) {
 					return
 				}
 				wsConn := TunnelChannel{
-					conn: conn,
-					ping: make(chan struct{}),
-					mu:   &sync.Mutex{},
+					conn:    conn,
+					ping:    make(chan struct{}),
+					mu:      &sync.Mutex{},
+					retired: new(atomic.Bool),
+					rawOK:   strings.HasPrefix(r.URL.Path, basePath+handlers.RawTunnelSuffix),
+					born:    time.Now(),
 				}
 				select {
 				case tunnelCh <- wsConn:
@@ -826,6 +848,12 @@ func (s *WsTransport) handleLoop() {
 					default:
 					}
 
+					// Rotation may have closed this connection while it sat in the
+					// queue: it holds its hand-over lock for good, so waiting for the
+					// lock below would never end. Take the next one instead.
+					if tunnelConnection.isRetired() {
+						continue loop
+					}
 					close(tunnelConnection.ping)
 					// Apply the remaining setup deadline to the underlying net.Conn
 					// now, before acquiring the handover lock, so that any
@@ -839,7 +867,26 @@ func (s *WsTransport) handleLoop() {
 					// holding this forever is the handover. The mutex dies with
 					// the per-connection struct, so nothing leaks - do not
 					// "balance" it with an Unlock.
-					tunnelConnection.mu.Lock()
+					if !tunnelConnection.acquire(ctx, setupDeadline) {
+						// Retired between the check above and now (the next queued
+						// connection will do), or the budget or the generation ended.
+						if tunnelConnection.isRetired() {
+							continue loop
+						}
+						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
+						tunnelConnection.conn.Close()
+						localConn.conn.Close()
+						if !setupTimer.Stop() {
+							select {
+							case <-setupTimer.C:
+							default:
+							}
+						}
+						if ctx.Err() != nil {
+							return
+						}
+						break loop
+					}
 
 					// Recheck after acquiring the lock: cancel or timer may have
 					// fired while we were waiting.
@@ -866,7 +913,22 @@ func (s *WsTransport) handleLoop() {
 					default:
 					}
 
-					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(localConn.remoteAddr)); err != nil {
+					open := localConn.remoteAddr
+					useRaw, caps := s.rawMode()
+					rawModeOn := useRaw
+					useRaw = useRaw && tunnelConnection.rawOK
+					// A raw flow can be moved to another connection before a CDN's
+					// age limit cuts it, when rotation is on and the client can.
+					flowID := ""
+					if useRaw && s.config.MaxConnAge > 0 && caps&handlers.CapRawResume != 0 {
+						flowID = newRawFlowID()
+					}
+					if flowID != "" {
+						open = handlers.RawFlowIDPrefix + flowID + "|" + open
+					} else if useRaw {
+						open = handlers.RawFlowPrefix + open
+					}
+					if err := tunnelConnection.conn.WriteMessage(network.TextMessage, []byte(open)); err != nil {
 						s.logger.Debugf("%v", err)                               // failed to send port number
 						tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
 						tunnelConnection.conn.Close()
@@ -894,17 +956,44 @@ func (s *WsTransport) handleLoop() {
 						continue loop
 					}
 
+					s.logger.Tracef("flow to %s: raw=%t (path verified %t, connection can %t)", localConn.remoteAddr, useRaw, rawModeOn, tunnelConnection.rawOK)
+					if useRaw {
+						s.rawFlows.Add(1)
+					} else {
+						s.framedFlows.Add(1)
+					}
 					// SUCCESS: clear the setup deadline before handing the
 					// tunnel connection to WSConnectionHandler so data-path
 					// I/O is not subject to the setup timeout.
 					tunnelConnection.conn.NetConn().SetDeadline(time.Time{}) //nolint:errcheck
 					setupTimer.Stop()
 					// Handle data exchange between connections
-					tunnelConn, userConn := tunnelConnection.conn, localConn.conn
+					tunnelConn, userConn, bornAt := tunnelConnection.conn, localConn.conn, tunnelConnection.born
 					atomic.AddInt32(&s.activeFlows, 1)
 					if !g.start(func() {
 						defer atomic.AddInt32(&s.activeFlows, -1)
 						defer g.release(tunnelConn)
+						if useRaw {
+							left, raw := tunnelConn.Detach()
+							flow := handlers.NewRawFlow(ctx, handlers.RawFlowConfig{
+								ID:            flowID,
+								Tunnel:        &handlers.RawTunnel{Conn: raw, Left: left, Born: bornAt},
+								App:           userConn,
+								ProxyProtocol: s.config.ProxyProtocol,
+								Logger:        s.logger,
+								Usage:         s.usageMonitor,
+								RemotePort:    userConn.LocalAddr().(*net.TCPAddr).Port,
+								Sniffer:       s.config.Sniffer,
+							})
+							if flowID != "" {
+								s.logger.Tracef("raw flow %s can be moved (connection born %s ago)", flowID, time.Since(bornAt).Round(time.Millisecond))
+								s.flows.Store(flowID, flow)
+								defer s.flows.Delete(flowID)
+								g.start(func() { s.resumeLoop(ctx, flow) })
+							}
+							flow.Run()
+							return
+						}
 						handlers.WSConnectionHandler(ctx, s.config.ProxyProtocol, tunnelConn, userConn, s.logger, s.usageMonitor, userConn.LocalAddr().(*net.TCPAddr).Port, s.config.Sniffer)
 					}) {
 						// Stopped: nobody will serve this flow.
@@ -960,6 +1049,9 @@ func (s *WsTransport) closeIdleTunnel(conn *TunnelChannel) bool {
 		return false
 	}
 	s.logger.Debug("idle tunnel connection reached its rotation age, closing")
+	if conn.retired != nil {
+		conn.retired.Store(true) // it stays queued, with its lock held for good
+	}
 	conn.conn.Close()
 	return true
 }

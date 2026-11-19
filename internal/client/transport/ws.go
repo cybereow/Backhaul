@@ -57,39 +57,59 @@ type WsTransport struct {
 	// control dials spread across every configured entry point.
 	endpoints []wsEndpoint
 	dialSeq   int32
+	// rawOKAt[i] is when entry point i last passed a raw probe (UnixNano, 0 =
+	// never or failed since). A tunnel connection dialled through a verified
+	// entry point is marked as able to carry raw flows; see rawVerified.
+	rawOKAt []atomic.Int64
+	// rawFirst is closed when the first round of raw probes has an answer.
+	rawFirst     chan struct{}
+	rawFirstOnce sync.Once
+	// rawFlows holds the raw flows that can be moved, by id, so that a connection
+	// the server hands over for a move finds its flow.
+	rawFlows sync.Map
 }
 type WsConfig struct {
-	RemoteAddr     string
-	RemoteAddrs    []string // optional list; non-empty wins over RemoteAddr
-	EdgeIPs        []string // per-entry edge IPs, aligned by index with RemoteAddrs
-	Token          string
-	SnifferLog     string
-	TunnelStatus   string
-	Nodelay        bool
-	Sniffer        bool
-	KeepAlive      time.Duration
-	RetryInterval  time.Duration
-	DialTimeOut    time.Duration
-	ConnPoolSize   int
-	ConnPoolMax    int // ceiling on idle + in-flight tunnel connections; 0 = derived from ConnPoolSize (see idleCeiling)
-	WebPort        int
-	Mode           config.TransportType
-	AggressivePool bool
-	EdgeIP         string
-	Path           string
-	SO_RCVBUF      int
-	SO_SNDBUF      int
-	MSS            int
-	TLSVerify      bool // wss: verify the server certificate during the TLS handshake
+	RemoteAddr    string
+	RemoteAddrs   []string // optional list; non-empty wins over RemoteAddr
+	EdgeIPs       []string // per-entry edge IPs, aligned by index with RemoteAddrs
+	Token         string
+	SnifferLog    string
+	TunnelStatus  string
+	Nodelay       bool
+	Sniffer       bool
+	KeepAlive     time.Duration
+	RetryInterval time.Duration
+	DialTimeOut   time.Duration
+	ConnPoolSize  int
+	ConnPoolMax   int // ceiling on idle + in-flight tunnel connections; 0 = derived from ConnPoolSize (see idleCeiling)
+	// RawProbeInterval is how often the client shows the server that raw flows
+	// get through the path (0 = every minute, negative = never). See rawProbeLoop.
+	RawProbeInterval time.Duration
+	WebPort          int
+	Mode             config.TransportType
+	AggressivePool   bool
+	EdgeIP           string
+	Path             string
+	SO_RCVBUF        int
+	SO_SNDBUF        int
+	MSS              int
+	TLSVerify        bool // wss: verify the server certificate during the TLS handshake
 }
 
 // nextEndpoint returns the next entry point via atomic round-robin.
 func (c *WsTransport) nextEndpoint() wsEndpoint {
+	ep, _ := c.nextEndpointIdx()
+	return ep
+}
+
+// nextEndpointIdx is nextEndpoint that also says which entry point it picked.
+func (c *WsTransport) nextEndpointIdx() (wsEndpoint, int) {
 	if len(c.endpoints) == 1 {
-		return c.endpoints[0]
+		return c.endpoints[0], 0
 	}
 	i := atomic.AddInt32(&c.dialSeq, 1)
-	return c.endpoints[int(uint32(i))%len(c.endpoints)]
+	idx := int(uint32(i)) % len(c.endpoints)
+	return c.endpoints[idx], idx
 }
 
 func NewWSClient(parentCtx context.Context, config *WsConfig, logger *logrus.Logger) *WsTransport {
@@ -114,6 +134,8 @@ func NewWSClient(parentCtx context.Context, config *WsConfig, logger *logrus.Log
 	}
 
 	client.endpoints = buildEndpoints(config.RemoteAddrs, config.EdgeIPs, config.RemoteAddr, config.EdgeIP)
+	client.rawOKAt = make([]atomic.Int64, len(client.endpoints))
+	client.rawFirst = make(chan struct{})
 
 	return client
 }
@@ -245,6 +267,9 @@ func (c *WsTransport) channelDialer() {
 
 func (c *WsTransport) poolMaintainer() {
 	g, ctx := c.gen, c.ctx
+
+	g.start(c.rawProbeLoop)
+	c.awaitFirstRawProbe(ctx)
 
 	// Stagger the initial pool fill instead of firing every dial at once - a
 	// burst of ConnPoolSize near-simultaneous handshakes to the same host is a
@@ -645,11 +670,20 @@ func (c *WsTransport) tunnelDialer() {
 		return
 	}
 
-	ep := c.nextEndpoint()
+	ep, epIdx := c.nextEndpointIdx()
 	c.logger.Debugf("initiating new websocket tunnel connection to address %s", ep.addr)
 
+	// The path says whether this entry point has shown it carries raw flows: the
+	// server only sends a raw flow over a connection that says so. Both forms
+	// start with the tunnel prefix, so a server that does not know the second
+	// treats it as any other tunnel connection.
+	tunnelPath := network.NormalizeBasePath(c.config.Path) + "/tunnel"
+	if c.rawVerified(epIdx) {
+		tunnelPath = network.NormalizeBasePath(c.config.Path) + handlers.RawTunnelSuffix
+	}
+
 	// Dial to the tunnel server
-	tunnelConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, network.NormalizeBasePath(c.config.Path)+"/tunnel", c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
+	tunnelConn, err := network.WebSocketDialer(ctx, ep.addr, ep.edgeIP, tunnelPath, c.config.DialTimeOut, c.config.KeepAlive, c.config.Nodelay, c.config.Token, c.userAgent, c.config.Mode, 3, c.config.SO_RCVBUF, c.config.SO_SNDBUF, c.config.MSS, c.config.TLSVerify)
 	if err != nil {
 		atomic.AddInt32(&c.pendingDials, -1)
 		c.logger.Errorf("tunnel server dialer: %v", err)
@@ -711,7 +745,23 @@ func (c *WsTransport) tunnelDialer() {
 
 			remoteAddr := string(remoteAddrBytes)
 			raw := false
-			if strings.HasPrefix(remoteAddr, handlers.RawFlowPrefix) {
+			flowID := ""
+			switch {
+			case strings.HasPrefix(remoteAddr, handlers.RawFlowResumePrefix):
+				// Not a new flow: this connection is the new carrier of one that is
+				// already running.
+				c.resumeRawFlow(tunnelConn, strings.TrimPrefix(remoteAddr, handlers.RawFlowResumePrefix))
+				return
+			case strings.HasPrefix(remoteAddr, handlers.RawFlowIDPrefix):
+				raw = true
+				var ok bool
+				flowID, remoteAddr, ok = strings.Cut(strings.TrimPrefix(remoteAddr, handlers.RawFlowIDPrefix), "|")
+				if !ok {
+					c.logger.Infof("malformed flow-open message %q", remoteAddrBytes)
+					tunnelConn.Close()
+					return
+				}
+			case strings.HasPrefix(remoteAddr, handlers.RawFlowPrefix):
 				raw = true
 				remoteAddr = strings.TrimPrefix(remoteAddr, handlers.RawFlowPrefix)
 			}
@@ -724,13 +774,13 @@ func (c *WsTransport) tunnelDialer() {
 				return
 			}
 
-			c.localDialer(tunnelConn, resolvedAddr, port, raw)
+			c.localDialer(tunnelConn, resolvedAddr, port, raw, flowID)
 			return
 		}
 	}
 }
 
-func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr string, port int, raw bool) {
+func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr string, port int, raw bool, flowID string) {
 	ctx := c.ctx // this worker's generation, read once
 	var sendBuf, recvBuf int
 
@@ -758,7 +808,20 @@ func (c *WsTransport) localDialer(tunnelCon *network.WebSocketConn, remoteAddr s
 
 	if raw {
 		left, conn := tunnelCon.Detach()
-		handlers.RawConnectionHandler(ctx, false, conn, left, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)
+		flow := handlers.NewRawFlow(ctx, handlers.RawFlowConfig{
+			ID:         flowID,
+			Tunnel:     &handlers.RawTunnel{Conn: conn, Left: left, Born: time.Now()},
+			App:        localConnection,
+			Logger:     c.logger,
+			Usage:      c.usageMonitor,
+			RemotePort: int(port),
+			Sniffer:    c.config.Sniffer,
+		})
+		if flowID != "" {
+			c.rawFlows.Store(flowID, flow)
+			defer c.rawFlows.Delete(flowID)
+		}
+		flow.Run()
 		return
 	}
 	handlers.WSConnectionHandler(ctx, false, tunnelCon, localConnection, c.logger, c.usageMonitor, int(port), c.config.Sniffer)

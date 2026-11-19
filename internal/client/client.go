@@ -141,6 +141,7 @@ func (c *Client) Start() {
 			RetryInterval:  time.Duration(c.config.RetryInterval) * time.Second,
 			DialTimeOut:    time.Duration(c.config.DialTimeout) * time.Second,
 			ConnPoolSize:   c.config.ConnectionPool,
+			ConnPoolMax:    c.config.ConnectionPoolMax,
 			Token:          c.config.Token,
 			Sniffer:        c.config.Sniffer,
 			WebPort:        c.config.WebPort,

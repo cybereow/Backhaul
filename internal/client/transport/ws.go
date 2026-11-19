@@ -71,6 +71,7 @@ type WsConfig struct {
 	RetryInterval  time.Duration
 	DialTimeOut    time.Duration
 	ConnPoolSize   int
+	ConnPoolMax    int // ceiling on idle + in-flight tunnel connections; 0 = derived from ConnPoolSize (see idleCeiling)
 	WebPort        int
 	Mode           config.TransportType
 	AggressivePool bool
@@ -566,11 +567,83 @@ func (c *WsTransport) owe() {
 	}
 }
 
+// idleCeiling is the most idle plus in-flight tunnel connections the pool may
+// hold. Connections serving a flow are not counted, so it never limits a
+// transfer: it bounds what piles up unused - for instance when the server does
+// not hand the connections out - and the burst of handshakes that comes with it.
+// Unset, it scales with the configured pool: four times as many, and at least 16
+// more, so a small pool still has room to absorb a burst of flows.
+func (c *WsTransport) idleCeiling() int {
+	return idleCeiling(c.config.ConnPoolSize, c.config.ConnPoolMax)
+}
+
+func idleCeiling(pool, configured int) int {
+	limit := configured
+	if limit <= 0 {
+		limit = 4 * pool
+		if limit < pool+16 {
+			limit = pool + 16
+		}
+	}
+	if limit < pool {
+		limit = pool // the pool's own floor is never refused
+	}
+	return limit
+}
+
+// reserveDial counts one more dial in flight, unless idle plus in-flight
+// connections are already at the ceiling. The count is taken before the check
+// and given back on refusal, so concurrent callers cannot all slip past it.
+func (c *WsTransport) reserveDial() bool {
+	pending := atomic.AddInt32(&c.pendingDials, 1)
+	if int(atomic.LoadInt32(&c.poolConnections))+int(pending) > c.idleCeiling() {
+		atomic.AddInt32(&c.pendingDials, -1)
+		return false
+	}
+	return true
+}
+
+// dialSlotWait is how long a dial that found the ceiling reached waits for room.
+// A request for a connection stands for a flow the server is holding, and the
+// server gives up on a flow after its 3s setup budget, so waiting much longer
+// than that serves nobody.
+const dialSlotWait = 5 * time.Second
+
+// awaitDialSlot reserves a dial, waiting up to wait for room under the ceiling.
+// A refused request is not dropped: it stands for a flow, and room appears as
+// soon as a connection leaves the idle pool for a flow or a dial completes. Only
+// when nothing frees up - connections piling up unused - does it give up, which
+// is what bounds the pile.
+func (c *WsTransport) awaitDialSlot(ctx context.Context, wait time.Duration) bool {
+	if c.reserveDial() {
+		return true
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-deadline.C:
+			return false
+		case <-poll.C:
+			if c.reserveDial() {
+				return true
+			}
+		}
+	}
+}
+
 func (c *WsTransport) tunnelDialer() {
 	g, ctx := c.gen, c.ctx
 
 	// In flight only while dialing; handed to poolConnections once established.
-	atomic.AddInt32(&c.pendingDials, 1)
+	if !c.awaitDialSlot(ctx, dialSlotWait) {
+		c.logger.Debug("idle connection ceiling reached, not dialling another tunnel connection")
+		return
+	}
 
 	ep := c.nextEndpoint()
 	c.logger.Debugf("initiating new websocket tunnel connection to address %s", ep.addr)

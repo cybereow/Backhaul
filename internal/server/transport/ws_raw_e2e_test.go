@@ -45,15 +45,44 @@ func startWsE2EServer(t *testing.T, raw bool, dest func(net.Conn), maxAge time.D
 	return startWsE2EFull(t, raw, dest, maxAge, 8, 0)
 }
 
+// e2eOpts configures startWsE2EOpts.
+type e2eOpts struct {
+	raw             bool
+	maxAge          time.Duration // idle-connection rotation (server MaxConnAge)
+	pool, poolMax   int           // client connection_pool / connection_pool_max
+	probeEvery      time.Duration // client RawProbeInterval (0 = 200ms here, negative = never probe)
+	probeTTL        time.Duration // server RawProbeTTL
+	via             func(tunnelAddr string) string
+	skipRawVerified bool // do not wait for the server to trust raw flows
+}
+
 // startWsE2EFull also sets the client's pool size and idle ceiling
 // (connection_pool, connection_pool_max).
 func startWsE2EFull(t *testing.T, raw bool, dest func(net.Conn), maxAge time.Duration, pool, poolMax int) (string, *WsTransport) {
 	t.Helper()
+	addr, srv, _ := startWsE2EOpts(t, dest, e2eOpts{raw: raw, maxAge: maxAge, pool: pool, poolMax: poolMax})
+	return addr, srv
+}
+
+// startWsE2EOpts runs the pair with the given options, and returns the public
+// address, the server and the client. With raw on it also waits until the
+// server trusts raw flows (the client probes the path first), unless asked not to.
+func startWsE2EOpts(t *testing.T, dest func(net.Conn), o e2eOpts) (string, *WsTransport, *client_transport.WsTransport) {
+	t.Helper()
+	if o.pool == 0 {
+		o.pool = 8
+	}
+	if o.probeEvery == 0 {
+		o.probeEvery = 200 * time.Millisecond
+	}
 	logger := logrus.New()
 	logger.SetOutput(io.Discard)
 	if os.Getenv("RAW_TEST_LOG") != "" {
 		logger.SetOutput(os.Stderr)
 		logger.SetLevel(logrus.DebugLevel)
+		if os.Getenv("RAW_TEST_LOG") == "trace" {
+			logger.SetLevel(logrus.TraceLevel)
+		}
 		logger.SetFormatter(&logrus.TextFormatter{FullTimestamp: true, TimestampFormat: "05.000"})
 	}
 	// Its own logger: Restart changes the level of the server's, and in a real
@@ -88,27 +117,34 @@ func startWsE2EFull(t *testing.T, raw bool, dest func(net.Conn), maxAge time.Dur
 		Nodelay:     true,
 		Mode:        config.WS,
 		Ports:       []string{fmt.Sprintf("127.0.0.1:%d=%s", publicPort, ln.Addr().String())},
-		Raw:         raw,
-		MaxConnAge:  maxAge,
+		Raw:         o.raw,
+		MaxConnAge:  o.maxAge,
+		RawProbeTTL: o.probeTTL,
 	}, logger)
 	go server.Start()
 	time.Sleep(500 * time.Millisecond)
 
+	tunnelAddr := fmt.Sprintf("127.0.0.1:%d", tunnelPort)
+	if o.via != nil {
+		tunnelAddr = o.via(tunnelAddr)
+	}
 	client := client_transport.NewWSClient(ctx, &client_transport.WsConfig{
-		RemoteAddr:   fmt.Sprintf("127.0.0.1:%d", tunnelPort),
-		Token:        "test_token",
-		KeepAlive:    30 * time.Second,
-		DialTimeOut:  10 * time.Second,
-		ConnPoolSize: pool,
-		ConnPoolMax:  poolMax,
-		Nodelay:      true,
-		Mode:         config.WS,
-		Path:         "/",
+		RemoteAddr:       tunnelAddr,
+		Token:            "test_token",
+		KeepAlive:        30 * time.Second,
+		DialTimeOut:      10 * time.Second,
+		ConnPoolSize:     o.pool,
+		ConnPoolMax:      o.poolMax,
+		Nodelay:          true,
+		Mode:             config.WS,
+		Path:             "/",
+		RawProbeInterval: o.probeEvery,
 	}, clientLogger)
 	go client.Start()
 
 	addr := fmt.Sprintf("127.0.0.1:%d", publicPort)
 	deadline := time.Now().Add(15 * time.Second)
+	ready := false
 	for time.Now().Before(deadline) {
 		// A probe flow: the pool is ready once an echo round-trips.
 		c, err := net.DialTimeout("tcp", addr, time.Second)
@@ -119,15 +155,26 @@ func startWsE2EFull(t *testing.T, raw bool, dest func(net.Conn), maxAge time.Dur
 				b := make([]byte, 1)
 				if _, err := io.ReadFull(c, b); err == nil {
 					c.Close()
-					return addr, server
+					ready = true
+					break
 				}
 			}
 			c.Close()
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatal("ws tunnel never carried a probe flow")
-	return "", nil
+	if !ready {
+		t.Fatal("ws tunnel never carried a probe flow")
+	}
+	if o.raw && !o.skipRawVerified && o.probeEvery > 0 {
+		for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+			if raw, _ := server.rawMode(); raw {
+				return addr, server, client
+			}
+		}
+		t.Fatal("the server never trusted raw flows although the path carries them")
+	}
+	return addr, server, client
 }
 
 func echoDest(c net.Conn) {

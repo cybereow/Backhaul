@@ -2,9 +2,8 @@ package handlers
 
 import (
 	"context"
-	"io"
 	"net"
-	"sync"
+	"time"
 
 	"github.com/musix/backhaul/internal/web"
 	"github.com/sirupsen/logrus"
@@ -21,6 +20,29 @@ import (
 // The price is everything that needs to see the bytes: no WebSocket masking, no
 // replay, no resume. A tunnel connection that dies takes its flow with it.
 const RawFlowPrefix = "RAW1|"
+
+// The raw probe: how a client shows the server that raw flows get through the
+// path between them (see the server's rawMode).
+const (
+	// RawProbeSuffix is the path, under the tunnel's base path, a client probes on.
+	RawProbeSuffix = "/rawprobe"
+	// RawTunnelSuffix is the path a client dials a pool connection on when its
+	// entry point has passed a probe. It still starts with "/tunnel", so a server
+	// that does not know it takes the connection as any other.
+	RawTunnelSuffix = "/tunnelr"
+	// RawProbeMsg is the text message after which the probe connection turns raw.
+	RawProbeMsg = "RAWPROBE2"
+	// RawProbeLen is the size of the payload the server writes and the client echoes.
+	RawProbeLen = 32
+	// RawProbeTimeout bounds one probe, from the upgrade to the echo.
+	RawProbeTimeout = 8 * time.Second
+)
+
+// Capabilities a client reports after the echo of its probe.
+const (
+	// CapRawResume: the client can move a raw flow to another connection.
+	CapRawResume = 1 << 0
+)
 
 // PrefixedConn is a plain socket with some bytes already read off it that its
 // reader must still be given first (the request an HTTP server consumed before
@@ -42,88 +64,13 @@ type PrefixedConn interface {
 // A direction that ends half-closes the write side of its destination, so a
 // request that ends with a FIN still gets its reply.
 func RawConnectionHandler(ctx context.Context, proxyProtocol bool, tunnel net.Conn, leftover []byte, tcpConn net.Conn, logger *logrus.Logger, usage *web.Usage, remotePort int, sniffer bool) {
-	var toTunnel []byte // bytes of the local peer already read, to go out first
-	if pc, ok := tcpConn.(PrefixedConn); ok {
-		toTunnel, tcpConn = pc.TakePrefix()
-	}
-	if proxyProtocol {
-		header, err := ProxyProtocolHeader(tcpConn.RemoteAddr(), tunnel.RemoteAddr())
-		if err != nil {
-			logger.Error(err)
-			tunnel.Close()
-			tcpConn.Close()
-			return
-		}
-		if _, err := tunnel.Write(header); err != nil {
-			logger.Errorf("failed to send Proxy Protocol v2 header: %v", err)
-			tunnel.Close()
-			tcpConn.Close()
-			return
-		}
-	}
-
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			tunnel.Close()
-			tcpConn.Close()
-		case <-done:
-		}
-	}()
-
-	account := func(n int64) {
-		if sniffer && n > 0 {
-			usage.AddOrUpdatePort(remotePort, uint64(n))
-		}
-	}
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { // tunnel -> local
-		defer wg.Done()
-		if len(leftover) > 0 {
-			if _, err := tcpConn.Write(leftover); err != nil {
-				tunnel.Close()
-				tcpConn.Close()
-				return
-			}
-			account(int64(len(leftover)))
-		}
-		n, err := io.Copy(tcpConn, tunnel)
-		logger.Debugf("raw tunnel -> local ended: %d bytes, err %v (tunnel %T, local %T)", n, err, tunnel, tcpConn)
-		account(n)
-		if err != nil {
-			logger.Trace("raw tunnel -> local: ", err)
-			tunnel.Close()
-			tcpConn.Close()
-			return
-		}
-		closeWrite(tcpConn)
-	}()
-	go func() { // local -> tunnel
-		defer wg.Done()
-		if len(toTunnel) > 0 {
-			if _, err := tunnel.Write(toTunnel); err != nil {
-				tunnel.Close()
-				tcpConn.Close()
-				return
-			}
-			account(int64(len(toTunnel)))
-		}
-		n, err := io.Copy(tunnel, tcpConn)
-		logger.Debugf("raw local -> tunnel ended: %d bytes, err %v (tunnel %T, local %T)", n, err, tunnel, tcpConn)
-		account(n)
-		if err != nil {
-			logger.Trace("raw local -> tunnel: ", err)
-			tunnel.Close()
-			tcpConn.Close()
-			return
-		}
-		closeWrite(tunnel)
-	}()
-	wg.Wait()
-	close(done)
-	tunnel.Close()
-	tcpConn.Close()
+	NewRawFlow(ctx, RawFlowConfig{
+		Tunnel:        &RawTunnel{Conn: tunnel, Left: leftover, Born: time.Now()},
+		App:           tcpConn,
+		ProxyProtocol: proxyProtocol,
+		Logger:        logger,
+		Usage:         usage,
+		RemotePort:    remotePort,
+		Sniffer:       sniffer,
+	}).Run()
 }

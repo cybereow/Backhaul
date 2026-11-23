@@ -180,6 +180,36 @@ func (c *WebSocketConn) NetConn() net.Conn {
 	return c.Conn
 }
 
+// Detach ends WebSocket framing on this connection and hands out what is left of
+// it: the bytes already pulled off the socket but not yet consumed, and the
+// socket itself (the TLS connection on wss, the TCP connection otherwise). From
+// then on the caller owns every byte in both directions; c must not be used
+// again. Nothing is sent: both ends have to agree, out of band, on the exact
+// message after which the stream turns raw.
+func (c *WebSocketConn) Detach() ([]byte, net.Conn) {
+	var left []byte
+	conn := c.Conn
+	if bc, ok := conn.(*bufferedConn); ok {
+		if br, ok := bc.r.(*bufio.Reader); ok && br.Buffered() > 0 {
+			left = make([]byte, br.Buffered())
+			_, _ = io.ReadFull(br, left)
+		}
+		conn = bc.Conn
+	}
+	// Peel off the wrappers that exist only for the upgrade handshake (see
+	// orderedUpgradeConn): once it is over they only hide the socket - and its
+	// CloseWrite, without which a half-close becomes a full close that cuts the
+	// peer's data short - from whoever copies the bytes.
+	for {
+		u, ok := conn.(interface{ UnderlyingConn() net.Conn })
+		if !ok {
+			break
+		}
+		conn = u.UnderlyingConn()
+	}
+	return left, conn
+}
+
 // MuxSubprotocol is the Sec-WebSocket-Protocol token that negotiates standards
 // framed mux legs (see WebSocketStream). It is an HTTP-handshake header only:
 // control-channel frames and smux's MuxVersion are unaffected.

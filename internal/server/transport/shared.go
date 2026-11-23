@@ -21,6 +21,12 @@ type TunnelChannel struct { // for websocket
 	// until a flow dequeues it, and its hand-over lock is then held for good, so
 	// a taker must look at this before waiting for the lock. Nil-safe.
 	retired *atomic.Bool
+	// rawOK is set when the client dialled this connection on the raw tunnel
+	// path: its entry point has shown that raw flows get through.
+	rawOK bool
+	// born is when the connection was accepted: a CDN counts a connection's age
+	// from its start, so this is what a flow's move is scheduled from.
+	born time.Time
 }
 
 // isRetired reports whether rotation has closed the connection.

@@ -158,6 +158,7 @@ To start using the solution, you'll need to configure both server and client com
    transport = "tcp"             # Protocol to use ("tcp", "tcpmux", "ws", "wss", "wsmux", "wssmux". mandatory).
    token = "your_token"          # Authentication token for secure communication (required; must match on client and server).
    connection_pool = 8           # Number of pre-established connections.(optional, default: 8).
+   connection_pool_max = 0       # ws/wss client: ceiling on idle plus in-flight tunnel connections (connections serving a flow are not counted, so it never limits a transfer). 0 = 4 x connection_pool, at least connection_pool + 16. It bounds a pile-up of unused connections, and the burst of handshakes that comes with it, when the server is not handing them out. A flow that arrives while every idle connection is taken waits for a new dial instead. (optional, default: 0)
    aggressive_pool = false       # Enables aggressive connection pool management.(optional, default: false).
    keepalive_period = 75         # Interval in seconds to send keep-alive packets. (optional, default: 75s)
    nodelay = false               # Use TCP_NODELAY (optional, default: false).

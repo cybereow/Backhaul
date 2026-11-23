@@ -32,6 +32,11 @@ func (b *bufferedConn) Read(p []byte) (int, error) {
 	return b.r.Read(p)
 }
 
+// UnderlyingConn exposes the socket for read-only inspection (TCP_INFO): see
+// underlyingTCP. It is deliberately not NetConn, which other code takes as leave
+// to act on the socket directly.
+func (b *bufferedConn) UnderlyingConn() net.Conn { return b.Conn }
+
 type WebSocketConn struct {
 	net.Conn
 	state   ws.State
@@ -272,6 +277,33 @@ func (s *WebSocketStream) Read(p []byte) (int, error) {
 			return n, nil
 		}
 	}
+}
+
+// WriteBuffers sends the buffers as one message, the way smux asks for a frame to
+// be written when its connection can take them separately (header, payload): the
+// frame is built once, in the message writer, instead of first being gathered into
+// a buffer of smux's own.
+func (s *WebSocketStream) WriteBuffers(v [][]byte) (int, error) {
+	total := 0
+	for _, b := range v {
+		total += len(b)
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	c := s.c
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	c.writer.ResetOp(ws.OpBinary)
+	for _, b := range v {
+		if _, err := c.writer.Write(b); err != nil {
+			return 0, err
+		}
+	}
+	if err := c.writer.Flush(); err != nil {
+		return 0, err
+	}
+	return total, nil
 }
 
 func (s *WebSocketStream) Write(p []byte) (int, error) {

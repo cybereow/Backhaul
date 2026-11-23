@@ -2,7 +2,10 @@ package transport
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
+
+	"github.com/musix/backhaul/internal/utils/proclimits"
 )
 
 // A pool connection that has stopped getting through.
@@ -104,13 +107,47 @@ func (ps *pooledSession) echoIsOverdue(sent int64, now time.Time) bool {
 	return true
 }
 
+// starvedOverride replaces the real monitor (see processStarved). An atomic: the
+// capacity loops of earlier transports may still be running when a test sets it.
+var starvedOverride atomic.Pointer[func(time.Time) bool]
+
+// processStarved reports whether this process has recently been kept from running
+// (see package proclimits). A test can say it was, or was not (setProcessStarved).
+func processStarved(now time.Time) bool {
+	if f := starvedOverride.Load(); f != nil {
+		return (*f)(now)
+	}
+	return proclimits.Sched.Starved(now)
+}
+
 // noteHealth records what the latest look at the session showed: socketStalled
 // from its TCP state, together with its RTT probes.
 func (ps *pooledSession) noteHealth(now time.Time, socketStalled bool) {
 	sure := socketStalled
-	if sent := ps.probeSent.Load(); !sure && sent != 0 {
-		sure = echoSilent(sent, ps.session.LastRecv(), now) || ps.echoIsOverdue(sent, now)
+	lateOnly := false
+	// A probe is answered by this process and by the peer's: when this one has
+	// not been getting its CPU time, a probe that is late says nothing about the
+	// connection - it was this end that was late to read the echo - and only the
+	// kernel's own view of the socket (its backoff) can still be believed.
+	if processStarved(now) {
+		ps.lateOnly.Store(false)
+		if sure {
+			ps.sureSince.CompareAndSwap(0, now.UnixNano())
+			ps.stalledSince.CompareAndSwap(0, now.UnixNano())
+		} else {
+			ps.sureSince.Store(0)
+			ps.stalledSince.Store(0)
+		}
+		return
 	}
+	if sent := ps.probeSent.Load(); !sure && sent != 0 {
+		if echoSilent(sent, ps.session.LastRecv(), now) {
+			sure = true
+		} else if ps.echoIsOverdue(sent, now) {
+			sure, lateOnly = true, true
+		}
+	}
+	ps.lateOnly.Store(lateOnly)
 	if sure {
 		ps.sureSince.CompareAndSwap(0, now.UnixNano())
 	} else {
@@ -206,4 +243,31 @@ func (s *WsMuxTransport) moveOffStalled(g *wsGeneration, sessions []*pooledSessi
 			s.recordEvent("session_stalled", fmt.Sprintf("%s silent for %s; %d flow(s) resumed on other connections", ps.host, ps.stalledFor(now).Round(time.Second), moved))
 		}
 	}
+}
+
+// shedSharedLoad withdraws the late-echo sign when most of the pool shows it at
+// once. A late echo on one connection can mean its way to the peer has stopped; on
+// most of them together it is the load they share: each echo waits behind the data
+// queued ahead of it on a path that is full. Moving flows then does not help - they
+// are resumed through the same full path, the handshake of the move times out in
+// the queue, and the flows sit suspended meanwhile - which is how a speed test
+// collapsed to nothing for seconds at a time. A connection whose socket is in
+// backoff, or that has gone completely silent, keeps its sign: neither is load.
+//
+// It runs just before moveOffStalled, on the same look at the pool.
+func shedSharedLoad(sessions []*pooledSession) (shed int) {
+	var late []*pooledSession
+	for _, ps := range sessions {
+		if ps.lateOnly.Load() && ps.sureSince.Load() != 0 {
+			late = append(late, ps)
+		}
+	}
+	if len(late)*2 <= len(sessions) {
+		return 0
+	}
+	for _, ps := range late {
+		ps.sureSince.Store(0)
+		ps.stalledSince.Store(0)
+	}
+	return len(late)
 }

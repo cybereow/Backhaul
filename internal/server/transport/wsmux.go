@@ -18,6 +18,7 @@ import (
 	"github.com/musix/backhaul/internal/smux"
 	"github.com/musix/backhaul/internal/utils"
 	"github.com/musix/backhaul/internal/utils/network"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 	"github.com/musix/backhaul/internal/web"
 
 	"github.com/sirupsen/logrus"
@@ -305,6 +306,9 @@ type WsMuxTransport struct {
 	// keepalive, so sessions never report closed) would be held "up" forever
 	// with no working data path. Set on the initial loss, not on each re-arm.
 	graceStart time.Time
+
+	// lastShedLog paces the log line of shedSharedLoad; capacityLoop alone touches it.
+	lastShedLog time.Time
 
 	// events is a small ring buffer of disruption events (control-channel
 	// losses, restarts, replacements) with timestamps, so an operator can see
@@ -728,6 +732,23 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 	// every probe that reached the listener.
 	expectedAuth := "Bearer " + s.config.Token
 
+	// Non-tunnel requests go to the decoy `fallback` when one is configured. With
+	// neither `ports` nor `fallback`, they are carried through the tunnel to the
+	// same port on the client instead (see bindForwardPort).
+	fallback := s.fallbackProxy
+	if fallback == nil {
+		if port, ok := bindForwardPort(s.config.BindAddr, s.config.Ports, s.config.Fallback); ok {
+			localCh := s.localChannel
+			fallback = newBindForwardProxy(port, func(conn net.Conn, remoteAddr string) bool {
+				// The socket did not come from a port listener, so give it the
+				// options a mapped port's sockets get.
+				network.TuneUserConn(conn, s.config.SO_RCVBUF, s.config.SO_SNDBUF, s.config.Nodelay, s.config.KeepAlive)
+				return s.enqueueLocalConn(g, localCh, conn, remoteAddr)
+			})
+			s.logger.Infof("ports is empty: non-tunnel requests on %s are forwarded to port %d on the client", addr, port)
+		}
+	}
+
 	// Create an HTTP server
 	server := &http.Server{
 		Addr: addr,
@@ -793,9 +814,9 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			// rejected as before.
 			isTunnelPath := r.URL.Path == channelPath || strings.HasPrefix(r.URL.Path, tunnelPathPrefix)
 			if !authorizedToken(r.Header.Get("Authorization"), expectedAuth) || !isTunnelPath {
-				if s.fallbackProxy != nil {
+				if fallback != nil {
 					s.logger.Debugf("serving fallback for %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-					s.fallbackProxy.ServeHTTP(w, r)
+					fallback.ServeHTTP(w, r)
 					return
 				}
 				s.logger.Warnf("unauthorized request from %s, closing connection", r.RemoteAddr)
@@ -980,8 +1001,21 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			if noControl {
 				s.logger.Infof("waiting for %s control channel connection", s.config.Mode)
 			}
-			if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-				s.logger.Fatalf("failed to listen on %s: %v", addr, err)
+			var serveErr error
+			if bufCap := proclimits.SocketBufferCap(); bufCap > 0 {
+				// A container with a memory limit: the buffers of every tunnel socket
+				// are held to a share of it (see network.ListenCapped).
+				s.logger.Infof("tunnel sockets are held to %d KB of kernel buffer each way to fit the memory limit", bufCap>>10)
+				ln, err := network.ListenCapped(addr, bufCap, bufCap)
+				if err != nil {
+					s.logger.Fatalf("failed to listen on %s: %v", addr, err)
+				}
+				serveErr = server.Serve(ln)
+			} else {
+				serveErr = server.ListenAndServe()
+			}
+			if serveErr != nil && serveErr != http.ErrServerClosed {
+				s.logger.Fatalf("failed to listen on %s: %v", addr, serveErr)
 			}
 		})
 	} else {
@@ -999,7 +1033,18 @@ func (s *WsMuxTransport) tunnelListener(g *wsGeneration) {
 			}
 			certs, keys := network.ResolveCertPairs(s.config.TLSCertFile, s.config.TLSKeyFile, s.config.TLSCerts, s.config.TLSKeys)
 			sndBuf, sndForce := s.tunnelLegSendBuf()
-			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, s.config.SO_RCVBUF, sndBuf, sndForce)
+			rcvBuf := s.config.SO_RCVBUF
+			if bufCap := proclimits.SocketBufferCap(); bufCap > 0 {
+				// Held to a share of the container's memory (see network.ListenCapped).
+				if rcvBuf == 0 || rcvBuf > bufCap {
+					rcvBuf = bufCap
+				}
+				if sndBuf == 0 || sndBuf > bufCap {
+					sndBuf, sndForce = bufCap, false
+				}
+				s.logger.Infof("tunnel sockets are held to %d KB of kernel buffer each way to fit the memory limit", bufCap>>10)
+			}
+			ln, err := network.NewTLSListener(s.config.TLSEngine, addr, certs, keys, rcvBuf, sndBuf, sndForce)
 			if err != nil {
 				s.logger.Fatalf("failed to create tls listener on %s: %v", addr, err)
 			}

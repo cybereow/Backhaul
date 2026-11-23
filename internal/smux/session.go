@@ -89,6 +89,24 @@ type Session struct {
 
 	bucket       int32         // token bucket
 	bucketNotify chan struct{} // used for waiting for tokens
+	// The receive budget as shared among the streams (see grant.go): grantSum is
+	// what they have been granted in all (grantMu), activeStreams how many of
+	// them are carrying data.
+	grantMu       sync.Mutex
+	grantSum      int64
+	grantDead     bool // the session has ended and given its grants back (releaseGrants)
+	activeStreams atomic.Int32
+	// idleGrant is the part of grantSum held by streams that are idle (see grantLoop).
+	idleGrant atomic.Int64
+	// rxData counts the stream data received; rateBudget is what the connection
+	// was seen to deliver in rateHorizon (see grant.go).
+	rxData     atomic.Int64
+	rateBudget atomic.Int64
+
+	// budgetHalts counts the times the read loop stopped because the bucket was
+	// empty, budgetHaltNs for how long in total (see BudgetHalts).
+	budgetHalts  atomic.Int64
+	budgetHaltNs atomic.Int64
 
 	streams    map[uint32]*Stream // all streams in this session
 	streamLock sync.Mutex         // locks streams
@@ -135,6 +153,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	s.bucketNotify = make(chan struct{}, 1)
 	s.shaper = make(chan writeRequest)
 	s.writes = make(chan writeRequest)
+	liveSessions.Store(s, struct{}{})
 	s.chSocketReadError = make(chan struct{})
 	s.chSocketWriteError = make(chan struct{})
 	s.chProtoError = make(chan struct{})
@@ -148,6 +167,9 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 	go s.shaperLoop()
 	go s.recvLoop()
 	go s.sendLoop()
+	if config.Version == 2 {
+		go s.grantLoop()
+	}
 	if !config.KeepAliveDisabled {
 		go s.keepalive()
 	}
@@ -157,6 +179,14 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 // OpenStream is used to create a new stream
 func (s *Session) OpenStream() (*Stream, error) {
 	return s.OpenStreamWithin(openCloseTimeout)
+}
+
+// BudgetHalts reports how many times this session's read loop has stopped because
+// its receive budget (MaxReceiveBuffer) was used up, and for how long in total.
+// While it is stopped nothing is read from the connection: no data for any stream,
+// no stream opening, no window update.
+func (s *Session) BudgetHalts() (n int64, total time.Duration) {
+	return s.budgetHalts.Load(), time.Duration(s.budgetHaltNs.Load())
 }
 
 // LastRecv is when the last frame of any kind arrived from the peer, in unix
@@ -261,6 +291,7 @@ func (s *Session) Close() error {
 	})
 
 	if once {
+		liveSessions.Delete(s)
 		s.streamLock.Lock()
 		for k := range s.streams {
 			s.streams[k].sessionClose()
@@ -362,6 +393,7 @@ func (s *Session) streamClosed(sid uint32) {
 			s.notifyBucket()
 		}
 	}
+	s.grantClose(s.streams[sid])
 	delete(s.streams, sid)
 	s.streamLock.Unlock()
 }
@@ -379,12 +411,20 @@ func (s *Session) recvLoop() {
 	var updHdr updHeader
 
 	for {
-		for atomic.LoadInt32(&s.bucket) <= 0 && !s.IsClosed() {
-			select {
-			case <-s.bucketNotify:
-			case <-s.die:
-				return
+		if atomic.LoadInt32(&s.bucket) <= 0 && !s.IsClosed() {
+			// Reading stops here for every stream of the session, control frames
+			// included, until a stream's reader gives tokens back: count it, so a
+			// session that keeps running out of budget can be seen from outside.
+			halted := time.Now()
+			s.budgetHalts.Add(1)
+			for atomic.LoadInt32(&s.bucket) <= 0 && !s.IsClosed() {
+				select {
+				case <-s.bucketNotify:
+				case <-s.die:
+					return
+				}
 			}
+			s.budgetHaltNs.Add(int64(time.Since(halted)))
 		}
 
 		// read header first

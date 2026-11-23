@@ -380,3 +380,77 @@ func TestOverdueEchoIsBelievedOncePerConnection(t *testing.T) {
 		t.Fatal("a late echo is still not believed after overdueQuiet")
 	}
 }
+
+// A late echo on most of the pool at once is load they share, so the sign is
+// withdrawn; on a few of them it is kept, and so are the signs that are not about
+// load.
+func TestSharedLoadIsNotAStall(t *testing.T) {
+	now := time.Now()
+	mk := func(late bool) *pooledSession {
+		ps := &pooledSession{}
+		ps.sureSince.Store(now.UnixNano())
+		ps.stalledSince.Store(now.UnixNano())
+		ps.lateOnly.Store(late)
+		return ps
+	}
+
+	few := []*pooledSession{mk(true), mk(false), mk(false), mk(false)}
+	if n := shedSharedLoad(few); n != 0 || few[0].sureSince.Load() == 0 {
+		t.Fatalf("a late echo on one connection of four was withdrawn (shed %d)", n)
+	}
+
+	half := []*pooledSession{mk(true), mk(true), mk(false), mk(false)}
+	if n := shedSharedLoad(half); n != 0 {
+		t.Fatalf("exactly half the pool counts as most of it (shed %d)", n)
+	}
+
+	most := []*pooledSession{mk(true), mk(true), mk(true), mk(false)}
+	silent := most[3] // sure for another reason: not about load
+	if n := shedSharedLoad(most); n != 3 {
+		t.Fatalf("shed %d, want 3", n)
+	}
+	for i, ps := range most[:3] {
+		if ps.sureSince.Load() != 0 || ps.stalledSince.Load() != 0 {
+			t.Fatalf("connection %d still shows the sign after it was withdrawn", i)
+		}
+	}
+	if silent.sureSince.Load() == 0 || silent.stalledSince.Load() == 0 {
+		t.Fatal("a connection whose sign is not a late echo lost it")
+	}
+	if !silent.dueToMove(now) {
+		t.Fatal("a silent connection is no longer due to be cleared")
+	}
+}
+
+// A process that has not been getting its CPU time answers late, and a late
+// answer is not a sign about the connection: nothing is moved for it. The
+// kernel's own view of the socket still counts.
+func TestStarvedProcessDoesNotTakeItsOwnLatenessForAStall(t *testing.T) {
+	defer setProcessStarved(nil)() // back to the test binary's default after
+	now := time.Now()
+
+	setProcessStarved(func(time.Time) bool { return false })
+	quiet := &pooledSession{}
+	quiet.probeFails.Store(2)
+	quiet.noteHealth(now, false)
+	if quiet.stalledSince.Load() == 0 {
+		t.Fatal("without starvation, failing probes did not mark the connection (the test would prove nothing)")
+	}
+
+	setProcessStarved(func(time.Time) bool { return true })
+	starved := &pooledSession{}
+	starved.probeFails.Store(2)
+	starved.sureSince.Store(now.UnixNano())
+	starved.stalledSince.Store(now.UnixNano())
+	starved.lateOnly.Store(true)
+	starved.noteHealth(now, false)
+	if starved.stalledSince.Load() != 0 || starved.sureSince.Load() != 0 || starved.dueToMove(now.Add(time.Minute)) {
+		t.Fatal("a starved process took failing probes for a stalled connection")
+	}
+
+	backoff := &pooledSession{}
+	backoff.noteHealth(now, true)
+	if backoff.sureSince.Load() == 0 || !backoff.dueToMove(now) {
+		t.Fatal("a socket in TCP backoff stopped counting while the process was starved")
+	}
+}

@@ -3,13 +3,20 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"strconv"
 
 	"github.com/musix/backhaul/config"
 	"github.com/musix/backhaul/internal/client"
 
 	"github.com/musix/backhaul/internal/server"
+	"github.com/musix/backhaul/internal/smux"
 	dnsx "github.com/musix/backhaul/internal/transport/dns"
 	"github.com/musix/backhaul/internal/utils"
+	"github.com/musix/backhaul/internal/utils/handlers"
+	"github.com/musix/backhaul/internal/utils/proclimits"
 
 	"github.com/BurntSushi/toml"
 )
@@ -111,6 +118,18 @@ func validateHalfClose(cfg *config.Config, configType string) error {
 }
 
 func Run(configPath string, ctx context.Context) {
+	// BACKHAUL_CPUPROFILE=file records a CPU profile of the whole run, written when
+	// the process is asked to stop: the way to see where a build spends its time
+	// under a real load (go tool pprof -top file).
+	if path := os.Getenv("BACKHAUL_CPUPROFILE"); path != "" {
+		if f, err := os.Create(path); err == nil {
+			if pprof.StartCPUProfile(f) == nil {
+				defer func() { pprof.StopCPUProfile(); f.Close() }()
+			} else {
+				f.Close()
+			}
+		}
+	}
 	// Load and parse the configuration file
 	cfg, err := loadConfig(configPath)
 	if err != nil {
@@ -119,6 +138,41 @@ func Run(configPath string, ctx context.Context) {
 
 	// Apply default values to the configuration
 	applyDefaults(cfg)
+
+	logger.Infof("%s", buildDescription())
+
+	// Size the Go runtime by the container, not by the machine under it.
+	limits := proclimits.Read()
+	procs, heap := proclimits.Apply(limits)
+	if limits.CPUs > 0 || limits.Memory > 0 {
+		logger.Infof("container limits: %.2f CPU core(s), %d MB memory (0 = none); the machine has %d core(s)", limits.CPUs, limits.Memory>>20, runtime.NumCPU())
+	}
+	if procs > 0 {
+		logger.Infof("running on %d thread(s) to stay within the CPU limit", procs)
+	}
+	if heap > 0 {
+		logger.Infof("keeping the heap under %d MB to stay within the memory limit", heap>>20)
+	}
+	// What flows may hold for replay follows the heap, however its limit was set;
+	// BACKHAUL_REPLAY_MB, when set, says it outright.
+	if total := handlers.ReplayBudgetFor(proclimits.HeapLimit()); total < handlers.ReplayBudgetTotal {
+		handlers.DefaultReplayBudget.SetTotal(total)
+		logger.Infof("replay buffers of all flows are held to %d MB to fit the heap limit", total>>20)
+	}
+	// So does what the streams of all sessions together may be granted to have in
+	// flight: sessions are limited one by one, and sixteen of them are not.
+	if hl := proclimits.HeapLimit(); hl > 0 {
+		smux.SetGlobalGrantBudget(hl / 4)
+		logger.Infof("receive windows of all streams together are held to %d MB to fit the heap limit", (hl/4)>>20)
+	}
+	if v := os.Getenv("BACKHAUL_REPLAY_MB"); v != "" {
+		if mb, err := strconv.Atoi(v); err == nil && mb > 0 {
+			handlers.DefaultReplayBudget.SetTotal(mb << 20)
+			logger.Infof("replay buffers of all flows are held to %d MB (BACKHAUL_REPLAY_MB)", mb)
+		} else {
+			logger.Warnf("BACKHAUL_REPLAY_MB=%q is not a number of megabytes: ignored", v)
+		}
+	}
 
 	configType := detectConfigType(cfg)
 	if configType == "" {

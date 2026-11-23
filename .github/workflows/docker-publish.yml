@@ -1,17 +1,22 @@
 name: Publish Docker image
 
-# Publishes a multi-arch (amd64 + arm64) image to Docker Hub.
+# Publishes a multi-arch (amd64 + arm64) image to Docker Hub and GHCR.
 #
-# Requires two repository secrets:
+# Requires two repository secrets for Docker Hub:
 #   DOCKERHUB_USERNAME - your Docker Hub account/namespace (image is
 #                        published as <username>/backhaul)
 #   DOCKERHUB_TOKEN    - a Docker Hub access token (Account Settings ->
 #                        Security -> New Access Token)
+# GHCR (ghcr.io/<owner>/<repo>) authenticates automatically with GITHUB_TOKEN.
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
 
 jobs:
   docker:
@@ -32,11 +37,20 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ secrets.DOCKERHUB_USERNAME }}/backhaul
+          images: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/backhaul
+            ghcr.io/${{ github.repository }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
@@ -49,6 +63,10 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          # Disable provenance/SBOM attestations so the published manifest index
+          # does not include unknown/unknown entries that break some Harbor/proxy caches.
+          provenance: false
+          sbom: false
           build-args: |
             COMMIT=${{ github.sha }}
           tags: ${{ steps.meta.outputs.tags }}
